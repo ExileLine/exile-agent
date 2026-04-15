@@ -13,6 +13,7 @@ from apscheduler.schedulers.base import SchedulerNotRunningError
 from fastapi import FastAPI
 from loguru import logger
 
+from app.ai.runtime import init_ai_runtime, shutdown_ai_runtime
 import app.db.redis_client as redis_module
 from app.core.config import get_config
 from app.db.redis_client import close_redis_connection_pool, create_redis_connection_pool
@@ -37,11 +38,17 @@ def _log_startup_info() -> None:
 
 
 async def _init_db() -> None:
+    if not project_config.DB_INIT_ON_STARTUP:
+        logger.info(">>> 跳过数据库连接池初始化")
+        return
     logger.info(">>> Mysql连接池初始化")
     await init_db()
 
 
 async def _init_redis() -> None:
+    if not project_config.REDIS_INIT_ON_STARTUP:
+        logger.info(">>> 跳过 Redis 连接池初始化")
+        return
     logger.info(">>> Redis连接池初始化")
     await create_redis_connection_pool()
     logger.debug(f"redis_pool: {redis_module.redis_pool!r}")
@@ -66,6 +73,8 @@ async def _shutdown_scheduler() -> None:
 
 
 async def _shutdown_redis() -> None:
+    if not project_config.REDIS_INIT_ON_STARTUP:
+        return
     try:
         await close_redis_connection_pool()
         logger.info(">>> Redis 连接池已关闭")
@@ -74,6 +83,8 @@ async def _shutdown_redis() -> None:
 
 
 async def _shutdown_db() -> None:
+    if not project_config.DB_INIT_ON_STARTUP:
+        return
     try:
         await close_db()
         logger.info(">>> 数据库连接已关闭")
@@ -81,24 +92,27 @@ async def _shutdown_db() -> None:
         logger.exception(">>> 数据库连接关闭失败")
 
 
-async def startup_event() -> None:
+async def startup_event(app: FastAPI) -> None:
     _log_startup_info()
     logger.info(f">>> Config初始化: {project_config.ENV}")
 
     try:
         await _init_db()
         await _init_redis()
+        await init_ai_runtime(app, project_config)
         # await _init_scheduler()
     except Exception:
         logger.exception("应用启动失败，开始回收资源")
+        await shutdown_ai_runtime(app)
         await _shutdown_scheduler()
         await _shutdown_redis()
         await _shutdown_db()
         raise
 
 
-async def shutdown_event() -> None:
+async def shutdown_event(app: FastAPI) -> None:
     logger.info(">>> shutdown")
+    await shutdown_ai_runtime(app)
     # await _shutdown_scheduler()
     await _shutdown_redis()
     await _shutdown_db()
@@ -106,9 +120,8 @@ async def shutdown_event() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    del app
-    await startup_event()
+    await startup_event(app)
     try:
         yield
     finally:
-        await shutdown_event()
+        await shutdown_event(app)

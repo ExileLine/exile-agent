@@ -94,6 +94,8 @@ class BaseConfig(BaseSettings):
     DEBUG: bool = True
     RUN_HOST: str = "0.0.0.0"
     RUN_PORT: int = 8000
+    DB_INIT_ON_STARTUP: bool = True
+    REDIS_INIT_ON_STARTUP: bool = True
 
     MYSQL_HOSTNAME: str = "127.0.0.1"
     MYSQL_USERNAME: str = "root"
@@ -115,6 +117,13 @@ class BaseConfig(BaseSettings):
     CELERY_BROKER_URL: Optional[str] = None
     CELERY_RESULT_BACKEND: Optional[str] = None
     CELERY_TASK_QUEUE: str = "exile_agent_task_queue"
+    AI_ENABLED: bool = True
+    AI_DEFAULT_AGENT: str = "chat-agent"
+    AI_DEFAULT_MODEL: str = "openai:gpt-5.2"
+    AI_MAX_RETRIES: int = 2
+    AI_HTTP_TIMEOUT_SECONDS: float = 30.0
+    OPENAI_API_KEY: Optional[str] = None
+    OPENAI_BASE_URL: Optional[str] = None
 
     SENSITIVE_HEADERS: str = "authorization,cookie,set-cookie,x-api-key"
 
