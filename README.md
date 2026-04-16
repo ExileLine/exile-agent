@@ -1601,6 +1601,58 @@ build_chat_agent(...)
 - 对真实模型和测试模型都成立
 - 记录点稳定，便于后续扩展
 
+#### 当前工具治理链路中的三层职责
+
+当前项目里，和工具治理最容易混淆的有三层职责。它们分别负责不同的问题：
+
+1. 暴露审计：这轮运行把哪些工具暴露给了模型
+2. 执行审计：某个工具是否真的被调用，以及调用结果是什么
+3. 审批策略：某个工具调用是否需要先进入 approval 流程
+
+对应到当前代码分别是：
+
+- `app/ai/runtime/runner.py`
+  - `_record_tool_exposure(...)`
+  - 负责记录 tool exposure
+- `app/ai/toolsets/audit.py`
+  - `ToolAuditWrapperToolset`
+  - 负责记录 tool execution
+- `app/ai/toolsets/approval.py`
+  - `tool_requires_approval(...)`
+  - `MetadataApprovalToolset`
+  - 负责 approval policy
+
+也就是说：
+
+- `audit.py` 不是“审批审计”
+- `approval.py` 也不是“执行审计”
+- 两者分别负责执行层治理与审批层治理
+
+如果用一句更短的话概括当前三层关系：
+
+- `runner.py` 负责记录“模型看到了什么工具”
+- `audit.py` 负责记录“工具实际执行了什么”
+- `approval.py` 负责决定“工具能不能直接执行”
+
+三者串起来之后，当前工具治理链路可以概括为：
+
+```text
+AgentRunner._record_tool_exposure(...)
+  -> 记录本轮可见工具集合
+
+MetadataApprovalToolset
+  -> 判断这次工具调用是否需要 approval
+
+ToolAuditWrapperToolset.call_tool(...)
+  -> 在真实调用前后记录执行事件
+```
+
+这样拆分的价值是：
+
+- 暴露审计与执行审计不会混在一起
+- approval 规则不会污染具体工具函数
+- 后续扩展 MCP / Skills / business toolsets 时，这三层都可以复用
+
 #### 为什么还把它放进 `AgentDeps`
 
 当前虽然主要是 `AgentRunner` 在用它，但它已经被放进了 `AgentDeps`。
