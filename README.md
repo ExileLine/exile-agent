@@ -94,14 +94,14 @@ app/
 
 建议你看链路时，把这些文件按下面顺序理解：
 
-1. [app/main.py](/Users/yangyuexiong/Desktop/exile-agent/app/main.py)
-2. [app/core/lifespan.py](/Users/yangyuexiong/Desktop/exile-agent/app/core/lifespan.py)
-3. [app/ai/runtime/__init__.py](/Users/yangyuexiong/Desktop/exile-agent/app/ai/runtime/__init__.py)
-4. [app/api/v1/endpoints/agent.py](/Users/yangyuexiong/Desktop/exile-agent/app/api/v1/endpoints/agent.py)
-5. [app/ai/services/chat_service.py](/Users/yangyuexiong/Desktop/exile-agent/app/ai/services/chat_service.py)
-6. [app/ai/runtime/runner.py](/Users/yangyuexiong/Desktop/exile-agent/app/ai/runtime/runner.py)
-7. [app/ai/runtime/manager.py](/Users/yangyuexiong/Desktop/exile-agent/app/ai/runtime/manager.py)
-8. [app/ai/agents/chat_agent.py](/Users/yangyuexiong/Desktop/exile-agent/app/ai/agents/chat_agent.py)
+1. [app/main.py](./app/main.py)
+2. [app/core/lifespan.py](./app/core/lifespan.py)
+3. [app/ai/runtime/__init__.py](./app/ai/runtime/__init__.py)
+4. [app/api/v1/endpoints/agent.py](./app/api/v1/endpoints/agent.py)
+5. [app/ai/services/chat_service.py](./app/ai/services/chat_service.py)
+6. [app/ai/runtime/runner.py](./app/ai/runtime/runner.py)
+7. [app/ai/runtime/manager.py](./app/ai/runtime/manager.py)
+8. [app/ai/agents/chat_agent.py](./app/ai/agents/chat_agent.py)
 
 ---
 
@@ -111,7 +111,7 @@ app/
 
 ### Step 1. FastAPI 创建应用
 
-入口在 [app/main.py](/Users/yangyuexiong/Desktop/exile-agent/app/main.py)。
+入口在 [app/main.py](./app/main.py)。
 
 `create_app()` 里最关键的代码是：
 
@@ -131,7 +131,7 @@ app = FastAPI(
 
 ### Step 2. FastAPI 进入 `lifespan`
 
-入口在 [app/core/lifespan.py](/Users/yangyuexiong/Desktop/exile-agent/app/core/lifespan.py)。
+入口在 [app/core/lifespan.py](./app/core/lifespan.py)。
 
 当前 `lifespan(app)` 是这样写的：
 
@@ -199,7 +199,7 @@ await init_ai_runtime(app, project_config)
 
 ## 二、`init_ai_runtime(app, project_config)` 具体做了什么
 
-入口在 [app/ai/runtime/__init__.py](/Users/yangyuexiong/Desktop/exile-agent/app/ai/runtime/__init__.py)。
+入口在 [app/ai/runtime/__init__.py](./app/ai/runtime/__init__.py)。
 
 这是当前 AI 初始化链路的真正核心。
 
@@ -285,7 +285,7 @@ registry = AgentRegistry()
 register_default_agents(registry, settings)
 ```
 
-入口在 [app/ai/agents/__init__.py](/Users/yangyuexiong/Desktop/exile-agent/app/ai/agents/__init__.py)。
+入口在 [app/ai/agents/__init__.py](./app/ai/agents/__init__.py)。
 
 当前做的事情很简单：
 
@@ -405,7 +405,7 @@ app.state.ai_runner = runner
 
 ## 1. 请求先经过中间件
 
-入口在 [app/core/middleware.py](/Users/yangyuexiong/Desktop/exile-agent/app/core/middleware.py)。
+入口在 [app/core/middleware.py](./app/core/middleware.py)。
 
 当前最关键的一步是注入 `request_id`：
 
@@ -437,11 +437,11 @@ getattr(request.state, "request_id", None)
 
 路由链路如下：
 
-1. [app/api/router.py](/Users/yangyuexiong/Desktop/exile-agent/app/api/router.py)  
+1. [app/api/router.py](./app/api/router.py)  
    定义 `/api`
-2. [app/api/v1/router.py](/Users/yangyuexiong/Desktop/exile-agent/app/api/v1/router.py)  
+2. [app/api/v1/router.py](./app/api/v1/router.py)  
    定义 `/v1`
-3. [app/api/v1/endpoints/agent.py](/Users/yangyuexiong/Desktop/exile-agent/app/api/v1/endpoints/agent.py)  
+3. [app/api/v1/endpoints/agent.py](./app/api/v1/endpoints/agent.py)  
    定义 `/agents/chat`
 
 合在一起就是：
@@ -452,7 +452,7 @@ getattr(request.state, "request_id", None)
 
 ## 3. 进入 endpoint：`chat_with_agent(...)`
 
-入口在 [app/api/v1/endpoints/agent.py](/Users/yangyuexiong/Desktop/exile-agent/app/api/v1/endpoints/agent.py)。
+入口在 [app/api/v1/endpoints/agent.py](./app/api/v1/endpoints/agent.py)。
 
 当前 endpoint 做的事情，可以概括成：
 
@@ -551,7 +551,7 @@ request_context = RequestContext(
 
 ## 4. 进入 `ChatService.chat(...)`
 
-入口在 [app/ai/services/chat_service.py](/Users/yangyuexiong/Desktop/exile-agent/app/ai/services/chat_service.py)。
+入口在 [app/ai/services/chat_service.py](./app/ai/services/chat_service.py)。
 
 当前它的实现很薄：
 
@@ -588,7 +588,7 @@ return await self.runner.run_chat(
 
 ## 5. 进入 `AgentRunner.run_chat(...)`
 
-入口在 [app/ai/runtime/runner.py](/Users/yangyuexiong/Desktop/exile-agent/app/ai/runtime/runner.py)。
+入口在 [app/ai/runtime/runner.py](./app/ai/runtime/runner.py)。
 
 这一步是当前 AI 链路里最重要的运行入口。
 
@@ -765,7 +765,7 @@ return AgentChatResponse(
 
 ## 6. `AgentManager.get_agent(...)` 到底做了什么
 
-入口在 [app/ai/runtime/manager.py](/Users/yangyuexiong/Desktop/exile-agent/app/ai/runtime/manager.py)。
+入口在 [app/ai/runtime/manager.py](./app/ai/runtime/manager.py)。
 
 这里的职责是：
 
@@ -967,7 +967,7 @@ deps = AgentDeps(
 
 ## 7. `build_chat_agent(...)` 到底做了什么
 
-入口在 [app/ai/agents/chat_agent.py](/Users/yangyuexiong/Desktop/exile-agent/app/ai/agents/chat_agent.py)。
+入口在 [app/ai/agents/chat_agent.py](./app/ai/agents/chat_agent.py)。
 
 这一步就是当前默认 Agent 的定义位置。
 
