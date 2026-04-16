@@ -474,18 +474,23 @@ MCP_SERVERS_JSON=[]
 - [x] 实现一个最小 `chat-agent`
 - [x] 在 `lifespan` 中初始化 AI 运行时所需资源
 - [x] 新增 `POST /api/v1/agents/chat`
+- [x] 新增 `GET /api/v1/agents`
+- [x] 增加 OpenAI 兼容 provider 配置支持（`OPENAI_API_KEY` / `OPENAI_BASE_URL`）
+- [x] 完成 README 调用链文档
 - [x] 为最小 agent 增加基础测试
 
 验收标准：
 
 - 可以通过 API 调起一个最小 agent
+- 可以通过 API 查看已注册 agent
 - 可以从 `deps` 中拿到 http client / redis / db factory
 - 项目结构中出现明确 `app/ai/` 边界
+- 真实模型与 `TestModel` 均可跑通最小链路
 
 ## Phase 2 - Toolsets 与工具治理
 
-- [ ] 实现基础 `FunctionToolset`
-- [ ] 增加系统类只读工具，如 `health`, `now`, `echo`, `config_summary`
+- [x] 实现基础 `FunctionToolset`
+- [x] 增加首批系统类只读工具（`get_current_utc_time`、`get_request_context`、`get_runtime_config_summary`、`check_runtime_resources`）
 - [ ] 统一工具命名、描述、参数 schema 规范
 - [ ] 实现 tool metadata 标注
 - [ ] 实现 wrapper/audit toolset
@@ -610,17 +615,28 @@ MCP_SERVERS_JSON=[]
 
 ## 首批建议实现的 MVP 内容
 
-建议第一轮实现只做这些：
+当前已完成：
 
 - 一个 `chat-agent`
 - 一个 `AgentRegistry`
+- 一个 `AgentManager`
 - 一个 `Runner`
-- 一个 `POST /api/v1/agents/chat`
-- 三到四个基础工具
+- `POST /api/v1/agents/chat`
+- `GET /api/v1/agents`
+- 一个基础 `FunctionToolset`
+- 四个 builtin 只读工具
+- OpenAI 兼容 provider 配置接入
+- 基础测试
+- README 调用链文档
+
+下一步建议补齐：
+
+- 三到四个可复用基础工具
+- 工具命名、描述、schema 规范化
+- wrapper / audit toolset
 - Redis 会话历史
 - 一个示例 skill
 - 一个可选 MCP server 装配点
-- 基础测试
 
 不要首轮就做：
 

@@ -11,17 +11,18 @@
 - 注册最小 `chat-agent`
 - 支持通过 `/api/v1/agents/chat` 触发一次 Agent 调用
 - 支持 `deps_type + RunContext`
-- 支持基础工具调用
+- 支持通过 `FunctionToolset` 装配基础工具
+- 已提供 4 个 builtin 只读工具
 - 支持真实模型和 `TestModel`
 
 当前还没有进入：
 
-- `toolsets` 治理
 - Redis 会话历史
 - MCP 接入
 - Skills 基础设施
 - 流式输出
 - 审批续跑
+- 更完整的 `toolsets` 包装、审计与审批治理
 
 ---
 
@@ -61,7 +62,7 @@ POST /api/v1/agents/chat
    - 调用 `agent.run(...)`
    - 把结果整理成统一响应结构
 7. `AgentManager` 负责“拿 Agent”，如果缓存里没有，就调用 `build_chat_agent()` 构建。
-8. `build_chat_agent()` 负责定义这个 Agent 的模型、输出类型、提示词和工具。
+8. `build_chat_agent()` 负责定义这个 Agent 的模型、输出类型、提示词和 toolsets。
 9. 最后 `pydantic_ai.Agent.run(...)` 才真正触发模型调用或测试模型执行。
 
 你举的那个例子，方向是对的，下面会按源码把每一步写细。
@@ -1038,9 +1039,302 @@ agent: Agent[AgentDeps, str] = Agent[AgentDeps, str](
 
 - 定义这个 Agent 的“人格 + 模型 + 依赖类型 + 输出类型”
 
-### 7.3 注册工具
+### 7.3 装配 `builtin_toolset`
 
-当前注册了两个最小工具：
+当前不是直接在 `chat-agent` 上零散注册工具，而是通过 `toolsets=[get_builtin_toolset()]` 装配一个基础工具集。
+
+这代表当前项目已经从“Agent 内直接挂两个函数工具”，演进到“通过 `FunctionToolset` 组织基础工具”的阶段。
+
+当前 `builtin_toolset` 提供了 4 个只读工具：
+
+- `get_current_utc_time`
+- `get_request_context`
+- `get_runtime_config_summary`
+- `check_runtime_resources`
+
+这些工具仍然会被模型看到并作为普通 function tools 调用，但它们的组织方式已经变成统一的 toolset。
+
+这样做的直接收益是：
+
+- 工具定义不再散落在具体 Agent 文件里
+- 后续可以继续拆出更多业务 toolsets
+- 为后面的 wrapper / approval / audit / MCP / Skills 动态装配预留结构
+
+#### 为什么 `FunctionToolset` 还会有 `instructions`
+
+`FunctionToolset` 不只是“装工具的容器”，它自己也可以附带一段 instructions。
+
+这段 instructions 不是给 Python 看的，而是给模型看的。它的作用是告诉模型：
+
+- 这组工具是做什么的
+- 什么时候应该优先使用它们
+- 不要在不需要的时候乱用它们
+
+当前 `builtin_toolset` 里的 instructions 大意是：
+
+- 当用户询问请求元数据、当前时间、或者 AI runtime 配置摘要时，优先使用 builtin tools
+
+为什么这段话不直接写进 `chat-agent` 的 `instructions` 里？
+
+因为两者职责不同：
+
+- `agent.instructions` 负责定义 Agent 的整体行为、回答风格和全局约束
+- `toolset.instructions` 负责定义“这一组工具”的使用策略
+
+这样拆开的好处是：
+
+- 同一个 toolset 将来可以复用到多个 Agent
+- Agent 本身不会堆满工具使用细节
+- 后续不同 toolset 可以携带各自不同的 instructions
+
+#### `id="builtin-toolset"` 的作用是什么
+
+这个 `id` 不是给模型看的，而是给系统和运行时看的。可以把它理解成：
+
+- 这个 toolset 的稳定身份标识
+
+当前阶段它最直接的价值是：
+
+- 可读性更强，一眼能知道这是哪个 toolset
+- 后续日志、调试、排查时更容易标识来源
+- 为未来多个 toolset 并存时提供稳定命名
+
+更进一步地说，`FunctionToolset.id` 也是在为后面的能力预留结构，例如：
+
+- wrapper / audit / approval 按 toolset 定向处理
+- Skills 依赖某个指定 toolset
+- MCP 动态装配后区分 builtin toolset 和外部 toolset
+- durable execution 或工作流恢复时稳定识别 toolset
+
+所以：
+
+- `instructions` 是告诉模型“这组工具什么时候用、怎么用”
+- `id` 是告诉系统“这组工具是谁”
+
+#### `tool_plain`、`tool`、`FunctionToolset` 三者是什么关系
+
+这三个概念不是同一层的东西，它们的关系可以这样理解：
+
+- `tool_plain`：定义一个“纯函数工具”
+- `tool`：定义一个“带运行上下文的工具”
+- `FunctionToolset`：把一组工具组织成一个可复用的工具集
+
+也就是说：
+
+- `tool_plain` 和 `tool` 解决的是“单个工具怎么定义”
+- `FunctionToolset` 解决的是“多个工具怎么组织和装配”
+
+#### 什么时候用 `tool_plain`
+
+`tool_plain` 适合纯函数场景，也就是：
+
+- 不依赖当前请求上下文
+- 不需要访问 `ctx.deps`
+- 不依赖 DB / Redis / HTTP client
+- 只根据传入参数计算结果
+
+比如当前的：
+
+- `get_current_utc_time`
+
+它本质上就是一个不需要运行态依赖的只读工具。
+
+所以可以理解成：
+
+- `tool_plain` 适合“纯逻辑 / 纯计算 / 纯格式化 / 纯时间读取”这类工具
+
+#### 什么时候用 `tool`
+
+`tool` 适合需要运行上下文的场景，也就是：
+
+- 需要读取 `ctx.deps`
+- 需要知道这次请求是谁发起的
+- 需要读取数据库、Redis、HTTP client 或运行配置
+
+比如当前的：
+
+- `get_request_context`
+- `get_runtime_config_summary`
+- `check_runtime_resources`
+
+这些工具都依赖当前运行态，因此应该定义为 `tool`，而不是 `tool_plain`。
+
+可以把它理解成：
+
+- `tool` 适合“依赖请求态 / 依赖外部资源 / 依赖运行配置”的工具
+
+#### 为什么有了 `tool` / `tool_plain` 还需要 `FunctionToolset`
+
+因为 `tool` 和 `tool_plain` 只解决“定义一个工具”的问题，不解决“项目级组织工具”的问题。
+
+如果所有工具都直接写在某个 Agent 里，短期能跑，但后面会出现这些问题：
+
+- 工具定义散落在不同 Agent 文件中
+- 同一组工具难以复用到多个 Agent
+- 不方便统一加 instructions、metadata、approval、audit
+- 不方便以后按能力包接 MCP 或 Skills
+
+`FunctionToolset` 的作用，就是把一组相关工具提升成一个可复用的能力包。
+
+所以当前项目里更推荐的理解方式是：
+
+- 用 `tool_plain` / `tool` 定义具体工具
+- 用 `FunctionToolset` 组织这批工具
+- 再由 Agent 通过 `toolsets=[...]` 挂载它们
+
+#### `toolsets=[...]` 可以挂多个 toolset 吗
+
+可以，而且这正是 `toolsets` 这个参数的重要用途之一。
+
+当前代码里是：
+
+```python
+toolsets=[get_builtin_toolset()]
+```
+
+但它本质上是一个序列，所以完全可以扩展成：
+
+```python
+toolsets=[
+    get_builtin_toolset(),
+    get_ops_toolset(),
+    get_business_toolset(),
+]
+```
+
+也可以混合不同来源的 toolset，例如：
+
+```python
+toolsets=[
+    get_builtin_toolset(),
+    get_business_toolset(),
+    mcp_toolset,
+]
+```
+
+这意味着，后续项目完全可以按“能力来源”拆分工具，而不是把所有工具都塞进一个大 toolset 里。
+
+#### 多个 toolset 组合时，模型看到的是什么
+
+从模型视角看，最终它看到的是多个 toolset 合并后的可用工具集合。
+
+也就是说：
+
+- `builtin_toolset` 提供一批基础只读工具
+- `business_toolset` 提供一批业务工具
+- `mcp_toolset` 提供一批外部能力工具
+
+最后模型会把它们当成同一轮 run 中可用的工具池来使用。
+
+#### 为什么后面大概率会有多个 toolset
+
+因为后续这个项目不可能永远只有一组 builtin tools。
+
+按现在的规划，后面很可能逐步出现：
+
+- `builtin_toolset`
+- `ops_toolset`
+- `business_toolset`
+- `mcp_toolset`
+- `skill_resolved_toolset`
+
+这时 `toolsets=[...]` 的意义就体现出来了：
+
+- 每一组工具按能力包独立维护
+- Agent 只负责组合需要的 toolsets
+- 不需要把所有工具重新散落到 Agent 文件中
+
+#### 多个 toolset 组合时要注意什么
+
+最重要的一点是：
+
+- 工具名不能冲突
+
+例如：
+
+- `builtin_toolset` 里定义了 `get_status`
+- `ops_toolset` 里也定义了 `get_status`
+
+这种情况后面会带来冲突风险。
+
+所以项目进入更复杂阶段后，应该尽早建立工具命名规范，例如：
+
+- `runtime_get_status`
+- `ops_get_status`
+- `customer_get_profile`
+
+这样不同 toolset 的工具来源会更清晰。
+
+#### 静态装配和动态装配的区别
+
+当前 `chat-agent` 里写的是：
+
+```python
+toolsets=[get_builtin_toolset()]
+```
+
+这属于静态装配，也就是：
+
+- 这个 Agent 每次运行都会固定带上这组 toolset
+
+后面更成熟的做法通常是：
+
+- Agent 定义阶段挂一部分固定 toolsets
+- Runner 执行阶段再根据请求动态补更多 toolsets
+
+例如：
+
+- 所有请求都带 `builtin_toolset`
+- 某些请求额外带业务 toolset
+- 某些请求额外带 skill toolset
+- 某些请求额外带 MCP toolset
+
+也就是说，后面这条链大概率会从：
+
+```python
+toolsets=[get_builtin_toolset()]
+```
+
+演进成：
+
+```python
+toolsets=[
+    get_builtin_toolset(),
+    get_business_toolset(),
+    *resolved_skill_toolsets,
+    *resolved_mcp_toolsets,
+]
+```
+
+所以你可以把当前这一步理解成：
+
+- 先把单个 `builtin_toolset` 跑通
+- 后续再把它扩展成多个 toolset 的组合装配机制
+
+#### 当前项目里的推荐用法
+
+按照现在这套架构，建议这样选：
+
+- 工具是纯函数：优先 `tool_plain`
+- 工具依赖 `ctx.deps`：优先 `tool`
+- 一组工具要被统一挂载、复用、治理：放进 `FunctionToolset`
+
+所以在当前阶段：
+
+- `get_current_utc_time` 是 `tool_plain`
+- `get_request_context` 是 `tool`
+- `builtin_toolset` 是 `FunctionToolset`
+
+这个分层正是后面继续做：
+
+- wrapper / audit toolset
+- MCP toolset
+- skill 依赖 toolset
+- 动态装配 toolsets
+
+所需要的基础结构。
+
+下面只重点解释两类最有代表性的工具。
 
 #### 工具 1：`get_current_utc_time`
 
@@ -1066,6 +1360,13 @@ def get_request_context(ctx: RunContext[AgentDeps]) -> dict[str, str | None]:
 这是一个带上下文的工具：
 
 - 它通过 `ctx.deps.request` 读取当前请求信息
+
+另外两个工具：
+
+- `get_runtime_config_summary`
+- `check_runtime_resources`
+
+它们也是只读工具，主要用于让模型读取当前 AI runtime 概况，而不是在需要运行时信息时靠猜测回答。
 
 这一点非常关键，因为它正好说明：
 
@@ -1242,6 +1543,7 @@ return api_response(data=result.model_dump(mode="json"))
 - `/api/v1/agents/chat` 可以真实触发 AgentRunner
 - `AgentManager` 可以正确获取和缓存 Agent
 - `build_chat_agent()` 可以正确构造 Agent
+- `chat-agent` 可以通过 `FunctionToolset` 装配 builtin tools
 - `AgentDeps` 可以被传入 `agent.run(...)`
 - `RunContext[AgentDeps]` 工具可以访问请求上下文
 - 可以使用 `TestModel`

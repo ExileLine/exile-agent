@@ -1,11 +1,10 @@
-import datetime as dt
-
-from pydantic_ai import Agent, RunContext
+from pydantic_ai import Agent
 from pydantic_ai.models.openai import OpenAIChatModel
 from pydantic_ai.providers.openai import OpenAIProvider
 
 from app.ai.config import AISettings
 from app.ai.deps import AgentDeps
+from app.ai.toolsets import get_builtin_toolset
 
 
 def build_chat_agent(settings: AISettings, model_name: str) -> Agent[AgentDeps, str]:
@@ -18,24 +17,13 @@ def build_chat_agent(settings: AISettings, model_name: str) -> Agent[AgentDeps, 
         instructions=(
             "You are the default assistant for this FastAPI backend project. "
             "Be concise, factual, and implementation-oriented. "
-            "Prefer answering in Chinese unless the user asks otherwise."
+            "Prefer answering in Chinese unless the user asks otherwise. "
+            "When runtime metadata would help, use the available builtin tools instead of guessing."
         ),
         retries=settings.max_retries,
+        toolsets=[get_builtin_toolset()],
         defer_model_check=True,
     )
-
-    @agent.tool_plain
-    def get_current_utc_time() -> str:
-        return dt.datetime.now(dt.UTC).isoformat()
-
-    @agent.tool
-    def get_request_context(ctx: RunContext[AgentDeps]) -> dict[str, str | None]:
-        request = ctx.deps.request
-        return {
-            "request_id": request.request_id,
-            "user_id": request.user_id,
-            "session_id": request.session_id,
-        }
 
     return agent
 
