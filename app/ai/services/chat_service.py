@@ -2,7 +2,7 @@ from app.ai.deps import RequestContext
 from app.ai.runtime.manager import AgentManager
 from app.ai.runtime.runner import AgentRunner
 from app.ai.schemas.agent import AgentManifest
-from app.ai.schemas.chat import AgentChatRequest, AgentChatResponse
+from app.ai.schemas.chat import AgentChatRequest, AgentChatResponse, AgentChatResumeRequest
 
 
 class ChatService:
@@ -26,6 +26,18 @@ class ChatService:
         return await self.runner.run_chat(
             request_context=request_context,
             message=payload.message,
+            agent_id=payload.agent_id,
+            session_id=payload.session_id,
+            model_name=payload.model,
+        )
+
+    async def resume(self, *, request_context: RequestContext, payload: AgentChatResumeRequest) -> AgentChatResponse:
+        """继续执行上一轮因 approval 停住的 run。"""
+
+        return await self.runner.resume_chat(
+            request_context=request_context,
+            message_history_json=payload.message_history_json,
+            approvals=payload.approvals,
             agent_id=payload.agent_id,
             session_id=payload.session_id,
             model_name=payload.model,

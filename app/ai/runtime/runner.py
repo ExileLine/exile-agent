@@ -1,15 +1,22 @@
+import json
 from typing import Any
 
 import httpx
 import shortuuid
-from pydantic_ai import RunContext
+from pydantic_ai import ModelMessagesTypeAdapter, RunContext
+from pydantic_ai.tools import DeferredToolRequests, DeferredToolResults, ToolApproved, ToolDenied
 from pydantic_ai.usage import RunUsage
 
 from app.ai.config import AISettings
 from app.ai.deps import AgentDeps, RequestContext
 from app.ai.exceptions import AIDisabledError
 from app.ai.runtime.manager import AgentManager
-from app.ai.schemas.chat import AgentChatResponse
+from app.ai.schemas.chat import (
+    AgentApprovalDecision,
+    AgentApprovalRequest,
+    AgentChatResponse,
+    AgentDeferredToolRequestsPayload,
+)
 from app.ai.services.tool_audit import ToolAuditService
 from app.db import redis_client
 from app.db.session import AsyncSessionLocal
@@ -38,38 +45,11 @@ class AgentRunner:
         session_id: str | None = None,
         model_name: str | None = None,
     ) -> AgentChatResponse:
-        """执行一次标准 chat run。
+        """执行一次标准 chat run。"""
 
-        这里是当前项目里“真正触发 Agent 执行”的核心入口。
-        整体职责包括：
-        - 检查 AI 开关
-        - 解析本次请求要使用的 agent / model
-        - 组装 AgentDeps
-        - 在执行前记录当前 run 暴露给模型的工具集合
-        - 调用 `agent.run(...)`
-        - 把结果整理成统一的 API 响应结构
-        """
-        if not self.settings.enabled:
-            raise AIDisabledError("AI 能力已关闭")
+        resolved_agent_id, resolved_model, agent = self._resolve_agent(agent_id=agent_id, model_name=model_name)
+        deps = self._build_deps(request_context)
 
-        resolved_agent_id = agent_id or self.settings.default_agent
-        resolved_model = self.agent_manager.resolve_model(resolved_agent_id, model_name)
-        agent = self.agent_manager.get_agent(resolved_agent_id, resolved_model)
-
-        # `AgentDeps` 是本次运行注入给工具层和动态 instructions 的运行时依赖集合。
-        # 当前先放 request/settings/db/redis/http_client/tool_audit，
-        # 后续继续扩 history / approval / skill / mcp 也会沿着这个入口演进。
-        deps = AgentDeps(
-            request=request_context,
-            settings=self.settings,
-            db_session_factory=AsyncSessionLocal,
-            redis=redis_client.redis_pool,
-            http_client=self.http_client,
-            tool_audit=self.tool_audit,
-        )
-
-        # 在真正执行前，先把当前 run 对模型可见的工具集合记录下来。
-        # 当前记录的是 tool exposure，而不是完整 tool execution telemetry。
         await self._record_tool_exposure(
             agent_id=resolved_agent_id,
             request_id=request_context.request_id,
@@ -78,30 +58,150 @@ class AgentRunner:
             deps=deps,
         )
 
-        # 真正触发模型调用与工具编排的入口。
         result = await agent.run(message, deps=deps)
-
-        return AgentChatResponse(
-            run_id=shortuuid.uuid(),
+        return self._build_chat_response(
+            result=result,
+            request_id=request_context.request_id,
+            session_id=session_id,
             agent_id=resolved_agent_id,
             model=resolved_model,
-            message=result.output,
+        )
+
+    async def resume_chat(
+        self,
+        *,
+        request_context: RequestContext,
+        message_history_json: str,
+        approvals: list[AgentApprovalDecision],
+        agent_id: str | None = None,
+        session_id: str | None = None,
+        model_name: str | None = None,
+    ) -> AgentChatResponse:
+        """基于上一轮 deferred tool requests 继续执行一次 run。"""
+
+        resolved_agent_id, resolved_model, agent = self._resolve_agent(agent_id=agent_id, model_name=model_name)
+        deps = self._build_deps(request_context)
+        message_history = ModelMessagesTypeAdapter.validate_json(message_history_json)
+        deferred_tool_results = self._build_deferred_tool_results(approvals)
+
+        result = await agent.run(
+            deps=deps,
+            message_history=message_history,
+            deferred_tool_results=deferred_tool_results,
+        )
+        return self._build_chat_response(
+            result=result,
             request_id=request_context.request_id,
+            session_id=session_id,
+            agent_id=resolved_agent_id,
+            model=resolved_model,
+        )
+
+    def _resolve_agent(self, *, agent_id: str | None, model_name: str | None) -> tuple[str, str, Any]:
+        if not self.settings.enabled:
+            raise AIDisabledError("AI 能力已关闭")
+
+        resolved_agent_id = agent_id or self.settings.default_agent
+        resolved_model = self.agent_manager.resolve_model(resolved_agent_id, model_name)
+        agent = self.agent_manager.get_agent(resolved_agent_id, resolved_model)
+        return resolved_agent_id, resolved_model, agent
+
+    def _build_deps(self, request_context: RequestContext) -> AgentDeps:
+        # `AgentDeps` 是本次运行注入给工具层和动态 instructions 的运行时依赖集合。
+        # 当前先放 request/settings/db/redis/http_client/tool_audit，
+        # 后续继续扩 history / approval / skill / mcp 也会沿着这个入口演进。
+        return AgentDeps(
+            request=request_context,
+            settings=self.settings,
+            db_session_factory=AsyncSessionLocal,
+            redis=redis_client.redis_pool,
+            http_client=self.http_client,
+            tool_audit=self.tool_audit,
+        )
+
+    def _build_chat_response(
+        self,
+        *,
+        result: Any,
+        request_id: str,
+        session_id: str | None,
+        agent_id: str,
+        model: str,
+    ) -> AgentChatResponse:
+        output = result.output
+        response = AgentChatResponse(
+            run_id=shortuuid.uuid(),
+            agent_id=agent_id,
+            model=model,
+            status="completed",
+            message=None,
+            request_id=request_id,
             session_id=session_id,
             usage=self._serialize_usage(result),
         )
 
-    async def _record_tool_exposure(self, *, agent_id: str, request_id: str, message: str, agent: Any, deps: AgentDeps) -> None:
-        """记录当前 run 暴露给模型的工具集合。
+        if isinstance(output, DeferredToolRequests):
+            response.status = "approval_required"
+            response.deferred_tool_requests = self._serialize_deferred_tool_requests(result, output)
+            return response
 
-        这里的关键点是：不依赖模型是否真的调用了某个工具，
-        而是在执行前直接从 Agent 聚合后的 toolset 中读取“本轮可见工具”。
+        response.message = output
+        return response
 
-        这样做的价值是：
-        - 对真实模型和 TestModel 都一致成立
-        - 能稳定回答“这次 run 为什么能看到这些工具”
-        - 为后续更细粒度的 wrapper / audit 扩展打基础
-        """
+    def _serialize_deferred_tool_requests(
+        self,
+        result: Any,
+        output: DeferredToolRequests,
+    ) -> AgentDeferredToolRequestsPayload:
+        approvals = [
+            AgentApprovalRequest(
+                tool_call_id=part.tool_call_id or "",
+                tool_name=part.tool_name,
+                args=self._normalize_tool_args(part.args),
+                metadata=dict(output.metadata.get(part.tool_call_id or "", {})),
+            )
+            for part in output.approvals
+        ]
+        calls = [
+            AgentApprovalRequest(
+                tool_call_id=part.tool_call_id or "",
+                tool_name=part.tool_name,
+                args=self._normalize_tool_args(part.args),
+                metadata=dict(output.metadata.get(part.tool_call_id or "", {})),
+            )
+            for part in output.calls
+        ]
+        return AgentDeferredToolRequestsPayload(
+            approvals=approvals,
+            calls=calls,
+            message_history_json=result.all_messages_json().decode(),
+        )
+
+    @staticmethod
+    def _build_deferred_tool_results(approvals: list[AgentApprovalDecision]) -> DeferredToolResults:
+        approval_map: dict[str, bool | ToolApproved | ToolDenied] = {}
+        for item in approvals:
+            if item.approved:
+                approval_map[item.tool_call_id] = (
+                    ToolApproved(override_args=item.override_args) if item.override_args is not None else True
+                )
+            else:
+                approval_map[item.tool_call_id] = ToolDenied(
+                    message=item.denial_message or "The tool call was denied."
+                )
+        return DeferredToolResults(approvals=approval_map)
+
+    async def _record_tool_exposure(
+        self,
+        *,
+        agent_id: str,
+        request_id: str,
+        message: str,
+        agent: Any,
+        deps: AgentDeps,
+    ) -> None:
+        """记录当前 run 暴露给模型的工具集合。"""
+
         model = agent._get_model(None)
         run_context = RunContext[AgentDeps](
             deps=deps,
@@ -121,6 +221,19 @@ class AgentRunner:
             tool_names=list(tools.keys()),
             tool_metadata={name: dict(tool.tool_def.metadata or {}) for name, tool in tools.items()},
         )
+
+    @staticmethod
+    def _normalize_tool_args(args: Any) -> dict[str, Any]:
+        if isinstance(args, dict):
+            return dict(args)
+        if isinstance(args, str):
+            try:
+                value = json.loads(args)
+            except json.JSONDecodeError:
+                return {}
+            if isinstance(value, dict):
+                return value
+        return {}
 
     @staticmethod
     def _serialize_usage(result: Any) -> dict[str, Any] | None:

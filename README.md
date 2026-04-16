@@ -16,6 +16,7 @@
 - 已为 builtin tools 增加稳定 metadata
 - 已接入最小 tool audit 记录
 - 已接入 wrapper/audit toolset 与最小 tool execution audit
+- 已接入 metadata 驱动的 approval policy wrapper
 - 支持真实模型和 `TestModel`
 
 当前还没有进入：
@@ -2019,6 +2020,597 @@ return api_response(data=result.model_dump(mode="json"))
 - streaming
 - approvals
 
+## Approval 审批闭环补充说明
+
+这一节专门整理当前项目里与 approval 相关的几个核心问题：
+
+- 什么时候会触发审批
+- `ApprovalRequired` 之后是谁接管
+- 逻辑闭环到底在哪里完成
+- 为什么接口拆成 `/chat` 与 `/chat/resume`
+- 前端应该如何驱动这条链
+
+### 1. 什么情况下会触发 approval
+
+当前项目是基于 tool metadata 做最小审批策略判断的。
+
+判断入口在：
+
+- `app/ai/toolsets/approval.py`
+- `tool_requires_approval(...)`
+
+当前规则非常明确：
+
+- `metadata["approval_required"] is True`
+- 或 `metadata["risk"] == "high"`
+
+只要命中任意一条，就认为这次工具调用需要进入审批。
+
+例如：
+
+```python
+metadata={
+    "category": "ops",
+    "readonly": False,
+    "risk": "high",
+    "approval_required": True,
+}
+```
+
+这种工具一旦被模型调用，就不会直接执行业务逻辑，而是先进入 approval 流程。
+
+### 2. `ApprovalRequired` 之后，谁来处理
+
+这里最容易误解的一点是：
+
+- `ApprovalRequired` 不是让业务代码到处 `try/except` 的
+- 它主要由 PydanticAI 运行时内部接管
+
+当前项目中，`chat-agent` 已经把：
+
+- `DeferredToolRequests`
+
+显式加入了 `output_type`。
+
+这意味着：
+
+- 当工具命中 approval 时
+- PydanticAI 不会把这次运行直接当成失败
+- 而是会把这轮运行转成一份“待审批结果”
+
+也就是：
+
+- `DeferredToolRequests`
+
+然后再由当前项目自己的 `AgentRunner` 把它整理成统一 API 响应。
+
+所以当前正式链路不是：
+
+```python
+try:
+    await wrapped_toolset.call_tool(...)
+except ApprovalRequired:
+    ...
+```
+
+而是：
+
+```text
+工具命中审批
+-> PydanticAI 内部转成 DeferredToolRequests
+-> AgentRunner 识别 output 类型
+-> API 返回 status="approval_required"
+```
+
+注意：
+
+- 直接 `except ApprovalRequired` 这种写法
+- 更适合测试或底层 wrapper 验证
+- 不是正常业务接口的主要写法
+
+### 3. 逻辑闭环到底在哪里完成
+
+approval 的闭环不是在单一一个函数里完成的，而是分成两段。
+
+第一段：首次 `/chat`
+
+- 用户调用 `/api/v1/agents/chat`
+- endpoint 构造 `ChatService`
+- `ChatService.chat(...)` 调用 `AgentRunner.run_chat(...)`
+- `AgentRunner.run_chat(...)` 内部执行 `agent.run(message, deps=deps)`
+- 如果模型调用了高风险工具，PydanticAI 会把本轮结果转成 `DeferredToolRequests`
+- `AgentRunner._build_chat_response(...)` 识别到这一点后，返回：
+  - `status="approval_required"`
+  - `deferred_tool_requests.approvals`
+  - `deferred_tool_requests.message_history_json`
+
+第二段：后续 `/chat/resume`
+
+- 前端或审批系统拿到第一次 `/chat` 的返回
+- 用户做出批准 / 拒绝决定
+- 再调用 `/api/v1/agents/chat/resume`
+- endpoint 调 `ChatService.resume(...)`
+- 再进入 `AgentRunner.resume_chat(...)`
+- `resume_chat(...)` 做两件事：
+  - 用 `message_history_json` 还原上一轮运行上下文
+  - 用前端传回的审批决定构造 `DeferredToolResults`
+- 然后再次调用：
+  - `agent.run(message_history=..., deferred_tool_results=..., deps=deps)`
+
+这一刻，闭环才真正完成。
+
+可以把它理解成：
+
+```text
+/chat 负责“停在审批点”
+/chat/resume 负责“从审批点继续跑”
+```
+
+### 4. `/chat/resume` 是什么时候调用的
+
+它不是后端自动调用的，也不是模型自己回调的。
+
+它的触发时机是：
+
+- 前端先调用 `/chat`
+- 如果响应里 `status == "approval_required"`
+- 前端就进入审批交互
+- 用户批准或拒绝后
+- 前端再显式调用 `/chat/resume`
+
+所以当前前端应当按响应 `status` 做分流：
+
+```text
+status == "completed"
+-> 直接展示 message
+
+status == "approval_required"
+-> 展示待审批工具
+-> 收集审批结果
+-> 调用 /chat/resume
+```
+
+也就是说，`/chat/resume` 不是每次都会调，而是：
+
+- 只有首次 `/chat` 停在审批点时才需要调
+
+### 5. 为什么拆成 `/chat` 与 `/chat/resume`
+
+技术上当然可以都放进 `/chat`。
+
+但当前拆开是更工程化的设计，因为这两个动作语义不同。
+
+`/chat` 表示：
+
+- 发起一轮新的用户问题
+
+`/chat/resume` 表示：
+
+- 继续一轮已经中断的 Agent 运行
+
+它们的请求体也完全不同：
+
+- `/chat` 的核心字段是 `message`
+- `/chat/resume` 的核心字段是 `message_history_json + approvals`
+
+如果都放在 `/chat`，后端就要先判断：
+
+- 你这次到底是在“发起新问题”
+- 还是“继续上一轮 run”
+
+这样会让：
+
+- schema 更复杂
+- endpoint 分支更多
+- 文档更难讲清楚
+- 后续接 streaming / external tools / retry / approval state 时更混乱
+
+所以当前拆成两个接口，本质上是在明确区分：
+
+- 开始一次 run
+- 继续一次 run
+
+### 6. 当前前端应如何对接 approval flow
+
+前端现在可以按下面的最小协议来接：
+
+第一步，调用：
+
+- `POST /api/v1/agents/chat`
+
+如果返回：
+
+```json
+{
+  "status": "completed",
+  "message": "最终回答"
+}
+```
+
+就直接展示结果。
+
+如果返回：
+
+```json
+{
+  "status": "approval_required",
+  "message": null,
+  "deferred_tool_requests": {
+    "approvals": [
+      {
+        "tool_call_id": "call_xxx",
+        "tool_name": "delete_demo_resource",
+        "args": {},
+        "metadata": {
+          "risk": "high",
+          "approval_required": true
+        }
+      }
+    ],
+    "calls": [],
+    "message_history_json": "..."
+  }
+}
+```
+
+前端就应该：
+
+- 展示审批确认框
+- 让用户选择批准或拒绝
+- 保留 `message_history_json`
+- 保留每个 `tool_call_id`
+
+第二步，调用：
+
+- `POST /api/v1/agents/chat/resume`
+
+例如：
+
+```json
+{
+  "agent_id": "chat-agent",
+  "message_history_json": "...",
+  "approvals": [
+    {
+      "tool_call_id": "call_xxx",
+      "approved": true
+    }
+  ]
+}
+```
+
+如果批准：
+
+- PydanticAI 会真正执行工具
+- 然后继续让模型生成最终回答
+
+如果拒绝：
+
+- PydanticAI 会把拒绝结果回送给模型
+- 再由模型决定如何继续回复用户
+
+### 7. 一句话总结当前 approval 闭环
+
+当前项目里的 approval 闭环可以概括成：
+
+```text
+模型请求高风险工具
+-> approval wrapper 拦截
+-> PydanticAI 输出 DeferredToolRequests
+-> /chat 返回 approval_required
+-> 前端完成审批
+-> /chat/resume 回填 DeferredToolResults
+-> Agent 从中断点继续执行
+-> 返回最终结果
+```
+
+所以当前这套实现已经不只是“预留审批入口”，而是已经具备了：
+
+- 审批判定
+- 审批中断
+- 审批结果回填
+- 续跑完成
+
+这就是当前阶段的最小可用 approval 闭环。
+
+### 8. approval 时序图
+
+如果把当前闭环按角色拆开，可以把它理解成下面这条时序。
+
+```text
+User
+  -> Frontend: 输入问题
+
+Frontend
+  -> POST /api/v1/agents/chat: message="请删除某资源"
+
+FastAPI endpoint
+  -> ChatService.chat(...)
+  -> AgentRunner.run_chat(...)
+  -> agent.run(message, deps=deps)
+
+Agent / PydanticAI runtime
+  -> 模型决定调用高风险工具
+  -> approval wrapper 判断 metadata:
+     - approval_required=True
+     - 或 risk=high
+  -> 工具调用不直接执行
+  -> 内部转成 DeferredToolRequests
+
+AgentRunner
+  -> 识别 result.output 是 DeferredToolRequests
+  -> 序列化为:
+     - status="approval_required"
+     - deferred_tool_requests.approvals
+     - deferred_tool_requests.message_history_json
+
+FastAPI endpoint
+  -> 返回 /chat 响应
+
+Frontend
+  -> 判断 status == "approval_required"
+  -> 打开审批确认 UI
+  -> 用户点击 批准 / 拒绝
+
+Frontend
+  -> POST /api/v1/agents/chat/resume:
+     - message_history_json
+     - approvals[{tool_call_id, approved}]
+
+FastAPI endpoint
+  -> ChatService.resume(...)
+  -> AgentRunner.resume_chat(...)
+  -> 反序列化 message_history_json
+  -> 构造 DeferredToolResults
+  -> agent.run(message_history=..., deferred_tool_results=..., deps=deps)
+
+PydanticAI runtime
+  -> 根据 tool_call_id 找回上一轮待处理工具调用
+  -> 如果 approved=True:
+     - 执行真实工具
+     - 把 ToolReturn 继续喂给模型
+  -> 如果 approved=False:
+     - 生成 ToolDenied
+     - 把拒绝结果继续喂给模型
+
+AgentRunner
+  -> 收到最终 result.output
+  -> 组装 status="completed"
+
+FastAPI endpoint
+  -> 返回 /chat/resume 响应
+
+Frontend
+  -> 展示最终 message
+```
+
+也可以把它压缩理解成一句更短的话：
+
+```text
+/chat 负责开始并可能停在审批点
+/chat/resume 负责把审批结果送回去并继续跑完
+```
+
+### 8.1 approval 时序图对应到哪些代码位置
+
+如果你想顺着代码一层层往下看，可以按下面这张“步骤 -> 文件位置”对照表来读。
+
+#### 首次 `/chat` 请求阶段
+
+1. 进入 HTTP 接口
+
+- 文件：`app/api/v1/endpoints/agent.py`
+- 方法：`chat_with_agent(...)`
+- 作用：
+  - 接收 `POST /api/v1/agents/chat`
+  - 构造 `RequestContext`
+  - 调用 `ChatService.chat(...)`
+
+2. 进入 service 层
+
+- 文件：`app/ai/services/chat_service.py`
+- 方法：`chat(...)`
+- 作用：
+  - 不直接处理 approval 逻辑
+  - 只是把请求转换成 `AgentRunner.run_chat(...)`
+
+3. 进入 runner 层
+
+- 文件：`app/ai/runtime/runner.py`
+- 方法：`run_chat(...)`
+- 作用：
+  - 解析当前使用哪个 agent / model
+  - 构造 `AgentDeps`
+  - 调用 `agent.run(message, deps=deps)`
+
+4. Agent 定义里已经挂好了 approval wrapper
+
+- 文件：`app/ai/agents/chat_agent.py`
+- 方法：`build_chat_agent(...)`
+- 关键点：
+  - `output_type=[str, DeferredToolRequests]`
+  - `toolsets=wrap_toolsets_with_audit(wrap_toolsets_with_metadata_approval(...))`
+
+这一步的意义是：
+
+- 如果工具命中了审批逻辑，PydanticAI 才能输出 `DeferredToolRequests`
+- 而不是把整个运行当成普通报错
+
+5. approval 判定发生在 toolset wrapper 中
+
+- 文件：`app/ai/toolsets/approval.py`
+- 方法：`tool_requires_approval(...)`
+- 作用：
+  - 根据 tool metadata 判断这次调用是否需要审批
+
+当前规则是：
+
+- `approval_required=True`
+- 或 `risk=="high"`
+
+6. toolset wrapper 把工具调用拦进 approval 流程
+
+- 文件：`app/ai/toolsets/approval.py`
+- 类型：`MetadataApprovalToolset`
+- 继承自：`ApprovalRequiredToolset`
+- 作用：
+  - 当某个工具满足审批条件时
+  - 不直接执行工具函数
+  - 而是进入 PydanticAI 的 deferred approval 流程
+
+7. PydanticAI 内部把 approval 转成 deferred output
+
+- 运行库位置：
+  - `.venv/lib/python3.13/site-packages/pydantic_ai/result.py`
+  - `.venv/lib/python3.13/site-packages/pydantic_ai/_agent_graph.py`
+- 作用：
+  - 识别这次工具调用属于 `unapproved`
+  - 生成 `DeferredToolRequests`
+
+8. 当前项目把 deferred output 包装成 `/chat` 响应
+
+- 文件：`app/ai/runtime/runner.py`
+- 方法：`_build_chat_response(...)`
+- 关键分支：
+  - 如果 `result.output` 是普通 `str`
+    - 返回 `status="completed"`
+  - 如果 `result.output` 是 `DeferredToolRequests`
+    - 返回 `status="approval_required"`
+
+9. 当前项目把待审批数据序列化给前端
+
+- 文件：`app/ai/runtime/runner.py`
+- 方法：`_serialize_deferred_tool_requests(...)`
+- 输出内容：
+  - `approvals`
+  - `calls`
+  - `message_history_json`
+
+10. 响应模型定义在 schema 中
+
+- 文件：`app/ai/schemas/chat.py`
+- 类型：
+  - `AgentChatResponse`
+  - `AgentDeferredToolRequestsPayload`
+  - `AgentApprovalRequest`
+
+这就是前端第一次拿到 `status="approval_required"` 的来源。
+
+#### 后续 `/chat/resume` 续跑阶段
+
+11. 前端在审批后再次进入 HTTP 接口
+
+- 文件：`app/api/v1/endpoints/agent.py`
+- 方法：`resume_agent_chat(...)`
+- 作用：
+  - 接收 `POST /api/v1/agents/chat/resume`
+  - 构造新的 `RequestContext`
+  - 调用 `ChatService.resume(...)`
+
+12. 进入 service 层的 resume 入口
+
+- 文件：`app/ai/services/chat_service.py`
+- 方法：`resume(...)`
+- 作用：
+  - 把前端提交的审批结果转交给 `AgentRunner.resume_chat(...)`
+
+13. 进入 runner 的续跑逻辑
+
+- 文件：`app/ai/runtime/runner.py`
+- 方法：`resume_chat(...)`
+- 关键动作：
+  - `ModelMessagesTypeAdapter.validate_json(message_history_json)`
+  - `_build_deferred_tool_results(approvals)`
+  - `agent.run(message_history=..., deferred_tool_results=..., deps=deps)`
+
+这一步是当前项目里“approval 闭环真正接起来”的核心位置。
+
+14. 审批结果被组装成 `DeferredToolResults`
+
+- 文件：`app/ai/runtime/runner.py`
+- 方法：`_build_deferred_tool_results(...)`
+- 映射规则：
+  - `approved=True` -> `ToolApproved(...)` 或 `True`
+  - `approved=False` -> `ToolDenied(...)`
+
+15. PydanticAI 根据 `tool_call_id` 恢复上一轮待处理工具调用
+
+- 运行库位置：
+  - `.venv/lib/python3.13/site-packages/pydantic_ai/_agent_graph.py`
+- 方法：
+  - `_handle_deferred_tool_results(...)`
+- 作用：
+  - 根据 `tool_call_id` 找回之前停住的工具调用
+  - 如果批准，就执行真实工具
+  - 如果拒绝，就把拒绝消息回送给模型
+
+16. 当前项目再次统一包装最终响应
+
+- 文件：`app/ai/runtime/runner.py`
+- 方法：`_build_chat_response(...)`
+- 结果：
+  - 如果模型已经产出最终文本
+  - 就返回 `status="completed"` 和 `message`
+
+#### 用一句更工程化的话概括
+
+如果按项目分层看，approval 闭环大致是：
+
+```text
+endpoint 接协议
+-> service 转调用
+-> runner 发起 / 恢复 run
+-> toolset wrapper 决定是否审批
+-> PydanticAI runtime 负责 deferred 中断与恢复
+-> runner 再包装成统一 API 响应
+```
+
+### 9. approval 相关职责分工
+
+为了避免把这条链看成“某一个函数处理了一切”，可以按职责这样理解：
+
+- `tool_requires_approval(...)`
+  负责判断“这次工具调用应不应该进入审批”
+- `MetadataApprovalToolset`
+  负责把需要审批的工具调用拦截成 approval 流程
+- `PydanticAI runtime`
+  负责把 `ApprovalRequired` 转成 `DeferredToolRequests`
+- `AgentRunner.run_chat(...)`
+  负责把 deferred 结果包装成 `/chat` 响应
+- 前端或审批系统
+  负责收集人工审批结果
+- `AgentRunner.resume_chat(...)`
+  负责把审批结果回填成 `DeferredToolResults`
+- `PydanticAI runtime`
+  负责根据 `tool_call_id` 恢复并继续执行
+
+这样看会更清楚：
+
+- 审批策略在 toolset 层
+- 中断与恢复在 runtime 层
+- 交互驱动在前端或上层系统
+- endpoint 只是协议入口，不负责审批决策本身
+
+### 10. 当前方案的边界
+
+当前 approval 闭环已经可用，但它仍然是“本阶段最小实现”，主要边界有这些：
+
+- 当前是无状态 resume 协议
+  - 由前端携带 `message_history_json`
+  - 服务端还没有落审批单或 run 状态表
+- 当前审批判断仍是最小规则
+  - 只看 tool metadata
+  - 还没有叠加用户角色、租户、环境、参数内容
+- 当前只接通了 approval 路径
+  - external tool calls 的完整回填协议还没继续展开
+- 当前还没有 streaming 形态
+  - 现在是标准 request/response
+
+所以这一阶段的正确定位是：
+
+- approval 能力已经打通
+- 但还没有进入平台级审批中心、持久化审批单、流式事件这些更完整阶段
+
 ---
 
 ## 六、当前这条链已经验证了什么
@@ -2027,6 +2619,7 @@ return api_response(data=result.model_dump(mode="json"))
 
 - 应用启动时可以初始化 AI runtime
 - `/api/v1/agents/chat` 可以真实触发 AgentRunner
+- `/api/v1/agents/chat/resume` 可以基于 `DeferredToolRequests` 继续执行
 - `AgentManager` 可以正确获取和缓存 Agent
 - `build_chat_agent()` 可以正确构造 Agent
 - `chat-agent` 可以通过 `FunctionToolset` 装配 builtin tools
@@ -2034,6 +2627,7 @@ return api_response(data=result.model_dump(mode="json"))
 - `RunContext[AgentDeps]` 工具可以访问请求上下文
 - 可以使用 `TestModel`
 - 可以使用真实 OpenAI 兼容 provider
+- 高风险工具可以先进入 approval，再由前端确认后续跑
 
 ---
 
@@ -2042,16 +2636,15 @@ return api_response(data=result.model_dump(mode="json"))
 当前它还是最小闭环，只覆盖：
 
 - 单次 chat 调用
+- 无状态 approval resume
 - 单 Agent
 - 少量基础工具
 
 还没覆盖：
 
-- `FunctionToolset`
 - 历史消息存储
 - 多轮上下文恢复
 - `run_stream`
-- `resume`
 - MCP manager
 - Skills resolver
 

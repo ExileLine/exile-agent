@@ -1,3 +1,9 @@
+from app.ai.toolsets.approval import (
+    MetadataApprovalToolset,
+    tool_requires_approval,
+    wrap_toolset_with_metadata_approval,
+    wrap_toolsets_with_metadata_approval,
+)
 from app.ai.toolsets.builtin import (
     get_builtin_request_toolset,
     get_builtin_runtime_toolset,
@@ -21,6 +27,7 @@ from app.ai.toolsets.metadata import (
 
 __all__ = [
     "READONLY_TOOL_PREFIXES",
+    "MetadataApprovalToolset",
     "TOOL_NAME_PATTERN",
     "ToolAuditWrapperToolset",
     "ToolRisk",
@@ -35,5 +42,8 @@ __all__ = [
     "get_builtin_toolsets",
     "validate_toolset_conventions",
     "wrap_toolset_with_audit",
+    "wrap_toolset_with_metadata_approval",
     "wrap_toolsets_with_audit",
+    "wrap_toolsets_with_metadata_approval",
+    "tool_requires_approval",
 ]

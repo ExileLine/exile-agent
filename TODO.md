@@ -378,13 +378,14 @@ Runner 负责：
 
 响应建议：
 
+- `status`
 - `message`
 - `agent_id`
 - `session_id`
 - `run_id`
 - `usage`
 - `tool_calls`
-- `approval_required` / `deferred_requests`
+- `deferred_tool_requests`
 
 ### 2. `POST /api/v1/agents/chat/stream`
 
@@ -395,12 +396,18 @@ Runner 负责：
 
 首期建议用 `SSE`
 
-### 3. `POST /api/v1/agents/runs/{run_id}/resume`
+### 3. `POST /api/v1/agents/chat/resume`
 
 用途：
 
 - 继续处理工具审批结果
 - 或处理外部 deferred tool result
+
+当前实现说明：
+
+- 当前已落地无状态 `resume` 协议
+- 前端需要回传 `message_history_json + approvals`
+- 后续如要升级为审批中心，再考虑引入 `run_id` 级状态持久化
 
 ### 4. `GET /api/v1/agents`
 
@@ -453,6 +460,34 @@ MCP_SERVERS_JSON=[]
 
 ## 分阶段实施清单
 
+## 当前进度概览
+
+截至目前，项目已经完成的核心基建有：
+
+- `Phase 0` 设计落盘
+- `Phase 1` AI 最小运行骨架
+- `Phase 2` Toolsets 与工具治理基础能力
+- `Phase 6` 中与 approval 相关的最小闭环
+
+当前已经具备：
+
+- `chat-agent` 最小可运行链路
+- `AgentRegistry` / `AgentManager` / `AgentRunner`
+- `POST /api/v1/agents/chat`
+- `POST /api/v1/agents/chat/resume`
+- `GET /api/v1/agents`
+- 分域 builtin toolsets
+- tool metadata / conventions / audit wrapper
+- metadata 驱动的 approval policy
+- `DeferredToolRequests` / `DeferredToolResults` 审批续跑协议
+- approval 端到端测试
+- README 调用链与 approval 闭环文档
+
+当前最自然的下一阶段是：
+
+- `Phase 3 - 会话历史与运行时管理`
+- 重点补 `session_id + Redis history store + 多轮恢复`
+
 ## Phase 0 - 设计落盘
 
 - [x] 评估当前 FastAPI 项目结构
@@ -498,14 +533,15 @@ MCP_SERVERS_JSON=[]
 - [x] 建立工具注册约定文档（README）
 - [x] 实现 wrapper/audit toolset
 - [x] 实现最小 tool execution audit（success/error）
-- [ ] 对高风险工具预留 approval 配置位
+- [x] 对高风险工具预留 approval 配置位（metadata policy wrapper）
 
 当前阶段说明：
 
 - 已具备分域 builtin toolsets 组合挂载能力
 - 已具备最小 tool exposure audit
 - 已具备最小 tool execution audit
-- Phase 2 剩余核心工作集中在 `approval` 预留与更细粒度的 audit 扩展
+- 已具备 metadata 驱动的 approval policy wrapper
+- Phase 2 最小目标已完成，后续增强项主要集中在更细粒度的 audit 扩展
 
 验收标准：
 
@@ -517,10 +553,17 @@ MCP_SERVERS_JSON=[]
 
 - [ ] 实现 Redis history store
 - [ ] 支持 `session_id` 多轮对话
-- [ ] 抽象 `run`, `run_stream`, `resume`
+- [x] 抽象 `run` / `resume`
+- [ ] 抽象 `run_stream`
 - [ ] 统一 run metadata、usage、error handling
 - [ ] 支持历史加载与保存
 - [ ] 为历史存储增加测试
+
+当前阶段说明：
+
+- `Runner` 已成为普通运行与审批续跑的统一入口
+- 但历史存储、`session_id` 连续对话、多轮恢复尚未接通
+- 本阶段应优先把“无状态 approval resume”推进到“有会话状态的连续对话”
 
 验收标准：
 
@@ -563,10 +606,17 @@ MCP_SERVERS_JSON=[]
 ## Phase 6 - Streaming / Approval / External Tools
 
 - [ ] 增加 `chat/stream` SSE 接口
-- [ ] 引入 `DeferredToolRequests` / `DeferredToolResults`
-- [ ] 实现 `resume` 协议
-- [ ] 对敏感工具启用审批流程
+- [x] 引入 `DeferredToolRequests` / `DeferredToolResults`
+- [x] 实现无状态 `chat/resume` 协议
+- [x] 对敏感工具启用审批流程
 - [ ] 如有前端工具调用需求，评估 `ExternalToolset`
+- [x] 增加 approval 端到端测试
+
+当前阶段说明：
+
+- approval 最小闭环已完成
+- 当前仍是无状态 `resume`，由前端回传 `message_history_json`
+- 后续如果要升级为平台级审批能力，还需要审批单持久化、状态管理和流式事件
 
 验收标准：
 
@@ -606,20 +656,24 @@ MCP_SERVERS_JSON=[]
 
 ## 首期实现顺序建议
 
-下一步建议严格按这个顺序推进：
+当前已经完成 `Phase 1` 与 `Phase 2`，并提前完成了 approval 最小闭环。
 
-1. `Phase 1`
-2. `Phase 2`
-3. `Phase 3`
-4. `Phase 4`
-5. `Phase 5`
+后续建议按这个顺序继续推进：
+
+1. `Phase 3`
+2. `Phase 6` 剩余项（`run_stream` / SSE / external tools）
+3. `Phase 4`
+4. `Phase 5`
+5. `Phase 7`
+6. `Phase 8`
 
 原因：
 
-- 没有 `AgentRegistry + Runner + Deps`，后面的 MCP/Skills 没有稳定挂载点
-- 没有 `Toolsets` 治理，后面业务工具会迅速散乱
-- 没有 `History/Session`，聊天接口只能停留在玩具阶段
-- MCP 与 Skills 都应建立在前面三层之上
+- 没有 `History/Session`，当前聊天仍停留在单次请求 + 无状态 approval resume
+- 没有 `run_stream`，前端仍拿不到连续事件流
+- 没有 `MCP`，外部工具协议能力还没有真正接进运行时
+- 没有 `Skills`，能力动态装配还停留在固定 toolsets 层
+- 在能力接入完成前，观测与测试应继续同步补齐
 
 ---
 
@@ -632,24 +686,31 @@ MCP_SERVERS_JSON=[]
 - 一个 `AgentManager`
 - 一个 `Runner`
 - `POST /api/v1/agents/chat`
+- `POST /api/v1/agents/chat/resume`
 - `GET /api/v1/agents`
 - 一组按能力域拆分的 builtin `FunctionToolset`
 - 四个 builtin 只读工具
 - builtin toolsets 组合挂载
 - builtin audit wrapper toolset
+- metadata approval wrapper toolset
 - toolset conventions / metadata helper
 - builtin tool metadata 标注
 - 最小 tool audit 记录
 - 最小 tool execution audit
+- metadata 驱动的 approval policy 入口
+- `DeferredToolRequests` / `DeferredToolResults` 审批续跑协议
+- approval 端到端测试
 - OpenAI 兼容 provider 配置接入
 - 基础测试
 - README 调用链文档
+- README approval 闭环说明文档
 
 下一步建议补齐：
 
-- 高风险工具 approval 配置与策略入口
-- 更细粒度的工具执行审计（耗时 / 入参脱敏 / 异常分类）
 - Redis 会话历史
+- `session_id` 多轮恢复
+- `run_stream`
+- 更细粒度的工具执行审计（耗时 / 入参脱敏 / 异常分类）
 - 一个示例 skill
 - 一个可选 MCP server 装配点
 
@@ -727,10 +788,10 @@ MCP_SERVERS_JSON=[]
 
 ## 下一步
 
-下一步可以直接开始 `Phase 1`：
+下一步建议直接进入 `Phase 3`：
 
-- 增加依赖
-- 创建 `app/ai/` 目录骨架
-- 定义 `AISettings`、`AgentDeps`、`AgentRegistry`
-- 落一个最小 `chat-agent`
-- 暴露第一个 `/api/v1/agents/chat` 接口
+- 实现 Redis history store
+- 基于 `session_id` 读写 message history
+- 在 `AgentRunner` 中接入 history load/save
+- 补多轮对话测试
+- 为后续 `run_stream` 与有状态 approval 打基础

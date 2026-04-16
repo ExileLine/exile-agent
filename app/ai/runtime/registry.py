@@ -1,5 +1,6 @@
 from collections.abc import Callable
 from dataclasses import dataclass
+from typing import Any
 
 from pydantic_ai import Agent
 
@@ -8,7 +9,7 @@ from app.ai.deps import AgentDeps
 from app.ai.exceptions import AgentNotFoundError
 from app.ai.schemas.agent import AgentManifest
 
-AgentBuilder = Callable[[AISettings, str], Agent[AgentDeps, str]]
+AgentBuilder = Callable[[AISettings, str], Agent[AgentDeps, Any]]
 
 
 @dataclass(slots=True)

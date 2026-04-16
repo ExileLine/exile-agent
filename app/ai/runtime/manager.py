@@ -1,3 +1,5 @@
+from typing import Any
+
 from pydantic_ai import Agent
 
 from app.ai.config import AISettings
@@ -17,7 +19,7 @@ class AgentManager:
     def __init__(self, *, registry: AgentRegistry, settings: AISettings) -> None:
         self.registry = registry
         self.settings = settings
-        self._cache: dict[tuple[str, str], Agent[AgentDeps, str]] = {}
+        self._cache: dict[tuple[str, str], Agent[AgentDeps, Any]] = {}
 
     def list_agents(self) -> list[AgentManifest]:
         return self.registry.list_manifests()
@@ -37,7 +39,7 @@ class AgentManager:
         manifest = self.get_manifest(agent_id)
         return model_name or manifest.default_model or self.settings.default_model
 
-    def get_agent(self, agent_id: str, model_name: str | None = None) -> Agent[AgentDeps, str]:
+    def get_agent(self, agent_id: str, model_name: str | None = None) -> Agent[AgentDeps, Any]:
         """获取一个可复用的 Agent 实例。
 
         当前缓存 key 是 `(agent_id, resolved_model)`，

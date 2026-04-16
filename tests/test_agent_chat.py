@@ -1,18 +1,77 @@
+import asyncio
+import httpx
 from fastapi.testclient import TestClient
+from pydantic_ai import Agent
+from pydantic_ai import RunContext
 from pydantic_ai import models
+from pydantic_ai.exceptions import ApprovalRequired
 from pydantic_ai.messages import ModelRequest, ModelResponse, TextPart, ToolCallPart, ToolReturnPart
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 from pydantic_ai.models.test import TestModel
+from pydantic_ai.toolsets.function import FunctionToolset
+from pydantic_ai.tools import DeferredToolRequests
+from pydantic_ai.usage import RunUsage
 
+from app.ai.config import AISettings
+from app.ai.deps import AgentDeps, RequestContext
 from app.main import app
+from app.ai.schemas.agent import AgentManifest
 from app.ai.toolsets.builtin import (
     get_builtin_request_toolset,
     get_builtin_runtime_toolset,
     get_builtin_time_toolset,
     get_builtin_toolsets,
 )
+from app.ai.toolsets import wrap_toolsets_with_audit, wrap_toolsets_with_metadata_approval
+from app.ai.toolsets.approval import tool_requires_approval, wrap_toolset_with_metadata_approval
+from app.ai.toolsets.conventions import create_function_toolset
+from app.ai.toolsets.metadata import build_tool_metadata
+from app.ai.services.tool_audit import ToolAuditService
 
 models.ALLOW_MODEL_REQUESTS = False
+
+
+def _build_test_deps(request_id: str) -> AgentDeps:
+    return AgentDeps(
+        request=RequestContext(request_id=request_id),
+        settings=AISettings(),
+        db_session_factory=None,
+        redis=None,
+        http_client=httpx.AsyncClient(),
+        tool_audit=ToolAuditService(),
+    )
+
+
+def _build_approval_demo_toolset() -> FunctionToolset[AgentDeps]:
+    toolset: FunctionToolset[AgentDeps] = create_function_toolset(
+        id="approval-demo-toolset",
+        metadata={"toolset": {"id": "approval-demo-toolset", "kind": "business", "owner": "test"}},
+    )
+
+    @toolset.tool_plain(
+        metadata=build_tool_metadata(category="ops", readonly=False, risk="high", approval_required=False),
+    )
+    def delete_demo_resource() -> str:
+        """Delete a demo resource."""
+
+        return "deleted"
+
+    return toolset
+
+
+def _build_approval_demo_agent(settings: AISettings, model_name: str) -> Agent[AgentDeps, str | DeferredToolRequests]:
+    return Agent[AgentDeps, str | DeferredToolRequests](
+        model=model_name,
+        deps_type=AgentDeps,
+        output_type=[str, DeferredToolRequests],
+        name="approval-demo-agent",
+        instructions="You are a demo approval agent.",
+        retries=settings.max_retries,
+        toolsets=wrap_toolsets_with_audit(
+            wrap_toolsets_with_metadata_approval([_build_approval_demo_toolset()])
+        ),
+        defer_model_check=True,
+    )
 
 
 def test_list_agents() -> None:
@@ -75,6 +134,86 @@ def test_builtin_toolsets_split_by_capability_domain() -> None:
         "get_runtime_config_summary",
         "check_runtime_resources",
     }
+
+
+def test_metadata_approval_policy_matches_metadata_flags() -> None:
+    low_risk_toolset: FunctionToolset[AgentDeps] = create_function_toolset(
+        id="test-low-risk-toolset",
+        metadata={"toolset": {"id": "test-low-risk-toolset", "kind": "business", "owner": "test"}},
+    )
+
+    @low_risk_toolset.tool_plain(
+        metadata=build_tool_metadata(category="demo", readonly=False, risk="low", approval_required=False),
+    )
+    def demo_safe_tool() -> str:
+        """Return a safe demo value."""
+        return "safe"
+
+    high_risk_toolset: FunctionToolset[AgentDeps] = create_function_toolset(
+        id="test-high-risk-toolset",
+        metadata={"toolset": {"id": "test-high-risk-toolset", "kind": "business", "owner": "test"}},
+    )
+
+    @high_risk_toolset.tool_plain(
+        metadata=build_tool_metadata(category="demo", readonly=False, risk="high", approval_required=False),
+    )
+    def demo_risky_tool() -> str:
+        """Return a risky demo value."""
+        return "risky"
+
+    deps = _build_test_deps("req-approval")
+    ctx = RunContext[AgentDeps](
+        deps=deps,
+        model=TestModel(),
+        usage=RunUsage(),
+        prompt="审批策略测试",
+    )
+
+    try:
+        low_risk_tool = next(iter(low_risk_toolset.tools.values()))
+        high_risk_tool = next(iter(high_risk_toolset.tools.values()))
+        assert tool_requires_approval(ctx, low_risk_tool.tool_def, {}) is False
+        assert tool_requires_approval(ctx, high_risk_tool.tool_def, {}) is True
+    finally:
+        asyncio.run(deps.http_client.aclose())
+
+
+async def _assert_approval_wrapper_blocks_high_risk_tool() -> None:
+    risky_toolset: FunctionToolset[AgentDeps] = create_function_toolset(
+        id="test-approval-block-toolset",
+        metadata={"toolset": {"id": "test-approval-block-toolset", "kind": "business", "owner": "test"}},
+    )
+
+    @risky_toolset.tool_plain(
+        metadata=build_tool_metadata(category="ops", readonly=False, risk="high", approval_required=False),
+    )
+    def delete_demo_resource() -> str:
+        """Delete a demo resource."""
+        return "deleted"
+
+    wrapped_toolset = wrap_toolset_with_metadata_approval(risky_toolset)
+    deps = _build_test_deps("req-approval-block")
+    run_context = RunContext[AgentDeps](
+        deps=deps,
+        model=TestModel(),
+        usage=RunUsage(),
+        prompt="执行高风险工具",
+    )
+
+    tools = await wrapped_toolset.get_tools(run_context)
+    tool = tools["delete_demo_resource"]
+    try:
+        await wrapped_toolset.call_tool("delete_demo_resource", {}, run_context, tool)
+    except ApprovalRequired:
+        return
+    finally:
+        await deps.http_client.aclose()
+
+    raise AssertionError("expected ApprovalRequired to be raised")
+
+
+def test_metadata_approval_wrapper_blocks_high_risk_tool() -> None:
+    asyncio.run(_assert_approval_wrapper_blocks_high_risk_tool())
 
 
 def test_chat_agent_registers_builtin_toolset_tools() -> None:
@@ -171,3 +310,67 @@ def test_runner_records_tool_execution_events() -> None:
     assert execution_record.tool_args == {}
     assert execution_record.tool_metadata["toolset"]["id"] == "builtin-request-toolset"
     assert execution_record.result["user_id"] == "tester"
+
+
+def test_chat_approval_resume_flow() -> None:
+    def approval_model(messages: list[ModelRequest | ModelResponse], info: AgentInfo) -> ModelResponse:
+        del info
+        for message in messages:
+            if isinstance(message, ModelRequest):
+                for part in message.parts:
+                    if isinstance(part, ToolReturnPart) and part.tool_name == "delete_demo_resource":
+                        return ModelResponse(parts=[TextPart(content="审批后已执行: deleted")])
+
+        return ModelResponse(parts=[ToolCallPart(tool_name="delete_demo_resource", args={})])
+
+    with TestClient(app) as client:
+        registry = client.app.state.ai_agent_registry
+        manager = client.app.state.ai_agent_manager
+        registry.register(
+            AgentManifest(
+                agent_id="approval-demo-agent",
+                name="Approval Demo Agent",
+                description="Agent used to test approval resume flow.",
+                default_model="test",
+            ),
+            _build_approval_demo_agent,
+        )
+
+        agent = manager.get_agent("approval-demo-agent")
+        with agent.override(model=FunctionModel(approval_model)):
+            first_response = client.post(
+                "/api/v1/agents/chat",
+                json={"agent_id": "approval-demo-agent", "message": "请删除演示资源"},
+                headers={"x-user-id": "tester"},
+            )
+
+            assert first_response.status_code == 200
+            first_body = first_response.json()
+            assert first_body["code"] == 200
+            assert first_body["data"]["status"] == "approval_required"
+            assert first_body["data"]["message"] is None
+
+            deferred = first_body["data"]["deferred_tool_requests"]
+            assert deferred is not None
+            assert deferred["calls"] == []
+            assert len(deferred["approvals"]) == 1
+            assert deferred["approvals"][0]["tool_name"] == "delete_demo_resource"
+            tool_call_id = deferred["approvals"][0]["tool_call_id"]
+            message_history_json = deferred["message_history_json"]
+
+            resume_response = client.post(
+                "/api/v1/agents/chat/resume",
+                json={
+                    "agent_id": "approval-demo-agent",
+                    "message_history_json": message_history_json,
+                    "approvals": [{"tool_call_id": tool_call_id, "approved": True}],
+                },
+                headers={"x-user-id": "tester"},
+            )
+
+    assert resume_response.status_code == 200
+    resume_body = resume_response.json()
+    assert resume_body["code"] == 200
+    assert resume_body["data"]["status"] == "completed"
+    assert resume_body["data"]["message"] == "审批后已执行: deleted"
+    assert resume_body["data"]["deferred_tool_requests"] is None
