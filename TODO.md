@@ -491,8 +491,9 @@ MCP_SERVERS_JSON=[]
 
 - [x] 实现基础 `FunctionToolset`
 - [x] 增加首批系统类只读工具（`get_current_utc_time`、`get_request_context`、`get_runtime_config_summary`、`check_runtime_resources`）
-- [ ] 统一工具命名、描述、参数 schema 规范
-- [ ] 实现 tool metadata 标注
+- [x] 统一工具命名、描述、参数 schema 规范
+- [x] 实现 tool metadata 标注
+- [x] 收敛 tool metadata 约定（`toolset.id/kind/owner`、`category`、`readonly`、`risk`、`approval_required`、`tags`）
 - [ ] 实现 wrapper/audit toolset
 - [ ] 对高风险工具预留 approval 配置位
 - [ ] 建立工具注册约定文档
@@ -625,6 +626,8 @@ MCP_SERVERS_JSON=[]
 - `GET /api/v1/agents`
 - 一个基础 `FunctionToolset`
 - 四个 builtin 只读工具
+- builtin tool metadata 标注
+- 最小 tool audit 记录
 - OpenAI 兼容 provider 配置接入
 - 基础测试
 - README 调用链文档

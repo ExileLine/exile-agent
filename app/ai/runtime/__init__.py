@@ -6,6 +6,7 @@ from app.ai.config import AISettings
 from app.ai.runtime.manager import AgentManager
 from app.ai.runtime.registry import AgentRegistry
 from app.ai.runtime.runner import AgentRunner
+from app.ai.services.tool_audit import ToolAuditService
 from app.core.config import BaseConfig
 
 
@@ -15,16 +16,19 @@ async def init_ai_runtime(app: FastAPI, project_config: BaseConfig) -> None:
     register_default_agents(registry, settings)
     manager = AgentManager(registry=registry, settings=settings)
     http_client = httpx.AsyncClient(timeout=settings.http_timeout_seconds)
+    tool_audit = ToolAuditService()
     runner = AgentRunner(
         settings=settings,
         agent_manager=manager,
         http_client=http_client,
+        tool_audit=tool_audit,
     )
 
     app.state.ai_settings = settings
     app.state.ai_agent_registry = registry
     app.state.ai_agent_manager = manager
     app.state.ai_http_client = http_client
+    app.state.ai_tool_audit = tool_audit
     app.state.ai_runner = runner
 
 
@@ -38,6 +42,7 @@ async def shutdown_ai_runtime(app: FastAPI) -> None:
         "ai_agent_registry",
         "ai_agent_manager",
         "ai_http_client",
+        "ai_tool_audit",
         "ai_runner",
     ):
         if hasattr(app.state, attr):

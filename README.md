@@ -13,6 +13,8 @@
 - 支持 `deps_type + RunContext`
 - 支持通过 `FunctionToolset` 装配基础工具
 - 已提供 4 个 builtin 只读工具
+- 已为 builtin tools 增加稳定 metadata
+- 已接入最小 tool audit 记录
 - 支持真实模型和 `TestModel`
 
 当前还没有进入：
@@ -22,7 +24,7 @@
 - Skills 基础设施
 - 流式输出
 - 审批续跑
-- 更完整的 `toolsets` 包装、审计与审批治理
+- 更完整的 `toolsets` 包装、审批治理与基于 hooks 的细粒度审计
 
 ---
 
@@ -59,6 +61,7 @@ POST /api/v1/agents/chat
    - 确定要用哪个 Agent
    - 确定要用哪个模型
    - 构造 `AgentDeps`
+   - 在执行前记录当前 run 可见的工具集合
    - 调用 `agent.run(...)`
    - 把结果整理成统一响应结构
 7. `AgentManager` 负责“拿 Agent”，如果缓存里没有，就调用 `build_chat_agent()` 构建。
@@ -84,6 +87,10 @@ app/
   ai/
     config.py                   # AISettings
     deps.py                     # RequestContext / AgentDeps
+    toolsets/
+      builtin.py                # builtin toolsets（time / request / runtime）
+      conventions.py            # toolset 本地注册规范与校验
+      metadata.py               # tool / toolset metadata helper
     runtime/__init__.py         # init_ai_runtime / shutdown_ai_runtime
     runtime/registry.py         # AgentRegistry
     runtime/manager.py          # AgentManager
@@ -101,8 +108,9 @@ app/
 4. [app/api/v1/endpoints/agent.py](./app/api/v1/endpoints/agent.py)
 5. [app/ai/services/chat_service.py](./app/ai/services/chat_service.py)
 6. [app/ai/runtime/runner.py](./app/ai/runtime/runner.py)
-7. [app/ai/runtime/manager.py](./app/ai/runtime/manager.py)
-8. [app/ai/agents/chat_agent.py](./app/ai/agents/chat_agent.py)
+7. [app/ai/toolsets/builtin.py](./app/ai/toolsets/builtin.py)
+8. [app/ai/runtime/manager.py](./app/ai/runtime/manager.py)
+9. [app/ai/agents/chat_agent.py](./app/ai/agents/chat_agent.py)
 
 ---
 
@@ -356,6 +364,11 @@ runner = AgentRunner(
 在当前架构里，它是：
 
 - 真正负责“执行一次 Agent 调用”的核心入口
+
+它和 `build_chat_agent()` 的分工可以简单理解成：
+
+- `build_chat_agent()`：负责定义 Agent 长什么样，默认挂哪些 toolsets
+- `AgentRunner.run_chat(...)`：负责执行这次请求，并把 request context / deps / tool exposure 接上
 
 也就是说：
 
@@ -1041,18 +1054,20 @@ agent: Agent[AgentDeps, str] = Agent[AgentDeps, str](
 
 ### 7.3 装配 `builtin_toolset`
 
-当前不是直接在 `chat-agent` 上零散注册工具，而是通过 `toolsets=[get_builtin_toolset()]` 装配一个基础工具集。
+当前不是直接在 `chat-agent` 上零散注册工具，而是通过 `toolsets=get_builtin_toolsets()` 装配一组 builtin 基础工具集。
 
 这代表当前项目已经从“Agent 内直接挂两个函数工具”，演进到“通过 `FunctionToolset` 组织基础工具”的阶段。
 
-当前 `builtin_toolset` 提供了 4 个只读工具：
+当前这组 builtin toolsets 一共提供了 4 个只读工具：
 
 - `get_current_utc_time`
 - `get_request_context`
 - `get_runtime_config_summary`
 - `check_runtime_resources`
 
-这些工具仍然会被模型看到并作为普通 function tools 调用，但它们的组织方式已经变成统一的 toolset。
+这些工具仍然会被模型看到并作为普通 function tools 调用，但它们的组织方式已经变成“多个小 toolset 按能力域组合挂载”。
+当前还给它们补上了 metadata，用于标记工具类别、只读属性和所属 toolset。
+另外，当前项目已经把一部分“工具注册规范”落成了代码级约束，而不只是口头约定。
 
 这样做的直接收益是：
 
@@ -1070,7 +1085,7 @@ agent: Agent[AgentDeps, str] = Agent[AgentDeps, str](
 - 什么时候应该优先使用它们
 - 不要在不需要的时候乱用它们
 
-当前 `builtin_toolset` 里的 instructions 大意是：
+当前 builtin toolsets 里的 instructions 大意是：
 
 - 当用户询问请求元数据、当前时间、或者 AI runtime 配置摘要时，优先使用 builtin tools
 
@@ -1087,16 +1102,33 @@ agent: Agent[AgentDeps, str] = Agent[AgentDeps, str](
 - Agent 本身不会堆满工具使用细节
 - 后续不同 toolset 可以携带各自不同的 instructions
 
-#### `id="builtin-toolset"` 的作用是什么
+#### 为什么现在不再只有一个 `builtin-toolset`
 
-这个 `id` 不是给模型看的，而是给系统和运行时看的。可以把它理解成：
+当前已经把 builtin 基础工具按能力域拆成了多个 toolset，例如：
 
-- 这个 toolset 的稳定身份标识
+- `builtin-time-toolset`
+- `builtin-request-toolset`
+- `builtin-runtime-toolset`
+
+这样拆的原因是：
+
+- 每个 toolset 的职责更单一
+- 后续扩展新 builtin 工具时，不需要一直往一个大 toolset 里堆
+- 更符合后面 MCP / Skills / business toolsets 的组合方式
+
+从 Agent 角度看，这些 toolset 仍然会在同一轮 run 中一起暴露给模型，所以外部行为没有变化，只是内部组织结构更清晰了。
+
+#### `id="builtin-toolset"` 或类似稳定 id 的作用是什么
+
+这些 `id` 不是给模型看的，而是给系统和运行时看的。可以把它理解成：
+
+- 每个 toolset 的稳定身份标识
 
 当前阶段它最直接的价值是：
 
 - 可读性更强，一眼能知道这是哪个 toolset
 - 后续日志、调试、排查时更容易标识来源
+- 可以把工具所属 toolset 信息稳定写入 metadata
 - 为未来多个 toolset 并存时提供稳定命名
 
 更进一步地说，`FunctionToolset.id` 也是在为后面的能力预留结构，例如：
@@ -1110,6 +1142,389 @@ agent: Agent[AgentDeps, str] = Agent[AgentDeps, str](
 
 - `instructions` 是告诉模型“这组工具什么时候用、怎么用”
 - `id` 是告诉系统“这组工具是谁”
+- `metadata` 是给系统保留一组结构化标签，便于过滤、审计和后续治理
+
+#### 当前已经落地的工具注册规范
+
+当前项目里，各个 builtin toolset 不是直接裸用 `FunctionToolset(...)`，而是通过一层本地约定封装创建：
+
+- `create_function_toolset(...)`
+
+这层封装当前默认开启了两项约束：
+
+- `strict=True`
+- `require_parameter_descriptions=True`
+
+对应含义可以理解成：
+
+- `strict=True`：要求 function tool 的 JSON schema 更严格，尤其是对 OpenAI 兼容模型更友好
+- `require_parameter_descriptions=True`：后续只要工具带业务参数，就要求参数必须写清描述，避免 schema 能跑但语义不清
+
+在这个基础上，toolset 构建完成后还会执行一层本地校验：
+
+- `validate_toolset_conventions(toolset)`
+
+当前这层校验至少会检查：
+
+- tool name 必须是小写 snake_case
+- tool description 不能为空
+- tool description 必须以句号结尾
+- tool 必须启用 `strict=True`
+- tool 必须启用 `require_parameter_descriptions=True`
+- 如果 metadata 标记了 `readonly=True`，工具名必须以只读前缀开头
+
+当前只读前缀约定是：
+
+- `get_`
+- `list_`
+- `check_`
+- `search_`
+
+例如当前 builtin tools：
+
+- `get_current_utc_time`
+- `get_request_context`
+- `get_runtime_config_summary`
+- `check_runtime_resources`
+
+都符合这套命名规则。
+
+这意味着后续如果有人新增工具时写成：
+
+- `GetUserInfo`
+- `fetch_status`
+- 没有 description
+- description 没有写完整句子
+
+那么在 toolset 构建阶段就会尽早失败，而不是等到线上调用时才暴露出“工具描述不稳定”“schema 不统一”“只读工具命名混乱”这类问题。
+
+所以到当前阶段，可以把这套约束理解成：
+
+- metadata 规范：解决“工具是什么”
+- naming / description / schema 规范：解决“工具怎么被稳定地定义出来”
+- audit 记录：解决“工具在本次运行里是怎么暴露出去的”
+
+#### `FunctionToolset` 中 `metadata` 入参的规范是什么
+
+先说结论：当前 `pydantic_ai` 对 `FunctionToolset(metadata=...)` 没有定义一套强制固定 schema。
+
+它在类型上就是：
+
+```python
+metadata: dict[str, Any] | None = None
+```
+
+也就是说：
+
+- 可以不传
+- 传了就是一个字典
+- key 一般是字符串
+- value 理论上可以是任意对象
+
+但虽然类型写的是 `Any`，项目内不建议真的随便塞。更稳妥的做法是：
+
+- 只放结构化、可序列化的数据
+- 尽量限制为 `str / int / float / bool / list / dict / None`
+- 不要放数据库连接、函数对象、class 实例这类运行时对象
+
+这样后续做：
+
+- tool selector 过滤
+- 审计记录
+- 持久化
+- 配置化治理
+
+都会更稳定。
+
+#### 这份 `metadata` 会发给模型吗
+
+不会。
+
+`pydantic_ai` 对它的定位更接近“系统内部标签”，而不是给大模型看的提示信息。
+
+它主要用于：
+
+- filtering
+- tool behavior customization
+- audit / observability
+- 后续审批与治理扩展
+
+所以你可以把它理解成：
+
+- `description` / `instructions` 是给模型看的
+- `metadata` 是给框架和我们项目自己看的
+
+#### `FunctionToolset.metadata` 和单个 tool 的 `metadata` 是什么关系
+
+这里有一个很关键的规则：
+
+- `FunctionToolset` 上的 `metadata` 会应用到这个 toolset 内的所有工具
+- 如果单个工具自己也声明了 `metadata`，两者会合并
+- 合并规则是浅合并，不是深合并
+
+当前源码里的合并逻辑可以理解成：
+
+```python
+tool.metadata = toolset.metadata | (tool.metadata or {})
+```
+
+这表示：
+
+- toolset 级别 metadata 先铺一层默认值
+- 单个 tool 自己的同名字段会覆盖 toolset 中的字段
+
+例如：
+
+```python
+toolset_metadata = {
+    "toolset": {"id": "builtin-toolset", "kind": "builtin"},
+    "readonly": True,
+}
+
+tool_metadata = {
+    "category": "time",
+    "readonly": False,
+}
+```
+
+最终工具上会得到：
+
+```python
+{
+    "toolset": {"id": "builtin-toolset", "kind": "builtin"},
+    "readonly": False,
+    "category": "time",
+}
+```
+
+这里要特别注意：
+
+- 这是浅合并
+- 如果同名 key 对应的是嵌套 dict，后者会整体覆盖前者对应 key
+- 它不是递归 merge
+
+#### 这个 `metadata` 实际会被谁使用
+
+当前最直接的用途有两个。
+
+第一个是 `ToolAuditService`。
+它会记录本次 run 暴露给模型的工具集合，以及每个工具带了哪些 metadata 标签。
+
+第二个是后续的 tool 过滤与能力治理。
+`pydantic_ai` 的 `ToolSelector` 支持直接用字典按 metadata 做匹配，而且是“深包含”语义。
+
+例如可以表达成：
+
+```python
+selector = {
+    "toolset": {"kind": "builtin"},
+    "readonly": True,
+}
+```
+
+它的意思不是“metadata 必须完全相等”，而是：
+
+- 工具 metadata 至少要包含这些键值
+- 可以额外带更多字段
+
+所以 metadata 设计得是否稳定，直接决定了后面：
+
+- wrapper toolset 好不好做
+- approval / audit 好不好做
+- MCP / Skills / builtin tools 能不能统一治理
+
+#### 当前项目里建议采用什么规范
+
+虽然框架没有强制 schema，但项目内最好尽早统一约定。
+
+当前阶段建议把 metadata 规范成下面这类结构：
+
+```python
+{
+    "toolset": {
+        "id": "builtin-time-toolset",
+        "kind": "builtin",
+        "owner": "platform",
+    },
+    "category": "time",
+    "readonly": True,
+    "risk": "low",
+    "approval_required": False,
+    "tags": ["system", "debug"],
+}
+```
+
+字段建议可以这样理解：
+
+- `toolset.id`：这个工具属于哪个稳定 toolset
+- `toolset.kind`：能力来源类型，例如 `builtin / business / mcp / skill`
+- `toolset.owner`：这组工具归哪个模块或团队维护
+- `category`：工具业务类别，例如 `time / request / config / runtime`
+- `readonly`：是否只读
+- `risk`：风险等级
+- `approval_required`：是否需要审批
+- `tags`：补充型标签
+
+#### 当前项目已经在用的 metadata 约定
+
+当前 [`app/ai/toolsets/builtin.py`](./app/ai/toolsets/builtin.py) 里已经落了一个轻量版本：
+
+```python
+metadata={
+    "toolset": {
+        "id": "builtin-time-toolset",
+        "kind": "builtin",
+        "owner": "platform",
+    }
+}
+```
+
+而每个具体工具再补自己那层标签，例如：
+
+```python
+metadata={
+    "category": "time",
+    "readonly": True,
+    "risk": "low",
+    "approval_required": False,
+}
+```
+
+这说明当前项目已经开始把 metadata 当成“治理标签”来用，而不只是随便附带一点备注信息。
+
+后续进入：
+
+- MCP toolset
+- skill resolved toolset
+- approval wrapper
+- tool execution audit
+
+这些阶段时，metadata 基本会成为统一治理的核心连接点之一。
+
+#### `ToolAuditService` 的作用和目的是什么
+
+当前的 `ToolAuditService` 不是业务功能，而是一层最小的工具审计与调试基础设施。
+
+它的核心作用是：
+
+- 记录“这次 Agent 运行把哪些工具暴露给了模型”
+- 同时记录这些工具带了什么 metadata
+
+也就是说，它当前更准确记录的是：
+
+- tool exposure
+
+而不是完整意义上的：
+
+- tool execution
+
+当前一条审计记录里主要包含：
+
+- `agent_id`
+- `request_id`
+- `tool_names`
+- `tool_metadata`
+
+这意味着它现在回答的问题是：
+
+- 这次 run 属于哪个 Agent
+- 对应哪个请求
+- 本次运行前模型能看到哪些工具
+- 这些工具各自携带了哪些治理标签
+
+它当前还没有做这些事：
+
+- 不记录每一次真实 tool call
+- 不记录工具入参
+- 不记录工具返回值
+- 不记录工具执行耗时
+- 不记录工具异常
+- 不做持久化存储
+
+所以现在这个版本可以理解成：
+
+- 面向当前阶段的最小 observability 基础
+- 也是后续 wrapper / audit toolset 的前置地基
+
+#### 为什么现在就要加 `ToolAuditService`
+
+因为项目已经进入 `Phase 2`，工具层开始从“能调用”进入“可治理”。
+
+一旦开始做：
+
+- `FunctionToolset`
+- tool metadata
+- 多 toolset 组合
+- 后续 MCP / Skills 动态装配
+
+就一定会遇到这些排查问题：
+
+- 这次 run 为什么能看到某个工具
+- 某个工具到底来自哪个 toolset
+- 某个请求暴露出来的工具集合是否符合预期
+- 动态装配时是不是把不该给模型的工具也暴露了
+
+如果没有一层基础审计，这些问题后面会很难排查。
+
+#### 它和 tool metadata 是什么关系
+
+两者是配套的。
+
+如果没有 metadata，审计里通常只能看到：
+
+- 工具名
+
+这远远不够。
+
+有了 metadata 之后，审计里才能稳定看到类似这些结构化信息：
+
+- 工具属于哪个 toolset
+- 工具属于哪个 category
+- 工具是不是只读
+- 后面还可以继续加 risk level / approval policy / ownership
+
+所以你可以把它们配套理解成：
+
+- `ToolAuditService` 负责“记录”
+- tool metadata 负责“给记录提供结构化标签”
+
+#### 当前调用链里，它是怎么工作的
+
+当前实现里，`AgentRunner.run_chat(...)` 会在真正执行：
+
+- `agent.run(message, deps=deps)`
+
+之前，先读取当前 Agent 经过 toolset 装配后的工具定义，并把这次 run 可暴露给模型的工具集合记录下来。
+
+按当前代码结构，这一步拿到的不是某一个单独的 builtin toolset，而是 Agent 已经聚合完成后的总 toolset。也就是说：
+
+- `chat-agent` 先挂上 `get_builtin_toolsets()`
+- `AgentRunner` 再通过 Agent 聚合后的 toolset 读取当前 run 可见工具
+- `ToolAuditService` 记录这些工具名和 metadata
+
+也就是说，它记录的不是“模型猜测会用什么”，而是：
+
+- 当前这次运行实际可见的工具集合
+
+这样做的好处是：
+
+- 不依赖 `TestModel` 内部状态
+- 对真实模型和测试模型都成立
+- 记录点稳定，便于后续扩展
+
+#### 为什么还把它放进 `AgentDeps`
+
+当前虽然主要是 `AgentRunner` 在用它，但它已经被放进了 `AgentDeps`。
+
+这意味着后续如果要扩展成更完整的工具审计，你可以在这些位置继续使用它：
+
+- `tool` 函数内部
+- wrapper toolset
+- hooks
+- approval 流程
+- external tool 执行回调
+
+所以当前把它放进 `AgentDeps`，本质上是在为后续更完整的审计与治理预留依赖注入入口。
 
 #### `tool_plain`、`tool`、`FunctionToolset` 三者是什么关系
 
@@ -1189,14 +1604,14 @@ agent: Agent[AgentDeps, str] = Agent[AgentDeps, str](
 当前代码里是：
 
 ```python
-toolsets=[get_builtin_toolset()]
+toolsets=get_builtin_toolsets()
 ```
 
 但它本质上是一个序列，所以完全可以扩展成：
 
 ```python
 toolsets=[
-    get_builtin_toolset(),
+    *get_builtin_toolsets(),
     get_ops_toolset(),
     get_business_toolset(),
 ]
@@ -1206,7 +1621,7 @@ toolsets=[
 
 ```python
 toolsets=[
-    get_builtin_toolset(),
+    *get_builtin_toolsets(),
     get_business_toolset(),
     mcp_toolset,
 ]
@@ -1220,7 +1635,7 @@ toolsets=[
 
 也就是说：
 
-- `builtin_toolset` 提供一批基础只读工具
+- `builtin toolsets` 提供一批基础只读工具
 - `business_toolset` 提供一批业务工具
 - `mcp_toolset` 提供一批外部能力工具
 
@@ -1232,7 +1647,9 @@ toolsets=[
 
 按现在的规划，后面很可能逐步出现：
 
-- `builtin_toolset`
+- `builtin-time-toolset`
+- `builtin-request-toolset`
+- `builtin-runtime-toolset`
 - `ops_toolset`
 - `business_toolset`
 - `mcp_toolset`
@@ -1270,7 +1687,7 @@ toolsets=[
 当前 `chat-agent` 里写的是：
 
 ```python
-toolsets=[get_builtin_toolset()]
+toolsets=get_builtin_toolsets()
 ```
 
 这属于静态装配，也就是：
@@ -1284,7 +1701,7 @@ toolsets=[get_builtin_toolset()]
 
 例如：
 
-- 所有请求都带 `builtin_toolset`
+- 所有请求都带 `builtin toolsets`
 - 某些请求额外带业务 toolset
 - 某些请求额外带 skill toolset
 - 某些请求额外带 MCP toolset
@@ -1292,14 +1709,14 @@ toolsets=[get_builtin_toolset()]
 也就是说，后面这条链大概率会从：
 
 ```python
-toolsets=[get_builtin_toolset()]
+toolsets=get_builtin_toolsets()
 ```
 
 演进成：
 
 ```python
 toolsets=[
-    get_builtin_toolset(),
+    *get_builtin_toolsets(),
     get_business_toolset(),
     *resolved_skill_toolsets,
     *resolved_mcp_toolsets,
@@ -1308,7 +1725,7 @@ toolsets=[
 
 所以你可以把当前这一步理解成：
 
-- 先把单个 `builtin_toolset` 跑通
+- 先把一组基础 builtin toolsets 跑通
 - 后续再把它扩展成多个 toolset 的组合装配机制
 
 #### 当前项目里的推荐用法
@@ -1323,7 +1740,7 @@ toolsets=[
 
 - `get_current_utc_time` 是 `tool_plain`
 - `get_request_context` 是 `tool`
-- `builtin_toolset` 是 `FunctionToolset`
+- `builtin_time/request/runtime_toolset` 是 `FunctionToolset`
 
 这个分层正是后面继续做：
 

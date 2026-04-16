@@ -4,10 +4,20 @@ from pydantic_ai.providers.openai import OpenAIProvider
 
 from app.ai.config import AISettings
 from app.ai.deps import AgentDeps
-from app.ai.toolsets import get_builtin_toolset
+from app.ai.toolsets import get_builtin_toolsets
 
 
 def build_chat_agent(settings: AISettings, model_name: str) -> Agent[AgentDeps, str]:
+    """构造默认的 chat-agent 定义。
+
+    这里做的是“Agent 定义态”的事情：
+    - 选择模型
+    - 声明 deps_type / output_type
+    - 设置全局 instructions
+    - 挂载默认 builtin toolsets
+
+    它本身并不执行模型调用，真正执行发生在 `AgentRunner.run_chat(...)` 里。
+    """
     model = _build_model(settings, model_name)
     agent: Agent[AgentDeps, str] = Agent[AgentDeps, str](
         model=model,
@@ -21,7 +31,9 @@ def build_chat_agent(settings: AISettings, model_name: str) -> Agent[AgentDeps, 
             "When runtime metadata would help, use the available builtin tools instead of guessing."
         ),
         retries=settings.max_retries,
-        toolsets=[get_builtin_toolset()],
+        # 这里挂的是一组 builtin toolsets，而不是单个大 toolset。
+        # Agent 运行时会把这些 toolset 合并成当前这轮 run 的可用工具集合。
+        toolsets=get_builtin_toolsets(),
         defer_model_check=True,
     )
 
@@ -29,6 +41,14 @@ def build_chat_agent(settings: AISettings, model_name: str) -> Agent[AgentDeps, 
 
 
 def _build_model(settings: AISettings, model_name: str):
+    """根据配置解析当前 Agent 应该使用的模型对象。
+
+    当前支持两种路径：
+    - 非 `openai:` 前缀：直接把字符串交给 PydanticAI 处理
+    - `openai:` 前缀：显式构造 OpenAI 兼容 provider + chat model
+
+    这样既能兼容测试态/简化场景，也能兼容真实的 OpenAI-compatible 服务端。
+    """
     if not model_name.startswith("openai:"):
         return model_name
 
