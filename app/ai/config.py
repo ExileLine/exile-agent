@@ -4,6 +4,12 @@ from app.core.config import BaseConfig
 
 
 class AISettings(BaseModel):
+    """AI 子系统自己的配置视图。
+
+    项目总配置里可能还有很多与 AI 无关的字段，
+    这里单独抽一层 `AISettings` 的目的，是让 runtime / agent / runner
+    这些模块只依赖自己真正关心的配置，避免一路透传整个 `BaseConfig`。
+    """
     model_config = ConfigDict(extra="ignore")
 
     enabled: bool = True
@@ -16,6 +22,7 @@ class AISettings(BaseModel):
 
     @classmethod
     def from_config(cls, config: BaseConfig) -> "AISettings":
+        """从全局配置对象提取 AI 运行时需要的最小配置集。"""
         return cls(
             enabled=config.AI_ENABLED,
             default_agent=config.AI_DEFAULT_AGENT,

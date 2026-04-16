@@ -4,6 +4,7 @@ from pydantic import BaseModel, Field
 
 
 class AgentChatRequest(BaseModel):
+    """`POST /api/v1/agents/chat` 的请求体。"""
     agent_id: str | None = Field(default=None, description="目标 Agent ID")
     message: str = Field(min_length=1, description="用户输入")
     session_id: str | None = Field(default=None, description="会话 ID")
@@ -11,6 +12,7 @@ class AgentChatRequest(BaseModel):
 
 
 class AgentChatResponse(BaseModel):
+    """一次 chat run 的标准化响应结构。"""
     run_id: str = Field(description="运行 ID")
     agent_id: str = Field(description="Agent ID")
     model: str = Field(description="实际使用的模型")

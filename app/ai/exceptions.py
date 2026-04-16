@@ -1,14 +1,14 @@
 class AIRuntimeError(Exception):
-    """Base AI runtime error."""
+    """AI 子系统的基础异常类型。"""
 
 
 class AIDisabledError(AIRuntimeError):
-    """Raised when AI features are disabled."""
+    """AI 能力被配置关闭时抛出。"""
 
 
 class AIRuntimeNotReadyError(AIRuntimeError):
-    """Raised when AI runtime resources are not available."""
+    """AI runtime 尚未初始化完成或关键资源不可用时抛出。"""
 
 
 class AgentNotFoundError(AIRuntimeError):
-    """Raised when an agent id is not registered."""
+    """请求的 agent_id 在注册表中不存在时抛出。"""

@@ -4,7 +4,7 @@ from pydantic_ai.providers.openai import OpenAIProvider
 
 from app.ai.config import AISettings
 from app.ai.deps import AgentDeps
-from app.ai.toolsets import get_builtin_toolsets
+from app.ai.toolsets import get_builtin_toolsets, wrap_toolsets_with_audit
 
 
 def build_chat_agent(settings: AISettings, model_name: str) -> Agent[AgentDeps, str]:
@@ -33,7 +33,8 @@ def build_chat_agent(settings: AISettings, model_name: str) -> Agent[AgentDeps, 
         retries=settings.max_retries,
         # 这里挂的是一组 builtin toolsets，而不是单个大 toolset。
         # Agent 运行时会把这些 toolset 合并成当前这轮 run 的可用工具集合。
-        toolsets=get_builtin_toolsets(),
+        # 同时会在外层包一层 audit wrapper，用于记录真实工具执行事件。
+        toolsets=wrap_toolsets_with_audit(get_builtin_toolsets()),
         defer_model_check=True,
     )
 

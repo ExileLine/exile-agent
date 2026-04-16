@@ -15,6 +15,7 @@
 - 已提供 4 个 builtin 只读工具
 - 已为 builtin tools 增加稳定 metadata
 - 已接入最小 tool audit 记录
+- 已接入 wrapper/audit toolset 与最小 tool execution audit
 - 支持真实模型和 `TestModel`
 
 当前还没有进入：
@@ -88,6 +89,7 @@ app/
     config.py                   # AISettings
     deps.py                     # RequestContext / AgentDeps
     toolsets/
+      audit.py                  # wrapper/audit toolset
       builtin.py                # builtin toolsets（time / request / runtime）
       conventions.py            # toolset 本地注册规范与校验
       metadata.py               # tool / toolset metadata helper
@@ -1409,14 +1411,16 @@ metadata={
 
 - 记录“这次 Agent 运行把哪些工具暴露给了模型”
 - 同时记录这些工具带了什么 metadata
+- 记录真实发生的 tool execution 事件
 
 也就是说，它当前更准确记录的是：
 
 - tool exposure
+- 最小 tool execution audit
 
-而不是完整意义上的：
+但它还不是完整意义上的：
 
-- tool execution
+- 完整 execution telemetry
 
 当前一条审计记录里主要包含：
 
@@ -1424,6 +1428,17 @@ metadata={
 - `request_id`
 - `tool_names`
 - `tool_metadata`
+
+而当前一条执行记录里主要包含：
+
+- `agent_id`
+- `request_id`
+- `tool_name`
+- `tool_call_id`
+- `status`
+- `tool_args`
+- `tool_metadata`
+- `result / error`
 
 这意味着它现在回答的问题是：
 
@@ -1434,17 +1449,16 @@ metadata={
 
 它当前还没有做这些事：
 
-- 不记录每一次真实 tool call
-- 不记录工具入参
-- 不记录工具返回值
-- 不记录工具执行耗时
-- 不记录工具异常
+- 不记录执行耗时
+- 不做入参脱敏
+- 不做异常分类
 - 不做持久化存储
 
 所以现在这个版本可以理解成：
 
 - 面向当前阶段的最小 observability 基础
-- 也是后续 wrapper / audit toolset 的前置地基
+- 已经具备最小 wrapper / audit toolset 能力
+- 但仍然只是后续更细粒度审计的前置地基
 
 #### 为什么现在就要加 `ToolAuditService`
 
@@ -1501,6 +1515,61 @@ metadata={
 - `chat-agent` 先挂上 `get_builtin_toolsets()`
 - `AgentRunner` 再通过 Agent 聚合后的 toolset 读取当前 run 可见工具
 - `ToolAuditService` 记录这些工具名和 metadata
+
+#### 从 `agent.run(...)` 到 `WrapperToolset.call_tool(...)` 的调用链是怎样的
+
+如果继续往下看“真实工具执行”这条线，当前可以把它理解成：
+
+```text
+build_chat_agent(...)
+  -> toolsets = wrap_toolsets_with_audit(get_builtin_toolsets())
+  -> agent.run(message, deps=deps)
+  -> PydanticAI 聚合所有 toolsets
+  -> model 决定发起某个 tool call
+  -> ToolManager 调度工具执行
+  -> ToolAuditWrapperToolset.call_tool(...)
+  -> wrapped builtin toolset.call_tool(...)
+  -> 真实工具函数执行
+  -> ToolAuditService 记录 execution event
+```
+
+这条链里最关键的点有两个：
+
+第一个点是：
+
+- `AgentRunner` 适合记录 tool exposure
+
+因为它在执行前就能稳定拿到：
+
+- 这次 run 用的是哪个 Agent
+- 本轮对模型可见的工具集合是什么
+
+所以它适合回答：
+
+- 这次 run 为什么能看到这些工具
+
+第二个点是：
+
+- `ToolAuditWrapperToolset.call_tool(...)` 适合记录 tool execution
+
+因为真实工具调用最终会经过 toolset 的 `call_tool(...)`。
+这意味着只要在 wrapper 里拦截这个方法，就能统一拿到：
+
+- tool name
+- tool args
+- tool_call_id
+- tool metadata
+- success / error
+- result / exception
+
+这也是为什么当前项目没有把“执行审计”写进每个具体工具函数里，而是放在 audit wrapper 里统一处理。
+
+这样做的好处是：
+
+- 工具函数本身保持干净，只关心业务逻辑
+- 审计逻辑不会散落在每个工具实现中
+- 后续 business / MCP / skill toolsets 也可以复用同一层 wrapper
+- 以后要扩执行耗时、参数脱敏、异常分类时，只需要继续增强 wrapper
 
 也就是说，它记录的不是“模型猜测会用什么”，而是：
 

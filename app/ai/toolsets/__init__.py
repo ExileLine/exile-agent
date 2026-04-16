@@ -4,6 +4,7 @@ from app.ai.toolsets.builtin import (
     get_builtin_time_toolset,
     get_builtin_toolsets,
 )
+from app.ai.toolsets.audit import ToolAuditWrapperToolset, wrap_toolset_with_audit, wrap_toolsets_with_audit
 from app.ai.toolsets.conventions import (
     READONLY_TOOL_PREFIXES,
     TOOL_NAME_PATTERN,
@@ -21,6 +22,7 @@ from app.ai.toolsets.metadata import (
 __all__ = [
     "READONLY_TOOL_PREFIXES",
     "TOOL_NAME_PATTERN",
+    "ToolAuditWrapperToolset",
     "ToolRisk",
     "ToolConventionError",
     "ToolsetKind",
@@ -32,4 +34,6 @@ __all__ = [
     "get_builtin_time_toolset",
     "get_builtin_toolsets",
     "validate_toolset_conventions",
+    "wrap_toolset_with_audit",
+    "wrap_toolsets_with_audit",
 ]

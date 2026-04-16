@@ -11,6 +11,18 @@ from app.core.config import BaseConfig
 
 
 async def init_ai_runtime(app: FastAPI, project_config: BaseConfig) -> None:
+    """在应用启动阶段初始化 AI runtime 并挂到 `app.state`。
+
+    当前这一步会统一装配：
+    - AISettings
+    - AgentRegistry
+    - AgentManager
+    - 共享 http client
+    - ToolAuditService
+    - AgentRunner
+
+    然后再把它们挂到 `app.state`，供 endpoint 按需取用。
+    """
     settings = AISettings.from_config(project_config)
     registry = AgentRegistry()
     register_default_agents(registry, settings)
@@ -33,6 +45,7 @@ async def init_ai_runtime(app: FastAPI, project_config: BaseConfig) -> None:
 
 
 async def shutdown_ai_runtime(app: FastAPI) -> None:
+    """在应用关闭阶段释放 AI runtime 资源并清理 `app.state`。"""
     http_client = getattr(app.state, "ai_http_client", None)
     if http_client is not None:
         await http_client.aclose()

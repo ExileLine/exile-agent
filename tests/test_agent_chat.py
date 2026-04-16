@@ -1,5 +1,7 @@
 from fastapi.testclient import TestClient
 from pydantic_ai import models
+from pydantic_ai.messages import ModelRequest, ModelResponse, TextPart, ToolCallPart, ToolReturnPart
+from pydantic_ai.models.function import AgentInfo, FunctionModel
 from pydantic_ai.models.test import TestModel
 
 from app.main import app
@@ -136,3 +138,36 @@ def test_runner_records_latest_tool_exposure() -> None:
     assert record.tool_metadata["get_runtime_config_summary"]["toolset"]["kind"] == "builtin"
     assert record.tool_metadata["get_runtime_config_summary"]["toolset"]["owner"] == "platform"
     assert "readonly" in record.tool_metadata["get_runtime_config_summary"]["tags"]
+
+
+def test_runner_records_tool_execution_events() -> None:
+    def audit_model(messages: list[ModelRequest | ModelResponse], info: AgentInfo) -> ModelResponse:
+        for message in messages:
+            if isinstance(message, ModelRequest):
+                for part in message.parts:
+                    if isinstance(part, ToolReturnPart) and part.tool_name == "get_request_context":
+                        return ModelResponse(parts=[TextPart(content="tool executed")])
+
+        return ModelResponse(parts=[ToolCallPart(tool_name="get_request_context", args={})])
+
+    with TestClient(app) as client:
+        tool_audit = client.app.state.ai_tool_audit
+        tool_audit.clear()
+        agent = client.app.state.ai_agent_manager.get_agent("chat-agent")
+        with agent.override(model=FunctionModel(audit_model)):
+            response = client.post(
+                "/api/v1/agents/chat",
+                json={"message": "请读取本次请求上下文"},
+                headers={"x-user-id": "tester"},
+            )
+
+    assert response.status_code == 200
+    execution_record = tool_audit.latest_execution_record()
+    assert execution_record is not None
+    assert execution_record.agent_id == "chat-agent"
+    assert execution_record.request_id
+    assert execution_record.tool_name == "get_request_context"
+    assert execution_record.status == "success"
+    assert execution_record.tool_args == {}
+    assert execution_record.tool_metadata["toolset"]["id"] == "builtin-request-toolset"
+    assert execution_record.result["user_id"] == "tester"
