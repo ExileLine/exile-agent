@@ -5,7 +5,16 @@ from typing import Any
 import httpx
 import shortuuid
 from pydantic_ai import ModelMessagesTypeAdapter, RunContext
-from pydantic_ai.exceptions import UserError
+from pydantic_ai.messages import (
+    FunctionToolCallEvent,
+    FunctionToolResultEvent,
+    PartDeltaEvent,
+    PartStartEvent,
+    RetryPromptPart,
+    TextPart,
+    TextPartDelta,
+)
+from pydantic_ai.run import AgentRunResultEvent
 from pydantic_ai.tools import DeferredToolRequests, DeferredToolResults, ToolApproved, ToolDenied
 from pydantic_ai.usage import RunUsage
 
@@ -97,15 +106,23 @@ class AgentRunner:
             session_id: str | None = None,
             model_name: str | None = None,
     ) -> AsyncIterator[str]:
-        """执行一次 SSE 形式的流式 chat run。"""
+        """执行一次 SSE 形式的流式 chat run。
+
+        当前实现优先走 `agent.run_stream_events(...)`：
+        - 可以同时拿到文本增量、工具调用、工具结果、最终 run result
+        - 再由 runner 统一翻译成前端可消费的 SSE 事件
+
+        如果底层模型不支持真正的 streamed request，则退化到 fallback：
+        - 内部改走一次普通 `agent.run(...)`
+        - 再把最终结果包装成 `start -> done` 或审批事件
+        """
 
         resolved_agent_id, resolved_model, agent = self._resolve_agent(agent_id=agent_id, model_name=model_name)
         deps = self._build_deps(request_context)
         message_history = await self.history_store.load_messages(session_id)
         history_loaded = bool(message_history)
-        started = False
 
-        await self._record_tool_exposure(
+        tool_metadata_by_name = await self._record_tool_exposure(
             agent_id=resolved_agent_id,
             request_id=request_context.request_id,
             message=message,
@@ -114,78 +131,21 @@ class AgentRunner:
         )
 
         try:
-            async with agent.run_stream(message, deps=deps, message_history=message_history or None) as stream_result:
-                yield self._sse_event(
-                    "start",
-                    {
-                        "run_id": stream_result.run_id,
-                        "agent_id": resolved_agent_id,
-                        "model": resolved_model,
-                        "request_id": request_context.request_id,
-                        "session_id": session_id,
-                        "meta": self._build_run_meta(
-                            run_kind="stream",
-                            stream_mode="native",
-                            history_loaded=history_loaded,
-                            history_saved=False,
-                            message_count=len(message_history),
-                        ).model_dump(mode="json"),
-                    },
-                )
-                started = True
-
-                try:
-                    async for delta in stream_result.stream_text(delta=True):
-                        if delta:
-                            yield self._sse_event("delta", {"text": delta})
-                except UserError:
-                    # 当前 `chat-agent` 的输出类型里同时允许 text 和 `DeferredToolRequests`。
-                    # 如果这轮 run 走进 approval/deferred 分支，`stream_text()` 不再适用，
-                    # 这里转而统一走 `get_output()` 读取最终的 deferred 输出对象。
-                    pass
-
-                output = await stream_result.get_output()
-                history_saved = await self._save_stream_history(
-                    session_id=session_id,
-                    messages=stream_result.all_messages(),
-                )
-
-                if isinstance(output, DeferredToolRequests):
-                    response = self._build_stream_response_from_deferred(
-                        stream_result=stream_result,
-                        output=output,
-                        request_id=request_context.request_id,
-                        session_id=session_id,
-                        agent_id=resolved_agent_id,
-                        model=resolved_model,
-                        history_loaded=history_loaded,
-                        history_saved=history_saved,
-                        stream_mode="native",
-                    )
-                    yield self._sse_event("approval_required", response.model_dump(mode="json"))
-                    return
-
-                response = AgentChatResponse(
-                    run_id=stream_result.run_id,
-                    agent_id=resolved_agent_id,
-                    model=resolved_model,
-                    status="completed",
-                    message=output,
-                    deferred_tool_requests=None,
-                    request_id=request_context.request_id,
-                    session_id=session_id,
-                    usage=self._serialize_usage(stream_result),
-                    meta=self._build_run_meta(
-                        run_kind="stream",
-                        stream_mode="native",
-                        history_loaded=history_loaded,
-                        history_saved=history_saved,
-                        message_count=len(stream_result.all_messages()),
-                    ),
-                )
-                yield self._sse_event("done", response.model_dump(mode="json"))
-        except Exception as exc:
-            if not started:
+            # `run_stream_events()` 是这次改造的核心：
+            # 它不是只吐文本，而是会产出 PydanticAI 的统一运行事件流，
+            # 包括文本 part、FunctionToolCallEvent、FunctionToolResultEvent、
+            # 以及最后的 AgentRunResultEvent。
+            stream = agent.run_stream_events(message, deps=deps, message_history=message_history or None)
+            try:
+                # 先探测首个事件有两个目的：
+                # 1. 尽早确认 native streaming 能否真正启动
+                # 2. 拿到可能已经带有 run_id 的最终事件，避免 start 事件没有稳定 run_id
+                first_event = await anext(stream)
+            except StopAsyncIteration:
+                return
+            except Exception:
+                # 这里的异常通常意味着当前模型/测试模型并没有真正支持 streamed request，
+                # 所以直接切到 fallback，而不是把整个接口报错给前端。
                 async for event in self._run_chat_stream_fallback(
                         agent=agent,
                         deps=deps,
@@ -201,6 +161,92 @@ class AgentRunner:
                     yield event
                 return
 
+            # `run_stream_events()` 的首个事件不一定带 run_id。
+            # 如果拿不到，就先生成一个本地 run_id，保证整条 SSE 会话有稳定标识。
+            stream_run_id = self._extract_stream_run_id_from_event(first_event) or shortuuid.uuid()
+            yield self._sse_event(
+                "start",
+                {
+                    "run_id": stream_run_id,
+                    "agent_id": resolved_agent_id,
+                    "model": resolved_model,
+                    "request_id": request_context.request_id,
+                    "session_id": session_id,
+                    "meta": self._build_run_meta(
+                        run_kind="stream",
+                        stream_mode="native",
+                        history_loaded=history_loaded,
+                        history_saved=False,
+                        message_count=len(message_history),
+                    ).model_dump(mode="json"),
+                },
+            )
+
+            # 把 PydanticAI 的底层事件翻译成我们自己的稳定 SSE 协议。
+            # 前端只需要理解这些事件名，不需要直接感知 PydanticAI 的内部事件结构。
+            async for event in self._iterate_stream_events(first_event, stream):
+                if isinstance(event, PartStartEvent) and isinstance(event.part, TextPart) and event.part.content:
+                    yield self._sse_event("delta", {"run_id": stream_run_id, "text": event.part.content})
+                    continue
+
+                if (
+                        isinstance(event, PartDeltaEvent)
+                        and isinstance(event.delta, TextPartDelta)
+                        and event.delta.content_delta
+                ):
+                    yield self._sse_event("delta", {"run_id": stream_run_id, "text": event.delta.content_delta})
+                    continue
+
+                if isinstance(event, FunctionToolCallEvent):
+                    yield self._sse_event(
+                        "tool_call",
+                        self._build_stream_tool_call_payload(
+                            run_id=stream_run_id,
+                            event=event,
+                            tool_metadata_by_name=tool_metadata_by_name,
+                        ),
+                    )
+                    continue
+
+                if isinstance(event, FunctionToolResultEvent):
+                    yield self._sse_event(
+                        "tool_result",
+                        self._build_stream_tool_result_payload(
+                            run_id=stream_run_id,
+                            event=event,
+                            tool_metadata_by_name=tool_metadata_by_name,
+                        ),
+                    )
+                    continue
+
+                if isinstance(event, AgentRunResultEvent):
+                    # 真正的“本轮运行结束”信号在这里。
+                    # 在此之前，前面的 delta/tool_call/tool_result 都只是过程事件。
+                    result = event.result
+                    history_saved = await self._save_history(session_id, result)
+                    response = self._build_chat_response(
+                        result=result,
+                        request_id=request_context.request_id,
+                        session_id=session_id,
+                        agent_id=resolved_agent_id,
+                        model=resolved_model,
+                        run_kind="stream",
+                        history_loaded=history_loaded,
+                        history_saved=history_saved,
+                    )
+                    response.meta.stream_mode = "native"
+
+                    if response.status == "approval_required":
+                        payload = response.model_dump(mode="json")
+                        # `approval_pending` 是新增的更语义化事件，
+                        # 但为了兼容已有前端协议，仍然继续发一份 `approval_required`。
+                        yield self._sse_event("approval_pending", payload)
+                        yield self._sse_event("approval_required", payload)
+                        return
+
+                    yield self._sse_event("done", response.model_dump(mode="json"))
+                    return
+        except Exception as exc:
             yield self._sse_event(
                 "error",
                 self._build_stream_error_payload(
@@ -314,6 +360,8 @@ class AgentRunner:
         )
 
         if isinstance(output, DeferredToolRequests):
+            # 这里是 `/chat`、`/resume`、`/stream done` 共用的统一判定：
+            # 只要输出不是最终文本，而是 deferred requests，就说明本轮进入审批/外部执行分支。
             response.status = "approval_required"
             response.deferred_tool_requests = self._serialize_deferred_tool_requests(result, output)
             return response
@@ -382,40 +430,15 @@ class AgentRunner:
                 ).model_dump(mode="json"),
             },
         )
-        event_name = "approval_required" if response.status == "approval_required" else "done"
-        yield self._sse_event(event_name, response.model_dump(mode="json"))
+        if response.status == "approval_required":
+            payload = response.model_dump(mode="json")
+            # fallback 路径虽然拿不到细粒度 tool 事件，
+            # 但审批语义仍然要与 native path 保持一致。
+            yield self._sse_event("approval_pending", payload)
+            yield self._sse_event("approval_required", payload)
+            return
 
-    def _build_stream_response_from_deferred(
-            self,
-            *,
-            stream_result: Any,
-            output: DeferredToolRequests,
-            request_id: str,
-            session_id: str | None,
-            agent_id: str,
-            model: str,
-            history_loaded: bool,
-            history_saved: bool,
-            stream_mode: str,
-    ) -> AgentChatResponse:
-        return AgentChatResponse(
-            run_id=stream_result.run_id,
-            agent_id=agent_id,
-            model=model,
-            status="approval_required",
-            message=None,
-            deferred_tool_requests=self._serialize_deferred_tool_requests(stream_result, output),
-            request_id=request_id,
-            session_id=session_id,
-            usage=self._serialize_usage(stream_result),
-            meta=self._build_run_meta(
-                run_kind="stream",
-                stream_mode=stream_mode,
-                history_loaded=history_loaded,
-                history_saved=history_saved,
-                message_count=len(stream_result.all_messages()),
-            ),
-        )
+        yield self._sse_event("done", response.model_dump(mode="json"))
 
     async def _save_history(self, session_id: str | None, result: Any) -> bool:
         """把本轮 run 结束后的完整消息历史写回会话存储。"""
@@ -423,14 +446,6 @@ class AgentRunner:
         if not session_id:
             return False
         await self.history_store.save_messages(session_id, result.all_messages())
-        return True
-
-    async def _save_stream_history(self, *, session_id: str | None, messages: list[Any]) -> bool:
-        """流式 run 完成后写回完整消息历史。"""
-
-        if not session_id:
-            return False
-        await self.history_store.save_messages(session_id, messages)
         return True
 
     def _serialize_deferred_tool_requests(
@@ -484,7 +499,7 @@ class AgentRunner:
             message: str,
             agent: Any,
             deps: AgentDeps,
-    ) -> None:
+    ) -> dict[str, dict[str, Any]]:
         """记录当前 run 暴露给模型的工具集合。"""
 
         model = agent._get_model(None)
@@ -500,15 +515,78 @@ class AgentRunner:
         # 包括静态挂载的 builtin toolsets，后续也可以扩展到动态 skills / MCP toolsets。
         toolset = agent._get_toolset()
         tools = await toolset.get_tools(run_context)
+        tool_metadata = {name: dict(tool.tool_def.metadata or {}) for name, tool in tools.items()}
         self.tool_audit.record_tool_exposure(
             agent_id=agent_id,
             request_id=request_id,
             tool_names=list(tools.keys()),
-            tool_metadata={name: dict(tool.tool_def.metadata or {}) for name, tool in tools.items()},
+            tool_metadata=tool_metadata,
         )
+        return tool_metadata
+
+    @staticmethod
+    async def _iterate_stream_events(first_event: Any, stream: Any) -> AsyncIterator[Any]:
+        # `anext(stream)` 已经消费掉首个事件，这里把它补回去，
+        # 对后续处理方来说，就像是在遍历一条完整的事件流。
+        yield first_event
+        async for event in stream:
+            yield event
+
+    @staticmethod
+    def _extract_stream_run_id_from_event(event: Any) -> str | None:
+        # 目前只有最终的 AgentRunResultEvent 一定能稳定拿到 result.run_id，
+        # 文本 part / tool 事件本身并不保证附带 run_id。
+        if isinstance(event, AgentRunResultEvent):
+            return AgentRunner._extract_run_id(event.result)
+        return None
+
+    def _build_stream_tool_call_payload(
+            self,
+            *,
+            run_id: str,
+            event: FunctionToolCallEvent,
+            tool_metadata_by_name: dict[str, dict[str, Any]],
+    ) -> dict[str, Any]:
+        # 这里返回的是前端协议层 payload，不直接暴露 PydanticAI 原始对象。
+        return {
+            "run_id": run_id,
+            "tool_call_id": event.tool_call_id,
+            "tool_name": event.part.tool_name,
+            "args": self._normalize_tool_args(event.part.args),
+            "args_valid": event.args_valid,
+            "tool_metadata": dict(tool_metadata_by_name.get(event.part.tool_name, {})),
+        }
+
+    def _build_stream_tool_result_payload(
+            self,
+            *,
+            run_id: str,
+            event: FunctionToolResultEvent,
+            tool_metadata_by_name: dict[str, dict[str, Any]],
+    ) -> dict[str, Any]:
+        result = event.result
+        tool_name = result.tool_name or ""
+        if isinstance(result, RetryPromptPart):
+            # RetryPromptPart 不是工具真正成功返回，而是“请模型修正后重试”的反馈。
+            tool_result: Any = result.model_response()
+            status = "retry"
+        else:
+            tool_result = self._normalize_value(result.content)
+            status = result.outcome
+
+        return {
+            "run_id": run_id,
+            "tool_call_id": result.tool_call_id,
+            "tool_name": tool_name,
+            "status": status,
+            "result": tool_result,
+            "tool_metadata": dict(tool_metadata_by_name.get(tool_name, {})),
+        }
 
     @staticmethod
     def _normalize_tool_args(args: Any) -> dict[str, Any]:
+        # PydanticAI 里的 tool args 可能是 dict，也可能是 JSON 字符串。
+        # 这里统一整理成 dict，方便前端和测试断言。
         if isinstance(args, dict):
             return dict(args)
         if isinstance(args, str):
@@ -519,6 +597,24 @@ class AgentRunner:
             if isinstance(value, dict):
                 return value
         return {}
+
+    @staticmethod
+    def _normalize_value(value: Any) -> Any:
+        # 把工具返回值尽量标准化成稳定、可 JSON 化的结构，
+        # 避免直接把复杂对象泄漏到 SSE payload 里。
+        if value is None:
+            return None
+        if isinstance(value, str | int | float | bool):
+            return value
+        if isinstance(value, list):
+            return [AgentRunner._normalize_value(item) for item in value]
+        if isinstance(value, dict):
+            return {str(key): AgentRunner._normalize_value(item) for key, item in value.items()}
+        if hasattr(value, "model_dump"):
+            return value.model_dump(mode="json")
+        if hasattr(value, "__dict__"):
+            return {str(key): AgentRunner._normalize_value(item) for key, item in vars(value).items()}
+        return repr(value)
 
     @staticmethod
     def _serialize_usage(result: Any) -> dict[str, Any] | None:

@@ -6,8 +6,8 @@ from pydantic_ai import Agent
 from pydantic_ai import RunContext
 from pydantic_ai import models
 from pydantic_ai.exceptions import ApprovalRequired
-from pydantic_ai.messages import ModelRequest, ModelResponse, PartStartEvent, TextPart, ToolCallPart, ToolReturnPart
-from pydantic_ai.models.function import AgentInfo, FunctionModel
+from pydantic_ai.messages import ModelRequest, ModelResponse, TextPart, ToolCallPart, ToolReturnPart
+from pydantic_ai.models.function import AgentInfo, DeltaToolCall, FunctionModel
 from pydantic_ai.models.test import TestModel
 from pydantic_ai.toolsets.function import FunctionToolset
 from pydantic_ai.tools import DeferredToolRequests
@@ -197,6 +197,56 @@ def test_agent_chat_stream_endpoint() -> None:
     assert done_event["message"] == "streamed reply"
     assert done_event["session_id"] == "sess-stream"
     assert done_event["meta"]["run_kind"] == "stream"
+
+
+def test_chat_stream_emits_tool_call_and_result_events() -> None:
+    def tool_model(messages: list[ModelRequest | ModelResponse], info: AgentInfo) -> ModelResponse:
+        del info
+        for message in messages:
+            if isinstance(message, ModelRequest):
+                for part in message.parts:
+                    if isinstance(part, ToolReturnPart) and part.tool_name == "get_request_context":
+                        return ModelResponse(parts=[TextPart(content="tool executed in stream")])
+
+        return ModelResponse(parts=[ToolCallPart(tool_name="get_request_context", args={})])
+
+    async def tool_stream_model(messages: list[ModelRequest | ModelResponse], info: AgentInfo):
+        del info
+        for message in messages:
+            if isinstance(message, ModelRequest):
+                for part in message.parts:
+                    if isinstance(part, ToolReturnPart) and part.tool_name == "get_request_context":
+                        yield "tool executed in stream"
+                        return
+
+        yield {0: DeltaToolCall(name="get_request_context", json_args="{}")}
+
+    with TestClient(app) as client:
+        agent = client.app.state.ai_agent_manager.get_agent("chat-agent")
+        with agent.override(model=FunctionModel(tool_model, stream_function=tool_stream_model)):
+            with client.stream(
+                "POST",
+                "/api/v1/agents/chat/stream",
+                json={"message": "请读取当前请求上下文"},
+                headers={"x-user-id": "tester"},
+            ) as response:
+                raw = "".join(response.iter_text())
+
+    assert response.status_code == 200
+    events = _parse_sse_events(raw)
+    tool_call_payload = next(payload for event, payload in events if event == "tool_call")
+    assert tool_call_payload["tool_name"] == "get_request_context"
+    assert tool_call_payload["args"] == {}
+    assert tool_call_payload["tool_metadata"]["toolset"]["id"] == "builtin-request-toolset"
+
+    tool_result_payload = next(payload for event, payload in events if event == "tool_result")
+    assert tool_result_payload["tool_name"] == "get_request_context"
+    assert tool_result_payload["status"] == "success"
+    assert tool_result_payload["result"]["user_id"] == "tester"
+
+    done_event = next(payload for event, payload in events if event == "done")
+    assert done_event["status"] == "completed"
+    assert done_event["message"] == "tool executed in stream"
 
 
 def test_builtin_toolsets_follows_local_conventions() -> None:
@@ -481,7 +531,7 @@ def test_chat_stream_approval_flow() -> None:
 
     async def approval_stream_model(messages: list[ModelRequest | ModelResponse], info: AgentInfo):
         del messages, info
-        yield PartStartEvent(index=0, part=ToolCallPart(tool_name="delete_demo_resource", args={}))
+        yield {0: DeltaToolCall(name="delete_demo_resource", json_args="{}")}
 
     with TestClient(app) as client:
         registry = client.app.state.ai_agent_registry
@@ -509,6 +559,9 @@ def test_chat_stream_approval_flow() -> None:
     assert response.status_code == 200
     events = _parse_sse_events(raw)
     assert events[0][0] == "start"
+    approval_pending_event = next(payload for event, payload in events if event == "approval_pending")
+    assert approval_pending_event["status"] == "approval_required"
+    assert approval_pending_event["deferred_tool_requests"]["approvals"][0]["tool_name"] == "delete_demo_resource"
     approval_event = next(payload for event, payload in events if event == "approval_required")
     assert approval_event["status"] == "approval_required"
     assert approval_event["message"] is None

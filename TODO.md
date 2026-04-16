@@ -569,11 +569,11 @@ MCP_SERVERS_JSON=[]
 
 - `Runner` 已成为普通运行与审批续跑的统一入口
 - 基础 `session_id` 历史读写已经接通
-- 已具备最小 `SSE run_stream`
+- 已具备基础 `SSE run_stream`
+- 已支持 `tool_call` / `tool_result` / `approval_pending` 等关键流式事件
 - 已具备统一基础 run metadata / error handling
-- 当前仍缺少历史裁剪/摘要、流式事件细化等更完整能力
 - 当前这轮最小运行时增强已经完成
-- 下一步应从“主链路打通”进入“治理与细化增强”
+- 后续增强点主要集中在历史裁剪/摘要与更完整的平台级流式协议
 
 验收标准：
 
@@ -626,9 +626,10 @@ MCP_SERVERS_JSON=[]
 当前阶段说明：
 
 - approval 最小闭环已完成
-- 最小 SSE stream 接口已完成
+- SSE stream 接口已完成，并已补齐工具执行与审批前置信号
 - 当前仍是无状态 `resume`，由前端回传 `message_history_json`
-- 后续如果要升级为平台级审批能力，还需要审批单持久化、状态管理和更细粒度的流式事件
+- 本阶段目标已经完成
+- 后续如果要升级为平台级审批能力，还需要审批单持久化、状态管理和更完整的平台级事件协议
 
 验收标准：
 
@@ -668,24 +669,25 @@ MCP_SERVERS_JSON=[]
 
 ## 首期实现顺序建议
 
-当前已经完成 `Phase 1` 与 `Phase 2`，并提前完成了 approval 最小闭环。
+当前已经完成：
+
+- `Phase 1`
+- `Phase 2`
+- `Phase 3`
+- `Phase 6` 的最小 approval / streaming 闭环
 
 后续建议按这个顺序继续推进：
 
-1. `Phase 3`
-2. `Phase 6` 剩余项（`run_stream` / SSE / external tools）
-3. `Phase 4`
-4. `Phase 5`
-5. `Phase 7`
-6. `Phase 8`
+1. `Phase 4`
+2. `Phase 5`
+3. `Phase 7`
+4. `Phase 8`
 
 原因：
 
-- 没有 `History/Session`，当前聊天仍停留在单次请求 + 无状态 approval resume
-- 当前只有最小 `run_stream`，前端还拿不到更细粒度的完整运行事件流
 - 没有 `MCP`，外部工具协议能力还没有真正接进运行时
 - 没有 `Skills`，能力动态装配还停留在固定 toolsets 层
-- 在能力接入完成前，观测与测试应继续同步补齐
+- 当前主链路已经可运行，下一阶段更适合补齐能力装配与可观测性
 
 ---
 
@@ -720,7 +722,7 @@ MCP_SERVERS_JSON=[]
 下一步建议补齐：
 
 - 更细粒度的工具执行审计（耗时 / 入参脱敏 / 异常分类）
-- 更细粒度的 streaming 事件（tool start/tool end/approval pending）
+- 更完整的 streaming 事件（thinking / request boundary / progress）
 - 一个示例 skill
 - 一个可选 MCP server 装配点
 
@@ -798,8 +800,8 @@ MCP_SERVERS_JSON=[]
 
 ## 下一步
 
-下一步建议直接进入 `Phase 3`：
+下一步建议优先进入 `Phase 4` 与 `Phase 5`：
 
-- 继续增强 history 策略（摘要 / 裁剪 / processor）
-- 细化 SSE 事件模型
-- 为后续 `streaming approval` 与有状态 approval 打基础
+- 开始落 `MCPManager` 与 MCP 配置装配链路
+- 开始定义 `SkillManifest / SkillLoader / SkillRegistry`
+- 在 MCP / Skills 进入主链路后，再继续细化历史策略、stream 协议和观测能力
