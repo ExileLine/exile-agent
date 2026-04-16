@@ -467,6 +467,7 @@ MCP_SERVERS_JSON=[]
 - `Phase 0` 设计落盘
 - `Phase 1` AI 最小运行骨架
 - `Phase 2` Toolsets 与工具治理基础能力
+- `Phase 3` 当前阶段的最小运行时增强
 - `Phase 6` 中与 approval 相关的最小闭环
 
 当前已经具备：
@@ -474,19 +475,24 @@ MCP_SERVERS_JSON=[]
 - `chat-agent` 最小可运行链路
 - `AgentRegistry` / `AgentManager` / `AgentRunner`
 - `POST /api/v1/agents/chat`
+- `POST /api/v1/agents/chat/stream`
 - `POST /api/v1/agents/chat/resume`
 - `GET /api/v1/agents`
+- 基于 `session_id` 的基础 history load/save
+- `/chat` / `/chat/resume` / `/chat/stream` 统一 run metadata
 - 分域 builtin toolsets
 - tool metadata / conventions / audit wrapper
 - metadata 驱动的 approval policy
 - `DeferredToolRequests` / `DeferredToolResults` 审批续跑协议
 - approval 端到端测试
+- 多轮对话基础测试
+- 流式文本输出与 approval fallback 流式测试
 - README 调用链与 approval 闭环文档
 
 当前最自然的下一阶段是：
 
-- `Phase 3 - 会话历史与运行时管理`
-- 重点补 `session_id + Redis history store + 多轮恢复`
+- `Phase 3` 的增强项与 `Phase 6` 的流式深化
+- 重点补 `更完整 history 策略 + streaming 事件细化 + 更细粒度观测`
 
 ## Phase 0 - 设计落盘
 
@@ -551,19 +557,23 @@ MCP_SERVERS_JSON=[]
 
 ## Phase 3 - 会话历史与运行时管理
 
-- [ ] 实现 Redis history store
-- [ ] 支持 `session_id` 多轮对话
+- [x] 实现基础 history store（优先 Redis，无 Redis 时内存兜底）
+- [x] 支持 `session_id` 多轮对话
 - [x] 抽象 `run` / `resume`
-- [ ] 抽象 `run_stream`
-- [ ] 统一 run metadata、usage、error handling
-- [ ] 支持历史加载与保存
-- [ ] 为历史存储增加测试
+- [x] 抽象最小 `run_stream`
+- [x] 统一基础 run metadata、usage、error handling
+- [x] 支持历史加载与保存
+- [x] 为历史存储增加测试
 
 当前阶段说明：
 
 - `Runner` 已成为普通运行与审批续跑的统一入口
-- 但历史存储、`session_id` 连续对话、多轮恢复尚未接通
-- 本阶段应优先把“无状态 approval resume”推进到“有会话状态的连续对话”
+- 基础 `session_id` 历史读写已经接通
+- 已具备最小 `SSE run_stream`
+- 已具备统一基础 run metadata / error handling
+- 当前仍缺少历史裁剪/摘要、流式事件细化等更完整能力
+- 当前这轮最小运行时增强已经完成
+- 下一步应从“主链路打通”进入“治理与细化增强”
 
 验收标准：
 
@@ -605,18 +615,20 @@ MCP_SERVERS_JSON=[]
 
 ## Phase 6 - Streaming / Approval / External Tools
 
-- [ ] 增加 `chat/stream` SSE 接口
+- [x] 增加 `chat/stream` SSE 接口
 - [x] 引入 `DeferredToolRequests` / `DeferredToolResults`
 - [x] 实现无状态 `chat/resume` 协议
 - [x] 对敏感工具启用审批流程
 - [ ] 如有前端工具调用需求，评估 `ExternalToolset`
 - [x] 增加 approval 端到端测试
+- [x] 增加 stream 相关测试
 
 当前阶段说明：
 
 - approval 最小闭环已完成
+- 最小 SSE stream 接口已完成
 - 当前仍是无状态 `resume`，由前端回传 `message_history_json`
-- 后续如果要升级为平台级审批能力，还需要审批单持久化、状态管理和流式事件
+- 后续如果要升级为平台级审批能力，还需要审批单持久化、状态管理和更细粒度的流式事件
 
 验收标准：
 
@@ -670,7 +682,7 @@ MCP_SERVERS_JSON=[]
 原因：
 
 - 没有 `History/Session`，当前聊天仍停留在单次请求 + 无状态 approval resume
-- 没有 `run_stream`，前端仍拿不到连续事件流
+- 当前只有最小 `run_stream`，前端还拿不到更细粒度的完整运行事件流
 - 没有 `MCP`，外部工具协议能力还没有真正接进运行时
 - 没有 `Skills`，能力动态装配还停留在固定 toolsets 层
 - 在能力接入完成前，观测与测试应继续同步补齐
@@ -707,10 +719,8 @@ MCP_SERVERS_JSON=[]
 
 下一步建议补齐：
 
-- Redis 会话历史
-- `session_id` 多轮恢复
-- `run_stream`
 - 更细粒度的工具执行审计（耗时 / 入参脱敏 / 异常分类）
+- 更细粒度的 streaming 事件（tool start/tool end/approval pending）
 - 一个示例 skill
 - 一个可选 MCP server 装配点
 
@@ -790,8 +800,6 @@ MCP_SERVERS_JSON=[]
 
 下一步建议直接进入 `Phase 3`：
 
-- 实现 Redis history store
-- 基于 `session_id` 读写 message history
-- 在 `AgentRunner` 中接入 history load/save
-- 补多轮对话测试
-- 为后续 `run_stream` 与有状态 approval 打基础
+- 继续增强 history 策略（摘要 / 裁剪 / processor）
+- 细化 SSE 事件模型
+- 为后续 `streaming approval` 与有状态 approval 打基础

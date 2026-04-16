@@ -122,6 +122,7 @@ class BaseConfig(BaseSettings):
     AI_DEFAULT_MODEL: str = "openai:gpt-5.2"
     AI_MAX_RETRIES: int = 2
     AI_HTTP_TIMEOUT_SECONDS: float = 30.0
+    AI_HISTORY_TTL_SECONDS: int | None = None
     OPENAI_API_KEY: Optional[str] = None
     OPENAI_BASE_URL: Optional[str] = None
 

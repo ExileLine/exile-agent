@@ -48,6 +48,20 @@ class AgentChatResumeRequest(BaseModel):
     approvals: list[AgentApprovalDecision] = Field(default_factory=list, description="人工审批结果列表")
 
 
+class AgentRunMeta(BaseModel):
+    """一次 run 的统一元信息。
+
+    这部分不是模型输出，而是运行时自己补充的治理信息，
+    用来让 `/chat`、`/chat/resume`、`/chat/stream` 三条链返回更稳定的上下文。
+    """
+
+    run_kind: Literal["chat", "resume", "stream"] | str = Field(description="本次运行的类型")
+    stream_mode: Literal["native", "fallback"] | None = Field(default=None, description="流式模式")
+    history_loaded: bool = Field(description="是否加载了已有会话历史")
+    history_saved: bool = Field(description="是否写回了会话历史")
+    message_count: int = Field(description="本轮 run 结束后的完整消息数")
+
+
 class AgentChatResponse(BaseModel):
     """一次 chat run 的标准化响应结构。"""
 
@@ -63,3 +77,4 @@ class AgentChatResponse(BaseModel):
     request_id: str = Field(description="请求 ID")
     session_id: str | None = Field(default=None, description="会话 ID")
     usage: dict[str, Any] | None = Field(default=None, description="模型用量信息")
+    meta: AgentRunMeta = Field(description="运行时元信息")

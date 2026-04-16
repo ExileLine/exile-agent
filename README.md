@@ -1,6 +1,11 @@
 # exile-agent
 
-当前项目是一个基于 `FastAPI` 的服务端基础骨架，并已经完成 `Phase 1` 的 AI 最小运行基建接入。
+当前项目是一个基于 `FastAPI` 的服务端基础骨架，并已经完成：
+
+- `Phase 1` AI 最小运行骨架
+- `Phase 2` Toolsets 与工具治理基础能力
+- `Phase 3` 当前阶段的最小运行时增强
+- `Phase 6` 中 approval 相关的最小闭环
 
 这份 README 不重点讲“怎么用”，而是重点讲“当前 AI 调用链路是怎么跑起来的”。  
 目标是让你在继续做 `toolsets / MCP / Skills / History` 之前，先把现有这条最小链路完全看明白。
@@ -10,6 +15,10 @@
 - 应用启动时初始化 AI runtime
 - 注册最小 `chat-agent`
 - 支持通过 `/api/v1/agents/chat` 触发一次 Agent 调用
+- 支持通过 `/api/v1/agents/chat/stream` 进行最小 SSE 流式输出
+- 支持通过 `/api/v1/agents/chat/resume` 继续审批中断的 run
+- 支持基于 `session_id` 的基础会话历史恢复
+- `/chat` / `/chat/resume` / `/chat/stream` 已具备统一基础 run metadata
 - 支持 `deps_type + RunContext`
 - 支持通过 `FunctionToolset` 装配基础工具
 - 已提供 4 个 builtin 只读工具
@@ -21,11 +30,10 @@
 
 当前还没有进入：
 
-- Redis 会话历史
 - MCP 接入
 - Skills 基础设施
-- 流式输出
-- 审批续跑
+- 更细粒度的流式事件
+- 历史摘要压缩 / 裁剪
 - 更完整的 `toolsets` 包装、审批治理与基于 hooks 的细粒度审计
 
 ---
@@ -378,11 +386,16 @@ runner = AgentRunner(
 - `AgentManager` 管理“拿哪个 Agent”
 - `AgentRunner` 管理“怎么跑这次请求”
 
-当前只实现了 `run_chat(...)`，但后面很自然会扩展成：
+当前已经实现了：
 
-- `run_stream(...)`
+- `run_chat(...)`
 - `resume(...)`
+- `run_chat_stream(...)`
+
+后面还会继续扩展成：
+
 - `run_with_history(...)`
+- 更细粒度的 stream event pipeline
 
 ### Step 7. 把这些对象挂到 `app.state`
 
@@ -2603,13 +2616,14 @@ endpoint 接协议
   - 还没有叠加用户角色、租户、环境、参数内容
 - 当前只接通了 approval 路径
   - external tool calls 的完整回填协议还没继续展开
-- 当前还没有 streaming 形态
-  - 现在是标准 request/response
+- 当前已经具备最小 streaming 形态
+  - 已支持 `/chat/stream` SSE
+  - 但还没有更细粒度的完整事件流
 
 所以这一阶段的正确定位是：
 
 - approval 能力已经打通
-- 但还没有进入平台级审批中心、持久化审批单、流式事件这些更完整阶段
+- 但还没有进入平台级审批中心、持久化审批单、更细粒度流式事件这些更完整阶段
 
 ---
 
@@ -2619,7 +2633,10 @@ endpoint 接协议
 
 - 应用启动时可以初始化 AI runtime
 - `/api/v1/agents/chat` 可以真实触发 AgentRunner
+- `/api/v1/agents/chat/stream` 可以输出最小 SSE 事件流
 - `/api/v1/agents/chat/resume` 可以基于 `DeferredToolRequests` 继续执行
+- 同一个 `session_id` 的后续 `/chat` 可以读取上一轮 message history
+- 三条运行链都能返回统一的基础 run metadata
 - `AgentManager` 可以正确获取和缓存 Agent
 - `build_chat_agent()` 可以正确构造 Agent
 - `chat-agent` 可以通过 `FunctionToolset` 装配 builtin tools
@@ -2636,15 +2653,16 @@ endpoint 接协议
 当前它还是最小闭环，只覆盖：
 
 - 单次 chat 调用
+- 最小 SSE 流式输出
 - 无状态 approval resume
+- 基础 `session_id` 多轮恢复
 - 单 Agent
 - 少量基础工具
 
 还没覆盖：
 
-- 历史消息存储
-- 多轮上下文恢复
-- `run_stream`
+- 更细粒度的 stream event pipeline
+- history 摘要压缩 / 裁剪 / processors
 - MCP manager
 - Skills resolver
 
@@ -2659,8 +2677,8 @@ endpoint 接协议
 
 如果沿着当前调用链继续扩展，最合适的方向是：
 
-1. 在 `AgentRunner` 前后补 toolsets 装配逻辑
-2. 在 `ChatService` 或 `AgentRunner` 中接入历史消息
+1. 继续细化 SSE 事件模型
+2. 在 `AgentRunner` 中增强 history 策略（摘要 / 裁剪 / processors）
 3. 在 runtime 层引入 MCP manager
 4. 在 agent 构建阶段接入 Skills resolver
 

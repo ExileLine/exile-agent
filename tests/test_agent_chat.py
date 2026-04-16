@@ -1,11 +1,12 @@
 import asyncio
+import json
 import httpx
 from fastapi.testclient import TestClient
 from pydantic_ai import Agent
 from pydantic_ai import RunContext
 from pydantic_ai import models
 from pydantic_ai.exceptions import ApprovalRequired
-from pydantic_ai.messages import ModelRequest, ModelResponse, TextPart, ToolCallPart, ToolReturnPart
+from pydantic_ai.messages import ModelRequest, ModelResponse, PartStartEvent, TextPart, ToolCallPart, ToolReturnPart
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 from pydantic_ai.models.test import TestModel
 from pydantic_ai.toolsets.function import FunctionToolset
@@ -40,6 +41,23 @@ def _build_test_deps(request_id: str) -> AgentDeps:
         http_client=httpx.AsyncClient(),
         tool_audit=ToolAuditService(),
     )
+
+
+def _parse_sse_events(raw: str) -> list[tuple[str, dict]]:
+    events: list[tuple[str, dict]] = []
+    for block in raw.strip().split("\n\n"):
+        if not block.strip():
+            continue
+        event_name = ""
+        data_payload = ""
+        for line in block.splitlines():
+            if line.startswith("event: "):
+                event_name = line.removeprefix("event: ").strip()
+            elif line.startswith("data: "):
+                data_payload = line.removeprefix("data: ").strip()
+        if event_name:
+            events.append((event_name, json.loads(data_payload or "{}")))
+    return events
 
 
 def _build_approval_demo_toolset() -> FunctionToolset[AgentDeps]:
@@ -100,6 +118,85 @@ def test_agent_chat_endpoint() -> None:
     assert body["data"]["agent_id"] == "chat-agent"
     assert body["data"]["message"] == "stubbed chat reply"
     assert body["data"]["request_id"]
+    assert body["data"]["meta"]["run_kind"] == "chat"
+    assert body["data"]["meta"]["history_loaded"] is False
+    assert body["data"]["meta"]["history_saved"] is False
+
+
+def test_agent_chat_session_history_roundtrip() -> None:
+    def history_model(messages: list[ModelRequest | ModelResponse], info: AgentInfo) -> ModelResponse:
+        del info
+        request_texts: list[str] = []
+        for message in messages:
+            if not isinstance(message, ModelRequest):
+                continue
+            for part in message.parts:
+                content = getattr(part, "content", None)
+                if isinstance(content, str):
+                    request_texts.append(content)
+
+        latest_prompt = request_texts[-1] if request_texts else ""
+        if latest_prompt == "第二次提问":
+            if "第一次提问" in request_texts[:-1]:
+                return ModelResponse(parts=[TextPart(content="已读取到上一轮历史")])
+            return ModelResponse(parts=[TextPart(content="未读取到历史")])
+
+        return ModelResponse(parts=[TextPart(content="首次消息已记录")])
+
+    session_id = "sess-history-demo"
+    with TestClient(app) as client:
+        history_store = client.app.state.ai_history_store
+        asyncio.run(history_store.delete_messages(session_id))
+        agent = client.app.state.ai_agent_manager.get_agent("chat-agent")
+        with agent.override(model=FunctionModel(history_model)):
+            first_response = client.post(
+                "/api/v1/agents/chat",
+                json={"message": "第一次提问", "session_id": session_id},
+                headers={"x-user-id": "tester"},
+            )
+            second_response = client.post(
+                "/api/v1/agents/chat",
+                json={"message": "第二次提问", "session_id": session_id},
+                headers={"x-user-id": "tester"},
+            )
+        asyncio.run(history_store.delete_messages(session_id))
+
+    assert first_response.status_code == 200
+    first_body = first_response.json()
+    assert first_body["code"] == 200
+    assert first_body["data"]["message"] == "首次消息已记录"
+
+    assert second_response.status_code == 200
+    second_body = second_response.json()
+    assert second_body["code"] == 200
+    assert second_body["data"]["message"] == "已读取到上一轮历史"
+    assert second_body["data"]["session_id"] == session_id
+    assert second_body["data"]["meta"]["run_kind"] == "chat"
+    assert second_body["data"]["meta"]["history_loaded"] is True
+    assert second_body["data"]["meta"]["history_saved"] is True
+
+
+def test_agent_chat_stream_endpoint() -> None:
+    with TestClient(app) as client:
+        agent = client.app.state.ai_agent_manager.get_agent("chat-agent")
+        with agent.override(model=TestModel(custom_output_text="streamed reply")):
+            with client.stream(
+                "POST",
+                "/api/v1/agents/chat/stream",
+                json={"message": "请流式回复", "session_id": "sess-stream"},
+                headers={"x-user-id": "tester"},
+            ) as response:
+                raw = "".join(response.iter_text())
+
+    assert response.status_code == 200
+    events = _parse_sse_events(raw)
+    assert events[0][0] == "start"
+    assert any(event == "delta" for event, _ in events)
+    done_event = next(payload for event, payload in events if event == "done")
+    assert done_event["status"] == "completed"
+    assert done_event["message"] == "streamed reply"
+    assert done_event["session_id"] == "sess-stream"
+    assert done_event["meta"]["run_kind"] == "stream"
 
 
 def test_builtin_toolsets_follows_local_conventions() -> None:
@@ -374,3 +471,71 @@ def test_chat_approval_resume_flow() -> None:
     assert resume_body["data"]["status"] == "completed"
     assert resume_body["data"]["message"] == "审批后已执行: deleted"
     assert resume_body["data"]["deferred_tool_requests"] is None
+    assert resume_body["data"]["meta"]["run_kind"] == "resume"
+
+
+def test_chat_stream_approval_flow() -> None:
+    def approval_model(messages: list[ModelRequest | ModelResponse], info: AgentInfo) -> ModelResponse:
+        del messages, info
+        return ModelResponse(parts=[ToolCallPart(tool_name="delete_demo_resource", args={})])
+
+    async def approval_stream_model(messages: list[ModelRequest | ModelResponse], info: AgentInfo):
+        del messages, info
+        yield PartStartEvent(index=0, part=ToolCallPart(tool_name="delete_demo_resource", args={}))
+
+    with TestClient(app) as client:
+        registry = client.app.state.ai_agent_registry
+        manager = client.app.state.ai_agent_manager
+        registry.register(
+            AgentManifest(
+                agent_id="approval-stream-agent",
+                name="Approval Stream Agent",
+                description="Agent used to test approval stream flow.",
+                default_model="test",
+            ),
+            _build_approval_demo_agent,
+        )
+
+        agent = manager.get_agent("approval-stream-agent")
+        with agent.override(model=FunctionModel(approval_model, stream_function=approval_stream_model)):
+            with client.stream(
+                "POST",
+                "/api/v1/agents/chat/stream",
+                json={"agent_id": "approval-stream-agent", "message": "请删除演示资源"},
+                headers={"x-user-id": "tester"},
+            ) as response:
+                raw = "".join(response.iter_text())
+
+    assert response.status_code == 200
+    events = _parse_sse_events(raw)
+    assert events[0][0] == "start"
+    approval_event = next(payload for event, payload in events if event == "approval_required")
+    assert approval_event["status"] == "approval_required"
+    assert approval_event["message"] is None
+    assert approval_event["deferred_tool_requests"]["approvals"][0]["tool_name"] == "delete_demo_resource"
+    assert approval_event["meta"]["run_kind"] == "stream"
+
+
+def test_chat_stream_error_payload_contains_run_meta() -> None:
+    def broken_model(messages: list[ModelRequest | ModelResponse], info: AgentInfo) -> ModelResponse:
+        del messages, info
+        raise RuntimeError("stream model exploded")
+
+    with TestClient(app) as client:
+        agent = client.app.state.ai_agent_manager.get_agent("chat-agent")
+        with agent.override(model=FunctionModel(broken_model)):
+            with client.stream(
+                "POST",
+                "/api/v1/agents/chat/stream",
+                json={"message": "请触发错误", "session_id": "sess-stream-error"},
+                headers={"x-user-id": "tester"},
+            ) as response:
+                raw = "".join(response.iter_text())
+
+    assert response.status_code == 200
+    events = _parse_sse_events(raw)
+    assert events[0][0] == "error"
+    error_event = events[0][1]
+    assert error_event["error_type"] == "RuntimeError"
+    assert error_event["meta"]["run_kind"] == "stream"
+    assert error_event["meta"]["stream_mode"] == "fallback"

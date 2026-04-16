@@ -1,3 +1,5 @@
+from collections.abc import AsyncIterator
+
 from app.ai.deps import RequestContext
 from app.ai.runtime.manager import AgentManager
 from app.ai.runtime.runner import AgentRunner
@@ -30,6 +32,18 @@ class ChatService:
             session_id=payload.session_id,
             model_name=payload.model,
         )
+
+    async def stream(self, *, request_context: RequestContext, payload: AgentChatRequest) -> AsyncIterator[str]:
+        """把 endpoint 请求转换成一次标准的 runner stream 调用。"""
+
+        async for event in self.runner.run_chat_stream(
+            request_context=request_context,
+            message=payload.message,
+            agent_id=payload.agent_id,
+            session_id=payload.session_id,
+            model_name=payload.model,
+        ):
+            yield event
 
     async def resume(self, *, request_context: RequestContext, payload: AgentChatResumeRequest) -> AgentChatResponse:
         """继续执行上一轮因 approval 停住的 run。"""

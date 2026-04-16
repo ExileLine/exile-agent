@@ -17,6 +17,7 @@ class AISettings(BaseModel):
     default_model: str = "openai:gpt-5.2"
     max_retries: int = 2
     http_timeout_seconds: float = 30.0
+    history_ttl_seconds: int | None = None
     openai_api_key: str | None = None
     openai_base_url: str | None = None
 
@@ -29,6 +30,7 @@ class AISettings(BaseModel):
             default_model=config.AI_DEFAULT_MODEL,
             max_retries=config.AI_MAX_RETRIES,
             http_timeout_seconds=config.AI_HTTP_TIMEOUT_SECONDS,
+            history_ttl_seconds=config.AI_HISTORY_TTL_SECONDS,
             openai_api_key=config.OPENAI_API_KEY,
             openai_base_url=config.OPENAI_BASE_URL,
         )

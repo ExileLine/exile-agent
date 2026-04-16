@@ -12,3 +12,7 @@ class AIRuntimeNotReadyError(AIRuntimeError):
 
 class AgentNotFoundError(AIRuntimeError):
     """请求的 agent_id 在注册表中不存在时抛出。"""
+
+
+class AIRunExecutionError(AIRuntimeError):
+    """一次具体 Agent run 在执行阶段失败时抛出。"""
