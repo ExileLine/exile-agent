@@ -15,12 +15,14 @@ from pydantic_ai.messages import (
     TextPartDelta,
 )
 from pydantic_ai.run import AgentRunResultEvent
+from pydantic_ai.toolsets.abstract import AbstractToolset
 from pydantic_ai.tools import DeferredToolRequests, DeferredToolResults, ToolApproved, ToolDenied
 from pydantic_ai.usage import RunUsage
 
 from app.ai.config import AISettings
 from app.ai.deps import AgentDeps, RequestContext
-from app.ai.exceptions import AIDisabledError, AIRunExecutionError, AIRuntimeError
+from app.ai.exceptions import AIDisabledError, AIRunExecutionError, AIRuntimeError, MCPRuntimeError
+from app.ai.mcp import MCPManager
 from app.ai.runtime.history import SessionHistoryStore
 from app.ai.runtime.manager import AgentManager
 from app.ai.schemas.chat import (
@@ -44,12 +46,14 @@ class AgentRunner:
             http_client: httpx.AsyncClient,
             tool_audit: ToolAuditService,
             history_store: SessionHistoryStore,
+            mcp_manager: MCPManager | None,
     ) -> None:
         self.settings = settings
         self.agent_manager = agent_manager
         self.http_client = http_client
         self.tool_audit = tool_audit
         self.history_store = history_store
+        self.mcp_manager = mcp_manager
 
     async def run_chat(
             self,
@@ -59,6 +63,7 @@ class AgentRunner:
             agent_id: str | None = None,
             session_id: str | None = None,
             model_name: str | None = None,
+            mcp_server_ids: list[str] | None = None,
     ) -> AgentChatResponse:
         """执行一次标准 chat run。
 
@@ -68,6 +73,10 @@ class AgentRunner:
 
         resolved_agent_id, resolved_model, agent = self._resolve_agent(agent_id=agent_id, model_name=model_name)
         deps = self._build_deps(request_context)
+        resolved_mcp_server_ids, run_toolsets = self._resolve_request_toolsets(
+            mcp_server_ids=mcp_server_ids,
+            route_message=message,
+        )
         message_history = await self.history_store.load_messages(session_id)
         history_loaded = bool(message_history)
 
@@ -77,10 +86,17 @@ class AgentRunner:
             message=message,
             agent=agent,
             deps=deps,
+            additional_toolsets=run_toolsets,
+            resolved_mcp_server_ids=resolved_mcp_server_ids,
         )
 
         try:
-            result = await agent.run(message, deps=deps, message_history=message_history or None)
+            result = await agent.run(
+                message,
+                deps=deps,
+                message_history=message_history or None,
+                toolsets=run_toolsets or None,
+            )
             history_saved = await self._save_history(session_id, result)
         except AIRuntimeError:
             raise
@@ -95,6 +111,7 @@ class AgentRunner:
             run_kind="chat",
             history_loaded=history_loaded,
             history_saved=history_saved,
+            mcp_servers=resolved_mcp_server_ids,
         )
 
     async def run_chat_stream(
@@ -105,6 +122,7 @@ class AgentRunner:
             agent_id: str | None = None,
             session_id: str | None = None,
             model_name: str | None = None,
+            mcp_server_ids: list[str] | None = None,
     ) -> AsyncIterator[str]:
         """执行一次 SSE 形式的流式 chat run。
 
@@ -119,6 +137,10 @@ class AgentRunner:
 
         resolved_agent_id, resolved_model, agent = self._resolve_agent(agent_id=agent_id, model_name=model_name)
         deps = self._build_deps(request_context)
+        resolved_mcp_server_ids, run_toolsets = self._resolve_request_toolsets(
+            mcp_server_ids=mcp_server_ids,
+            route_message=message,
+        )
         message_history = await self.history_store.load_messages(session_id)
         history_loaded = bool(message_history)
 
@@ -128,6 +150,8 @@ class AgentRunner:
             message=message,
             agent=agent,
             deps=deps,
+            additional_toolsets=run_toolsets,
+            resolved_mcp_server_ids=resolved_mcp_server_ids,
         )
 
         try:
@@ -135,7 +159,12 @@ class AgentRunner:
             # 它不是只吐文本，而是会产出 PydanticAI 的统一运行事件流，
             # 包括文本 part、FunctionToolCallEvent、FunctionToolResultEvent、
             # 以及最后的 AgentRunResultEvent。
-            stream = agent.run_stream_events(message, deps=deps, message_history=message_history or None)
+            stream = agent.run_stream_events(
+                message,
+                deps=deps,
+                message_history=message_history or None,
+                toolsets=run_toolsets or None,
+            )
             try:
                 # 先探测首个事件有两个目的：
                 # 1. 尽早确认 native streaming 能否真正启动
@@ -157,6 +186,8 @@ class AgentRunner:
                         model=resolved_model,
                         history_loaded=history_loaded,
                         stream_mode="fallback",
+                        mcp_servers=resolved_mcp_server_ids,
+                        run_toolsets=run_toolsets,
                 ):
                     yield event
                 return
@@ -178,6 +209,7 @@ class AgentRunner:
                         history_loaded=history_loaded,
                         history_saved=False,
                         message_count=len(message_history),
+                        mcp_servers=resolved_mcp_server_ids,
                     ).model_dump(mode="json"),
                 },
             )
@@ -233,6 +265,7 @@ class AgentRunner:
                         run_kind="stream",
                         history_loaded=history_loaded,
                         history_saved=history_saved,
+                        mcp_servers=resolved_mcp_server_ids,
                     )
                     response.meta.stream_mode = "native"
 
@@ -257,6 +290,7 @@ class AgentRunner:
                     model=resolved_model,
                     history_loaded=history_loaded,
                     stream_mode="native",
+                    mcp_servers=resolved_mcp_server_ids,
                 ),
             )
             return
@@ -270,6 +304,7 @@ class AgentRunner:
             agent_id: str | None = None,
             session_id: str | None = None,
             model_name: str | None = None,
+            mcp_server_ids: list[str] | None = None,
     ) -> AgentChatResponse:
         """基于上一轮 deferred tool requests 继续执行一次 run。
 
@@ -282,6 +317,10 @@ class AgentRunner:
         resolved_agent_id, resolved_model, agent = self._resolve_agent(agent_id=agent_id, model_name=model_name)
         deps = self._build_deps(request_context)
         message_history = ModelMessagesTypeAdapter.validate_json(message_history_json)
+        resolved_mcp_server_ids, run_toolsets = self._resolve_request_toolsets(
+            mcp_server_ids=mcp_server_ids,
+            route_message=self._extract_latest_user_message(message_history),
+        )
         deferred_tool_results = self._build_deferred_tool_results(approvals)
 
         try:
@@ -289,6 +328,7 @@ class AgentRunner:
                 deps=deps,
                 message_history=message_history,
                 deferred_tool_results=deferred_tool_results,
+                toolsets=run_toolsets or None,
             )
             history_saved = await self._save_history(session_id, result)
         except AIRuntimeError:
@@ -304,6 +344,7 @@ class AgentRunner:
             run_kind="resume",
             history_loaded=True,
             history_saved=history_saved,
+            mcp_servers=resolved_mcp_server_ids,
         )
 
     def _resolve_agent(self, *, agent_id: str | None, model_name: str | None) -> tuple[str, str, Any]:
@@ -317,8 +358,8 @@ class AgentRunner:
 
     def _build_deps(self, request_context: RequestContext) -> AgentDeps:
         # `AgentDeps` 是本次运行注入给工具层和动态 instructions 的运行时依赖集合。
-        # 当前先放 request/settings/db/redis/http_client/tool_audit，
-        # 后续继续扩 history / approval / skill / mcp 也会沿着这个入口演进。
+        # 当前先放 request/settings/db/redis/http_client/tool_audit/mcp_manager，
+        # 后续继续扩 history / approval / skill 也会沿着这个入口演进。
         return AgentDeps(
             request=request_context,
             settings=self.settings,
@@ -326,7 +367,32 @@ class AgentRunner:
             redis=redis_client.redis_pool,
             http_client=self.http_client,
             tool_audit=self.tool_audit,
+            mcp_manager=self.mcp_manager,
         )
+
+    def _resolve_request_toolsets(
+            self,
+            *,
+            mcp_server_ids: list[str] | None,
+            route_message: str | None,
+    ) -> tuple[list[str], list[AbstractToolset[AgentDeps]]]:
+        """解析请求级动态能力并转换成本轮附加 toolsets。
+
+        规则是：
+        - 显式传入 `mcp_servers` 时优先按显式值启用
+        - 未显式传入时，允许 MCP manager 根据消息内容做自动路由
+        """
+
+        if self.mcp_manager is None:
+            return list(dict.fromkeys(mcp_server_ids or [])), []
+
+        resolved_mcp_server_ids = self.mcp_manager.resolve_server_ids(
+            requested_server_ids=mcp_server_ids,
+            message=route_message,
+        )
+        if not resolved_mcp_server_ids:
+            return resolved_mcp_server_ids, []
+        return resolved_mcp_server_ids, self.mcp_manager.build_toolsets(resolved_mcp_server_ids)
 
     def _build_chat_response(
             self,
@@ -339,6 +405,7 @@ class AgentRunner:
             run_kind: str,
             history_loaded: bool,
             history_saved: bool,
+            mcp_servers: list[str],
     ) -> AgentChatResponse:
         output = result.output
         response = AgentChatResponse(
@@ -356,6 +423,7 @@ class AgentRunner:
                 history_loaded=history_loaded,
                 history_saved=history_saved,
                 message_count=len(result.all_messages()),
+                mcp_servers=mcp_servers,
             ),
         )
 
@@ -382,11 +450,18 @@ class AgentRunner:
             model: str,
             history_loaded: bool,
             stream_mode: str,
+            mcp_servers: list[str],
+            run_toolsets: list[AbstractToolset[AgentDeps]],
     ) -> AsyncIterator[str]:
         """当模型不支持真正的 streamed request 时，退化成单次 run 再包装成 SSE。"""
 
         try:
-            result = await agent.run(message, deps=deps, message_history=message_history or None)
+            result = await agent.run(
+                message,
+                deps=deps,
+                message_history=message_history or None,
+                toolsets=run_toolsets or None,
+            )
             history_saved = await self._save_history(session_id, result)
         except Exception as exc:
             yield self._sse_event(
@@ -399,6 +474,7 @@ class AgentRunner:
                     model=model,
                     history_loaded=history_loaded,
                     stream_mode="fallback",
+                    mcp_servers=mcp_servers,
                 ),
             )
             return
@@ -411,6 +487,7 @@ class AgentRunner:
             run_kind="stream",
             history_loaded=history_loaded,
             history_saved=history_saved,
+            mcp_servers=mcp_servers,
         )
         response.meta.stream_mode = stream_mode
         yield self._sse_event(
@@ -427,6 +504,7 @@ class AgentRunner:
                     history_loaded=history_loaded,
                     history_saved=False,
                     message_count=len(message_history),
+                    mcp_servers=mcp_servers,
                 ).model_dump(mode="json"),
             },
         )
@@ -499,6 +577,8 @@ class AgentRunner:
             message: str,
             agent: Any,
             deps: AgentDeps,
+            additional_toolsets: list[AbstractToolset[AgentDeps]],
+            resolved_mcp_server_ids: list[str],
     ) -> dict[str, dict[str, Any]]:
         """记录当前 run 暴露给模型的工具集合。"""
 
@@ -513,8 +593,25 @@ class AgentRunner:
 
         # 这里拿到的是 Agent 已经聚合完成后的总 toolset，
         # 包括静态挂载的 builtin toolsets，后续也可以扩展到动态 skills / MCP toolsets。
-        toolset = agent._get_toolset()
-        tools = await toolset.get_tools(run_context)
+        toolset = agent._get_toolset(additional_toolsets=additional_toolsets)
+        try:
+            tools = await toolset.get_tools(run_context)
+        except AIRuntimeError:
+            raise
+        except TimeoutError as exc:
+            if resolved_mcp_server_ids:
+                raise MCPRuntimeError(
+                    f"MCP server 初始化超时: {', '.join(resolved_mcp_server_ids)}。"
+                    "请检查服务可用性、访问令牌以及 timeout 配置。"
+                ) from exc
+            raise AIRunExecutionError("工具暴露信息收集超时") from exc
+        except Exception as exc:
+            if resolved_mcp_server_ids:
+                raise MCPRuntimeError(
+                    f"MCP server 初始化失败: {', '.join(resolved_mcp_server_ids)}。"
+                    "请检查 MCP 命令、网络连接、鉴权参数或服务端日志。"
+                ) from exc
+            raise AIRunExecutionError("工具暴露信息收集失败") from exc
         tool_metadata = {name: dict(tool.tool_def.metadata or {}) for name, tool in tools.items()}
         self.tool_audit.record_tool_exposure(
             agent_id=agent_id,
@@ -599,6 +696,20 @@ class AgentRunner:
         return {}
 
     @staticmethod
+    def _extract_latest_user_message(message_history: list[Any]) -> str | None:
+        """从 message history 中提取最后一条用户消息，供 resume 自动路由使用。"""
+
+        for message in reversed(message_history):
+            parts = getattr(message, "parts", None)
+            if not isinstance(parts, list):
+                continue
+            for part in reversed(parts):
+                content = getattr(part, "content", None)
+                if isinstance(content, str) and content.strip():
+                    return content
+        return None
+
+    @staticmethod
     def _normalize_value(value: Any) -> Any:
         # 把工具返回值尽量标准化成稳定、可 JSON 化的结构，
         # 避免直接把复杂对象泄漏到 SSE payload 里。
@@ -638,6 +749,7 @@ class AgentRunner:
             history_loaded: bool,
             history_saved: bool,
             message_count: int,
+            mcp_servers: list[str],
     ) -> AgentRunMeta:
         return AgentRunMeta(
             run_kind=run_kind,
@@ -645,6 +757,7 @@ class AgentRunner:
             history_loaded=history_loaded,
             history_saved=history_saved,
             message_count=message_count,
+            mcp_servers=mcp_servers,
         )
 
     @staticmethod
@@ -669,6 +782,7 @@ class AgentRunner:
             model: str,
             history_loaded: bool,
             stream_mode: str,
+            mcp_servers: list[str],
     ) -> dict[str, Any]:
         return {
             "error": str(error),
@@ -683,5 +797,6 @@ class AgentRunner:
                 history_loaded=history_loaded,
                 history_saved=False,
                 message_count=0,
+                mcp_servers=mcp_servers,
             ).model_dump(mode="json"),
         }

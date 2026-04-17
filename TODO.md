@@ -447,13 +447,13 @@ OPENAI_API_KEY=
 ANTHROPIC_API_KEY=
 GEMINI_API_KEY=
 
-MCP_SERVERS_JSON=[]
+AI_MCP_SERVERS_JSON={}
 ```
 
 说明：
 
 - 模型厂商密钥按实际 provider 增减
-- `MCP_SERVERS_JSON` 首期可先用 JSON 配置，后续再升级成更清晰的多变量结构
+- `AI_MCP_SERVERS_JSON` 首期先用 JSON 配置，当前已经支持 `{ "mcpServers": { ... } }`、数组、以及 `{id: config}` 三种输入形态
 - skills 目录建议支持相对路径
 
 ---
@@ -583,18 +583,30 @@ MCP_SERVERS_JSON=[]
 
 ## Phase 4 - MCP 基础接入
 
-- [ ] 定义 `MCPServerConfig`
-- [ ] 实现 `MCPManager`
-- [ ] 支持从配置加载 MCP server
-- [ ] 支持为指定 agent/run 动态装配 MCP toolset
-- [ ] 增加 MCP 错误处理、超时和日志
-- [ ] 新增一个示例 MCP server 配置与联调说明
+- [x] 定义 `MCPServerConfig`
+- [x] 实现 `MCPManager`
+- [x] 支持从配置加载 MCP server
+- [x] 支持为指定 agent/run 动态装配 MCP toolset
+- [x] 支持未显式传入 `mcp_servers` 时按消息关键词自动路由 MCP
+- [x] 增加 MCP 错误处理、超时和日志
+- [x] 新增一个示例 MCP server 配置与联调说明
 
 验收标准：
 
-- 指定请求可以启用 MCP 工具
+- 指定请求可以显式或自动启用 MCP 工具
 - MCP 生命周期不散落在 endpoint 中
 - MCP 失败不会拖垮整个服务进程
+
+当前阶段说明：
+
+- 已新增 `app/ai/mcp/config.py` 与 `app/ai/mcp/manager.py`
+- `init_ai_runtime(...)` 会统一初始化并挂载 `ai_mcp_manager`
+- `/chat`、`/chat/stream`、`/chat/resume` 已支持通过 `mcp_servers` 做请求级动态装配
+- 未显式传入 `mcp_servers` 时，`MCPManager` 会基于 `route_keywords` 做自动 MCP 路由
+- MCP toolset 会统一经过现有 approval / audit wrapper
+- 当前环境如果未安装 `mcp` SDK，服务仍可正常启动；只有真正构建 MCP server 时才会返回明确错误
+- 已提供本地 mock MCP server 与联调测试路径
+- 本阶段目标已经完成，下一阶段进入 `Phase 5 - Skills`
 
 ## Phase 5 - Skills 基础设施
 
@@ -674,20 +686,19 @@ MCP_SERVERS_JSON=[]
 - `Phase 1`
 - `Phase 2`
 - `Phase 3`
+- `Phase 4`
 - `Phase 6` 的最小 approval / streaming 闭环
 
 后续建议按这个顺序继续推进：
 
-1. `Phase 4`
-2. `Phase 5`
-3. `Phase 7`
-4. `Phase 8`
+1. `Phase 5`
+2. `Phase 7`
+3. `Phase 8`
 
 原因：
 
-- 没有 `MCP`，外部工具协议能力还没有真正接进运行时
 - 没有 `Skills`，能力动态装配还停留在固定 toolsets 层
-- 当前主链路已经可运行，下一阶段更适合补齐能力装配与可观测性
+- MCP 最小闭环已经接进运行时，下一阶段更适合继续补齐 skills 与观测能力
 
 ---
 
@@ -718,13 +729,15 @@ MCP_SERVERS_JSON=[]
 - 基础测试
 - README 调用链文档
 - README approval 闭环说明文档
+- MCP 配置解析与请求级动态装配
+- MCP manager 生命周期管理
+- MCP 相关测试
 
 下一步建议补齐：
 
 - 更细粒度的工具执行审计（耗时 / 入参脱敏 / 异常分类）
 - 更完整的 streaming 事件（thinking / request boundary / progress）
 - 一个示例 skill
-- 一个可选 MCP server 装配点
 
 不要首轮就做：
 
@@ -800,8 +813,7 @@ MCP_SERVERS_JSON=[]
 
 ## 下一步
 
-下一步建议优先进入 `Phase 4` 与 `Phase 5`：
+下一步建议优先进入 `Phase 5` 与 `Phase 7`：
 
-- 开始落 `MCPManager` 与 MCP 配置装配链路
 - 开始定义 `SkillManifest / SkillLoader / SkillRegistry`
-- 在 MCP / Skills 进入主链路后，再继续细化历史策略、stream 协议和观测能力
+- 在 Skills 进入主链路后，再继续细化观测、历史策略和更完整的 streaming 协议

@@ -40,6 +40,7 @@ def _build_test_deps(request_id: str) -> AgentDeps:
         redis=None,
         http_client=httpx.AsyncClient(),
         tool_audit=ToolAuditService(),
+        mcp_manager=None,
     )
 
 

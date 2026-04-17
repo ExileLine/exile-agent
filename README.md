@@ -4,7 +4,8 @@
 
 - `Phase 1` AI 最小运行骨架
 - `Phase 2` Toolsets 与工具治理基础能力
-- `Phase 3` 当前阶段的最小运行时增强
+- `Phase 3` 运行时增强（history / resume / response metadata）
+- `Phase 4` MCP 基础接入
 - `Phase 6` 中 approval 相关的最小闭环
 
 本文档面向开发人员，重点说明当前项目的：
@@ -33,13 +34,17 @@
 - 已接入最小 tool audit 记录
 - 已接入 wrapper/audit toolset 与最小 tool execution audit
 - 已接入 metadata 驱动的 approval policy wrapper
+- 已接入 MCP 配置解析与 `MCPManager`
+- 支持在 `/chat`、`/chat/stream`、`/chat/resume` 请求中通过 `mcp_servers` 动态挂载 MCP toolsets
+- 支持基于 `route_keywords` 的自动 MCP 路由，未显式传 `mcp_servers` 时可按消息内容自动装配
+- MCP toolsets 已接入现有 approval / audit 治理包装
 - `/chat/stream` 已支持 `start` / `delta` / `tool_call` / `tool_result` / `approval_pending` / `approval_required` / `done` / `error`
 - 支持真实模型和 `TestModel`
 
 当前尚未覆盖或尚未完整落地的能力包括：
 
-- MCP 接入
 - Skills 基础设施
+- 真实第三方 MCP 的生产级认证、限流、稳定性治理与业务级工具落地
 - 更完整的平台级流式协议（如 thinking / request boundary / richer progress events）
 - 历史摘要压缩 / 裁剪
 - 更完整的 `toolsets` 包装、审批治理与基于 hooks 的细粒度审计
@@ -54,7 +59,7 @@
 FastAPI app
   -> lifespan.startup_event()
   -> init_ai_runtime()
-  -> app.state 挂载 ai_runner / ai_agent_manager
+  -> app.state 挂载 ai_runner / ai_agent_manager / ai_mcp_manager
 
 POST /api/v1/agents/chat
   -> agent endpoint
@@ -62,8 +67,9 @@ POST /api/v1/agents/chat
   -> ChatService.chat(...)
   -> AgentRunner.run_chat(...)
   -> AgentManager.get_agent(...)
+  -> MCPManager.build_toolsets(...)  # 可选，请求显式传 mcp_servers 或命中自动路由时触发
   -> build_chat_agent(...)
-  -> agent.run(message, deps=deps)
+  -> agent.run(message, deps=deps, toolsets=...)
   -> 返回 AgentChatResponse
   -> api_response(...)
 ```
@@ -79,6 +85,7 @@ POST /api/v1/agents/chat
    - 确定要用哪个 Agent
    - 确定要用哪个模型
    - 构造 `AgentDeps`
+   - 按请求解析额外的 MCP toolsets
    - 在执行前记录当前 run 可见的工具集合
    - 调用 `agent.run(...)`
    - 把结果整理成统一响应结构
@@ -103,6 +110,9 @@ app/
   ai/
     config.py                   # AISettings
     deps.py                     # RequestContext / AgentDeps
+    mcp/
+      config.py                 # MCP 配置解析
+      manager.py                # MCP server 生命周期与请求级装配
     toolsets/
       audit.py                  # wrapper/audit toolset
       builtin.py                # builtin toolsets（time / request / runtime）
@@ -259,6 +269,8 @@ settings = AISettings.from_config(project_config)
 - `default_model`
 - `max_retries`
 - `http_timeout_seconds`
+- `enable_mcp`
+- `mcp_servers_json`
 - `openai_api_key`
 - `openai_base_url`
 
@@ -364,7 +376,32 @@ http_client = httpx.AsyncClient(timeout=settings.http_timeout_seconds)
 
 都可以走这个共享 client。
 
-### Step 6. 创建 `AgentRunner`
+### Step 6. 创建 `MCPManager`
+
+代码：
+
+```python
+mcp_manager = MCPManager(
+    enabled=settings.enable_mcp,
+    server_configs=load_mcp_server_configs(settings),
+    http_client=http_client,
+)
+```
+
+`MCPManager` 是 `Phase 4` 新增的统一装配层，职责有三类：
+
+1. 解析并持有 MCP server 配置
+2. 按请求显式参数或消息自动路由，把 MCP server 解析为当前 run 的附加 toolsets
+3. 在应用关闭时统一释放已创建的 MCP server 连接
+
+当前实现里有几个关键约束：
+
+- MCP server 不直接写死在 `chat-agent` 定义中
+- `/chat`、`/chat/stream`、`/chat/resume` 都是按请求决定是否挂载 MCP
+- MCP toolset 在进入 run 前，会继续复用现有 approval / audit wrapper
+- 如果当前环境没有安装 `mcp` SDK，服务仍可启动；只有真正构建 MCP server 时才返回明确错误
+
+### Step 7. 创建 `AgentRunner`
 
 代码：
 
@@ -373,6 +410,7 @@ runner = AgentRunner(
     settings=settings,
     agent_manager=manager,
     http_client=http_client,
+    mcp_manager=mcp_manager,
 )
 ```
 
@@ -403,7 +441,7 @@ runner = AgentRunner(
 - `run_with_history(...)`
 - 更细粒度的 stream event pipeline
 
-### Step 7. 把这些对象挂到 `app.state`
+### Step 8. 把这些对象挂到 `app.state`
 
 代码：
 
@@ -412,6 +450,7 @@ app.state.ai_settings = settings
 app.state.ai_agent_registry = registry
 app.state.ai_agent_manager = manager
 app.state.ai_http_client = http_client
+app.state.ai_mcp_manager = mcp_manager
 app.state.ai_runner = runner
 ```
 
@@ -430,6 +469,148 @@ app.state.ai_runner = runner
 - `_build_chat_service(request)` 就是通过 `request.app.state` 把 `ai_runner` 和 `ai_agent_manager` 取出来
 
 这也是当前代码中 endpoint 获取 `ai_runner` 与 `ai_agent_manager` 的实际装配方式。
+
+---
+
+## 三、MCP 基础接入的当前设计
+
+当前 MCP 接入采用“配置驱动 + 请求级动态装配”的方式，而不是把外部 MCP 能力写死在某个 Agent 定义里。
+
+在当前实现里，可以把 MCP 的职责边界理解为：
+
+- `AI_MCP_SERVERS_JSON`：定义系统级“可用 MCP 能力池”
+- `mcp_servers` 或自动路由：决定当前这轮 run “向模型开放哪些 MCP”
+- 模型 tool call：在本轮已开放的工具范围内，自主决定是否调用
+
+这意味着，仅配置 MCP server 还不等于模型一定能调用；只有当该 server 被当前 run 装配进 toolsets 后，模型才看得到它。
+
+### 3.1 配置入口
+
+当前新增了两个配置字段：
+
+- `AI_ENABLE_MCP`
+- `AI_MCP_SERVERS_JSON`
+
+其中 `AI_MCP_SERVERS_JSON` 当前支持三种输入形态：
+
+1. `{"mcpServers": {"filesystem": {...}}}`
+2. `{"filesystem": {...}}`
+3. `[{"id": "filesystem", ...}]`
+
+项目内部会先把这些输入统一规整成自己的 `ManagedMCPServerConfig`，再由 `MCPManager` 懒加载成实际 MCP server 对象。
+
+当前实现把 `mcp` SDK 视为可选依赖：
+
+- 未安装 `mcp` 时，项目仍可正常启动
+- 只有在真正构建 MCP server 对象时，才会返回明确的配置错误
+
+当前每个 MCP server 还支持补充自动路由字段：
+
+- `auto_route_enabled`
+- `route_keywords`
+
+其中：
+
+- `auto_route_enabled=true` 表示该 server 允许被自动路由选中
+- `route_keywords` 用于定义命中这类问题时的关键词，例如 `["地图", "路线", "导航"]`
+
+### 3.2 请求级启用方式
+
+`/api/v1/agents/chat`、`/chat/stream`、`/chat/resume` 现在都支持在请求体中传：
+
+```json
+{
+  "message": "请调用 MCP 工具",
+  "mcp_servers": ["filesystem"]
+}
+```
+
+当请求带了 `mcp_servers` 时，调用链会多出一段：
+
+1. `ChatService` 把 `mcp_servers` 继续传给 `AgentRunner`
+2. `AgentRunner._resolve_request_toolsets(...)` 调用 `MCPManager.build_toolsets(...)`
+3. `MCPManager` 把这些 server 转成当前 run 的附加 toolsets
+4. `AgentRunner` 在 `agent.run(..., toolsets=...)` 或 `agent.run_stream_events(..., toolsets=...)` 时一起挂进去
+
+这样做的结果是：
+
+- `chat-agent` 的静态定义仍然保持精简
+- MCP 能力可以按请求启用，不污染所有 run
+- 同一套 approval / audit wrapper 可以继续复用到 MCP toolsets
+
+### 3.3 自动 MCP 路由
+
+当前已经支持“显式参数优先，未显式传参时自动路由”的模式：
+
+1. 请求显式传了 `mcp_servers`
+   当前 run 直接使用显式值，不做自动推断
+2. 请求未显式传 `mcp_servers`
+   `MCPManager` 会遍历已注册 server 的 `route_keywords`，根据用户消息做关键词匹配
+
+例如：
+
+```env
+AI_MCP_SERVERS_JSON={"mcpServers":{"maps":{"transport":"streamable-http","url":"https://example.com/maps/mcp","tool_prefix":"maps","route_keywords":["地图","路线","导航"]}}}
+```
+
+当请求为：
+
+```json
+{
+  "message": "请帮我查上海到杭州的路线"
+}
+```
+
+且本轮没有显式传 `mcp_servers` 时，运行时会自动命中 `maps`，并把它挂到当前 run。
+
+### 3.4 返回结果中的体现
+
+当前运行结束后，响应里的 `meta.mcp_servers` 会回显本轮实际装配的 MCP server ID 列表。
+
+这样做的目的有两个：
+
+- 方便前端或调用方理解这次 run 带了哪些外部能力
+- 在 `/chat/resume` 需要续跑时，调用方可以明确回传同一组 `mcp_servers`
+
+当本轮是通过自动路由命中 MCP 时，这里回显的仍然是最终实际装配的 server ID，因此前端可以据此判断当前回答是否使用了自动装配的外部能力。
+
+### 3.5 本地 mock MCP server 联调
+
+项目内提供了一个最小可运行的本地 demo MCP server：
+
+- [scripts/mock_mcp_server.py](./scripts/mock_mcp_server.py)
+
+它通过 `stdio` 暴露了 3 个工具：
+
+- `ping`
+- `echo_text`
+- `get_runtime_snapshot`
+
+推荐的本地配置示例：
+
+```env
+AI_ENABLE_MCP=true
+AI_MCP_SERVERS_JSON={"mcpServers":{"demo":{"transport":"stdio","command":"/Users/yangyuexiong/Desktop/exile-agent/.venv/bin/python","args":["/Users/yangyuexiong/Desktop/exile-agent/scripts/mock_mcp_server.py"],"tool_prefix":"demo"}}}
+```
+
+完成配置并重启服务后，可以直接测试：
+
+```bash
+curl -X POST 'http://127.0.0.1:8000/api/v1/agents/chat' \
+  -H 'Content-Type: application/json' \
+  -H 'x-user-id: tester' \
+  -d '{
+    "message": "请不要猜测，必须调用 demo MCP 工具先执行 ping，再简要回答当前 MCP 是否可用。",
+    "mcp_servers": ["demo"]
+  }'
+```
+
+如果链路正常，响应里应满足：
+
+- `data.meta.mcp_servers == ["demo"]`
+- 模型返回内容明确引用了 MCP 工具结果
+
+如果要进一步确认模型是否真的执行了工具，而不是只返回最终文本，建议改用 `/api/v1/agents/chat/stream` 观察 `tool_call` / `tool_result` 事件。
 
 ---
 

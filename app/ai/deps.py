@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from app.ai.config import AISettings
 
 if TYPE_CHECKING:
+    from app.ai.mcp import MCPManager
     from app.ai.services.tool_audit import ToolAuditService
 
 
@@ -30,8 +31,8 @@ class AgentDeps:
     """一次 Agent 运行注入给工具层 / 动态 instructions 的依赖集合。
 
     `deps_type=AgentDeps` 后，工具函数里的 `RunContext[AgentDeps]` 就可以统一拿到这些资源。
-    当前先注入 request/settings/db/redis/http_client/tool_audit，
-    后续接 history / skill / mcp / approval 也会继续沿这个入口扩展。
+    当前先注入 request/settings/db/redis/http_client/tool_audit/mcp_manager，
+    后续接 history / skill / approval 也会继续沿这个入口扩展。
     """
     request: RequestContext
     settings: AISettings
@@ -39,3 +40,4 @@ class AgentDeps:
     redis: Redis | None
     http_client: httpx.AsyncClient
     tool_audit: ToolAuditService
+    mcp_manager: MCPManager | None

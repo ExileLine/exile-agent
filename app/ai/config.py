@@ -18,6 +18,8 @@ class AISettings(BaseModel):
     max_retries: int = 2
     http_timeout_seconds: float = 30.0
     history_ttl_seconds: int | None = None
+    enable_mcp: bool = False
+    mcp_servers_json: str | None = None
     openai_api_key: str | None = None
     openai_base_url: str | None = None
 
@@ -31,6 +33,8 @@ class AISettings(BaseModel):
             max_retries=config.AI_MAX_RETRIES,
             http_timeout_seconds=config.AI_HTTP_TIMEOUT_SECONDS,
             history_ttl_seconds=config.AI_HISTORY_TTL_SECONDS,
+            enable_mcp=config.AI_ENABLE_MCP,
+            mcp_servers_json=config.AI_MCP_SERVERS_JSON,
             openai_api_key=config.OPENAI_API_KEY,
             openai_base_url=config.OPENAI_BASE_URL,
         )

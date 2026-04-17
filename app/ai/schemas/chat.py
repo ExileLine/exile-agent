@@ -10,6 +10,7 @@ class AgentChatRequest(BaseModel):
     message: str = Field(min_length=1, description="用户输入")
     session_id: str | None = Field(default=None, description="会话 ID")
     model: str | None = Field(default=None, description="覆盖模型名")
+    mcp_servers: list[str] = Field(default_factory=list, description="本轮额外启用的 MCP server ID 列表")
 
 
 class AgentApprovalRequest(BaseModel):
@@ -44,6 +45,7 @@ class AgentChatResumeRequest(BaseModel):
     agent_id: str | None = Field(default=None, description="目标 Agent ID")
     session_id: str | None = Field(default=None, description="会话 ID")
     model: str | None = Field(default=None, description="覆盖模型名")
+    mcp_servers: list[str] = Field(default_factory=list, description="本轮需要继续挂载的 MCP server ID 列表")
     message_history_json: str = Field(min_length=1, description="上一次 run 返回的完整 message_history JSON")
     approvals: list[AgentApprovalDecision] = Field(default_factory=list, description="人工审批结果列表")
 
@@ -60,6 +62,7 @@ class AgentRunMeta(BaseModel):
     history_loaded: bool = Field(description="是否加载了已有会话历史")
     history_saved: bool = Field(description="是否写回了会话历史")
     message_count: int = Field(description="本轮 run 结束后的完整消息数")
+    mcp_servers: list[str] = Field(default_factory=list, description="本轮实际装配的 MCP server ID 列表")
 
 
 class AgentChatResponse(BaseModel):

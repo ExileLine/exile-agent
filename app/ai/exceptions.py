@@ -16,3 +16,15 @@ class AgentNotFoundError(AIRuntimeError):
 
 class AIRunExecutionError(AIRuntimeError):
     """一次具体 Agent run 在执行阶段失败时抛出。"""
+
+
+class MCPConfigurationError(AIRuntimeError):
+    """MCP 配置格式不正确或与当前运行方式不兼容时抛出。"""
+
+
+class MCPServerNotFoundError(AIRuntimeError):
+    """请求了未注册的 MCP server ID 时抛出。"""
+
+
+class MCPRuntimeError(AIRuntimeError):
+    """MCP server 在初始化、列工具或执行过程中失败时抛出。"""

@@ -31,6 +31,7 @@ class ChatService:
             agent_id=payload.agent_id,
             session_id=payload.session_id,
             model_name=payload.model,
+            mcp_server_ids=payload.mcp_servers,
         )
 
     async def stream(self, *, request_context: RequestContext, payload: AgentChatRequest) -> AsyncIterator[str]:
@@ -42,6 +43,7 @@ class ChatService:
             agent_id=payload.agent_id,
             session_id=payload.session_id,
             model_name=payload.model,
+            mcp_server_ids=payload.mcp_servers,
         ):
             yield event
 
@@ -55,4 +57,5 @@ class ChatService:
             agent_id=payload.agent_id,
             session_id=payload.session_id,
             model_name=payload.model,
+            mcp_server_ids=payload.mcp_servers,
         )

@@ -3,6 +3,7 @@ from fastapi import FastAPI
 
 from app.ai.agents import register_default_agents
 from app.ai.config import AISettings
+from app.ai.mcp import MCPManager, load_mcp_server_configs
 from app.ai.runtime.history import SessionHistoryStore
 from app.ai.runtime.manager import AgentManager
 from app.ai.runtime.registry import AgentRegistry
@@ -31,6 +32,11 @@ async def init_ai_runtime(app: FastAPI, project_config: BaseConfig) -> None:
     register_default_agents(registry, settings)
     manager = AgentManager(registry=registry, settings=settings)
     http_client = httpx.AsyncClient(timeout=settings.http_timeout_seconds)
+    mcp_manager = MCPManager(
+        enabled=settings.enable_mcp,
+        server_configs=load_mcp_server_configs(settings),
+        http_client=http_client,
+    )
     tool_audit = ToolAuditService()
     # 会话历史优先落 Redis；
     # 如果当前环境没有 Redis 连接，则退化到进程内存存储，方便测试和本地最小调试。
@@ -44,12 +50,14 @@ async def init_ai_runtime(app: FastAPI, project_config: BaseConfig) -> None:
         http_client=http_client,
         tool_audit=tool_audit,
         history_store=history_store,
+        mcp_manager=mcp_manager,
     )
 
     app.state.ai_settings = settings
     app.state.ai_agent_registry = registry
     app.state.ai_agent_manager = manager
     app.state.ai_http_client = http_client
+    app.state.ai_mcp_manager = mcp_manager
     app.state.ai_tool_audit = tool_audit
     app.state.ai_history_store = history_store
     app.state.ai_runner = runner
@@ -58,6 +66,10 @@ async def init_ai_runtime(app: FastAPI, project_config: BaseConfig) -> None:
 async def shutdown_ai_runtime(app: FastAPI) -> None:
     """在应用关闭阶段释放 AI runtime 资源并清理 `app.state`。"""
     http_client = getattr(app.state, "ai_http_client", None)
+    mcp_manager = getattr(app.state, "ai_mcp_manager", None)
+    if mcp_manager is not None:
+        await mcp_manager.shutdown()
+
     if http_client is not None:
         await http_client.aclose()
 
@@ -66,6 +78,7 @@ async def shutdown_ai_runtime(app: FastAPI) -> None:
         "ai_agent_registry",
         "ai_agent_manager",
         "ai_http_client",
+        "ai_mcp_manager",
         "ai_tool_audit",
         "ai_history_store",
         "ai_runner",
