@@ -32,7 +32,13 @@ from app.ai.schemas.chat import (
     AgentDeferredToolRequestsPayload,
     AgentRunMeta,
 )
+from app.ai.skills import SkillRegistry, SkillResolution, SkillResolver
 from app.ai.services.tool_audit import ToolAuditService
+from app.ai.toolsets import (
+    build_registered_toolsets,
+    wrap_toolsets_with_audit,
+    wrap_toolsets_with_metadata_approval,
+)
 from app.db import redis_client
 from app.db.session import AsyncSessionLocal
 
@@ -47,6 +53,8 @@ class AgentRunner:
             tool_audit: ToolAuditService,
             history_store: SessionHistoryStore,
             mcp_manager: MCPManager | None,
+            skill_registry: SkillRegistry | None,
+            skill_resolver: SkillResolver | None,
     ) -> None:
         self.settings = settings
         self.agent_manager = agent_manager
@@ -54,6 +62,8 @@ class AgentRunner:
         self.tool_audit = tool_audit
         self.history_store = history_store
         self.mcp_manager = mcp_manager
+        self.skill_registry = skill_registry
+        self.skill_resolver = skill_resolver
 
     async def run_chat(
             self,
@@ -64,6 +74,8 @@ class AgentRunner:
             session_id: str | None = None,
             model_name: str | None = None,
             mcp_server_ids: list[str] | None = None,
+            skill_ids: list[str] | None = None,
+            skill_tags: list[str] | None = None,
     ) -> AgentChatResponse:
         """执行一次标准 chat run。
 
@@ -72,10 +84,17 @@ class AgentRunner:
         """
 
         resolved_agent_id, resolved_model, agent = self._resolve_agent(agent_id=agent_id, model_name=model_name)
-        deps = self._build_deps(request_context)
+        skill_resolution = self._resolve_skills(
+            agent_id=resolved_agent_id,
+            message=message,
+            skill_ids=skill_ids,
+            skill_tags=skill_tags,
+        )
+        deps = self._build_deps(request_context, resolved_skill_names=tuple(skill_resolution.skill_names))
         resolved_mcp_server_ids, run_toolsets = self._resolve_request_toolsets(
             mcp_server_ids=mcp_server_ids,
             route_message=message,
+            skill_resolution=skill_resolution,
         )
         message_history = await self.history_store.load_messages(session_id)
         history_loaded = bool(message_history)
@@ -95,6 +114,7 @@ class AgentRunner:
                 message,
                 deps=deps,
                 message_history=message_history or None,
+                instructions=skill_resolution.instructions or None,
                 toolsets=run_toolsets or None,
             )
             history_saved = await self._save_history(session_id, result)
@@ -112,6 +132,7 @@ class AgentRunner:
             history_loaded=history_loaded,
             history_saved=history_saved,
             mcp_servers=resolved_mcp_server_ids,
+            skills=skill_resolution.skill_names,
         )
 
     async def run_chat_stream(
@@ -123,6 +144,8 @@ class AgentRunner:
             session_id: str | None = None,
             model_name: str | None = None,
             mcp_server_ids: list[str] | None = None,
+            skill_ids: list[str] | None = None,
+            skill_tags: list[str] | None = None,
     ) -> AsyncIterator[str]:
         """执行一次 SSE 形式的流式 chat run。
 
@@ -136,10 +159,17 @@ class AgentRunner:
         """
 
         resolved_agent_id, resolved_model, agent = self._resolve_agent(agent_id=agent_id, model_name=model_name)
-        deps = self._build_deps(request_context)
+        skill_resolution = self._resolve_skills(
+            agent_id=resolved_agent_id,
+            message=message,
+            skill_ids=skill_ids,
+            skill_tags=skill_tags,
+        )
+        deps = self._build_deps(request_context, resolved_skill_names=tuple(skill_resolution.skill_names))
         resolved_mcp_server_ids, run_toolsets = self._resolve_request_toolsets(
             mcp_server_ids=mcp_server_ids,
             route_message=message,
+            skill_resolution=skill_resolution,
         )
         message_history = await self.history_store.load_messages(session_id)
         history_loaded = bool(message_history)
@@ -163,6 +193,7 @@ class AgentRunner:
                 message,
                 deps=deps,
                 message_history=message_history or None,
+                instructions=skill_resolution.instructions or None,
                 toolsets=run_toolsets or None,
             )
             try:
@@ -188,6 +219,8 @@ class AgentRunner:
                         stream_mode="fallback",
                         mcp_servers=resolved_mcp_server_ids,
                         run_toolsets=run_toolsets,
+                        instructions=skill_resolution.instructions,
+                        skills=skill_resolution.skill_names,
                 ):
                     yield event
                 return
@@ -210,6 +243,7 @@ class AgentRunner:
                         history_saved=False,
                         message_count=len(message_history),
                         mcp_servers=resolved_mcp_server_ids,
+                        skills=skill_resolution.skill_names,
                     ).model_dump(mode="json"),
                 },
             )
@@ -266,6 +300,7 @@ class AgentRunner:
                         history_loaded=history_loaded,
                         history_saved=history_saved,
                         mcp_servers=resolved_mcp_server_ids,
+                        skills=skill_resolution.skill_names,
                     )
                     response.meta.stream_mode = "native"
 
@@ -291,6 +326,7 @@ class AgentRunner:
                     history_loaded=history_loaded,
                     stream_mode="native",
                     mcp_servers=resolved_mcp_server_ids,
+                    skills=skill_resolution.skill_names,
                 ),
             )
             return
@@ -305,6 +341,8 @@ class AgentRunner:
             session_id: str | None = None,
             model_name: str | None = None,
             mcp_server_ids: list[str] | None = None,
+            skill_ids: list[str] | None = None,
+            skill_tags: list[str] | None = None,
     ) -> AgentChatResponse:
         """基于上一轮 deferred tool requests 继续执行一次 run。
 
@@ -315,11 +353,19 @@ class AgentRunner:
         """
 
         resolved_agent_id, resolved_model, agent = self._resolve_agent(agent_id=agent_id, model_name=model_name)
-        deps = self._build_deps(request_context)
         message_history = ModelMessagesTypeAdapter.validate_json(message_history_json)
+        latest_user_message = self._extract_latest_user_message(message_history)
+        skill_resolution = self._resolve_skills(
+            agent_id=resolved_agent_id,
+            message=latest_user_message,
+            skill_ids=skill_ids,
+            skill_tags=skill_tags,
+        )
+        deps = self._build_deps(request_context, resolved_skill_names=tuple(skill_resolution.skill_names))
         resolved_mcp_server_ids, run_toolsets = self._resolve_request_toolsets(
             mcp_server_ids=mcp_server_ids,
-            route_message=self._extract_latest_user_message(message_history),
+            route_message=latest_user_message,
+            skill_resolution=skill_resolution,
         )
         deferred_tool_results = self._build_deferred_tool_results(approvals)
 
@@ -328,6 +374,7 @@ class AgentRunner:
                 deps=deps,
                 message_history=message_history,
                 deferred_tool_results=deferred_tool_results,
+                instructions=skill_resolution.instructions or None,
                 toolsets=run_toolsets or None,
             )
             history_saved = await self._save_history(session_id, result)
@@ -345,6 +392,7 @@ class AgentRunner:
             history_loaded=True,
             history_saved=history_saved,
             mcp_servers=resolved_mcp_server_ids,
+            skills=skill_resolution.skill_names,
         )
 
     def _resolve_agent(self, *, agent_id: str | None, model_name: str | None) -> tuple[str, str, Any]:
@@ -356,9 +404,14 @@ class AgentRunner:
         agent = self.agent_manager.get_agent(resolved_agent_id, resolved_model)
         return resolved_agent_id, resolved_model, agent
 
-    def _build_deps(self, request_context: RequestContext) -> AgentDeps:
+    def _build_deps(
+            self,
+            request_context: RequestContext,
+            *,
+            resolved_skill_names: tuple[str, ...] = (),
+    ) -> AgentDeps:
         # `AgentDeps` 是本次运行注入给工具层和动态 instructions 的运行时依赖集合。
-        # 当前先放 request/settings/db/redis/http_client/tool_audit/mcp_manager，
+        # 当前先放 request/settings/db/redis/http_client/tool_audit/mcp_manager/skill_registry，
         # 后续继续扩 history / approval / skill 也会沿着这个入口演进。
         return AgentDeps(
             request=request_context,
@@ -368,6 +421,31 @@ class AgentRunner:
             http_client=self.http_client,
             tool_audit=self.tool_audit,
             mcp_manager=self.mcp_manager,
+            skill_registry=self.skill_registry,
+            resolved_skill_names=resolved_skill_names,
+        )
+
+    def _resolve_skills(
+            self,
+            *,
+            agent_id: str,
+            message: str | None,
+            skill_ids: list[str] | None,
+            skill_tags: list[str] | None,
+    ) -> SkillResolution:
+        if self.skill_resolver is None:
+            return SkillResolution(
+                skills=(),
+                instructions=(),
+                required_toolset_ids=(),
+                required_mcp_server_ids=(),
+            )
+
+        return self.skill_resolver.resolve(
+            agent_id=agent_id,
+            message=message,
+            skill_ids=skill_ids,
+            skill_tags=skill_tags,
         )
 
     def _resolve_request_toolsets(
@@ -375,24 +453,40 @@ class AgentRunner:
             *,
             mcp_server_ids: list[str] | None,
             route_message: str | None,
+            skill_resolution: SkillResolution,
     ) -> tuple[list[str], list[AbstractToolset[AgentDeps]]]:
         """解析请求级动态能力并转换成本轮附加 toolsets。
 
         规则是：
-        - 显式传入 `mcp_servers` 时优先按显式值启用
-        - 未显式传入时，允许 MCP manager 根据消息内容做自动路由
+        - skills 先声明本轮额外需要的 toolsets / MCP
+        - 未显式传入 `mcp_servers` 时，允许 MCP manager 根据消息内容做自动路由
         """
 
-        if self.mcp_manager is None:
-            return list(dict.fromkeys(mcp_server_ids or [])), []
-
-        resolved_mcp_server_ids = self.mcp_manager.resolve_server_ids(
-            requested_server_ids=mcp_server_ids,
-            message=route_message,
+        skill_toolsets = build_registered_toolsets(list(skill_resolution.required_toolset_ids))
+        wrapped_skill_toolsets = wrap_toolsets_with_audit(
+            wrap_toolsets_with_metadata_approval(skill_toolsets)
         )
+
+        explicit_mcp_server_ids = _dedupe_server_ids(
+            [*(mcp_server_ids or []), *skill_resolution.required_mcp_server_ids]
+        )
+
+        if self.mcp_manager is None:
+            return explicit_mcp_server_ids, wrapped_skill_toolsets
+
+        auto_routed_server_ids = self.mcp_manager.resolve_server_ids(
+            requested_server_ids=None,
+            message=route_message,
+        ) if not mcp_server_ids else []
+
+        resolved_mcp_server_ids = _dedupe_server_ids([*explicit_mcp_server_ids, *auto_routed_server_ids])
         if not resolved_mcp_server_ids:
-            return resolved_mcp_server_ids, []
-        return resolved_mcp_server_ids, self.mcp_manager.build_toolsets(resolved_mcp_server_ids)
+            return resolved_mcp_server_ids, wrapped_skill_toolsets
+
+        return (
+            resolved_mcp_server_ids,
+            [*wrapped_skill_toolsets, *self.mcp_manager.build_toolsets(resolved_mcp_server_ids)],
+        )
 
     def _build_chat_response(
             self,
@@ -406,6 +500,7 @@ class AgentRunner:
             history_loaded: bool,
             history_saved: bool,
             mcp_servers: list[str],
+            skills: list[str],
     ) -> AgentChatResponse:
         output = result.output
         response = AgentChatResponse(
@@ -424,6 +519,7 @@ class AgentRunner:
                 history_saved=history_saved,
                 message_count=len(result.all_messages()),
                 mcp_servers=mcp_servers,
+                skills=skills,
             ),
         )
 
@@ -452,6 +548,8 @@ class AgentRunner:
             stream_mode: str,
             mcp_servers: list[str],
             run_toolsets: list[AbstractToolset[AgentDeps]],
+            instructions: tuple[str, ...],
+            skills: list[str],
     ) -> AsyncIterator[str]:
         """当模型不支持真正的 streamed request 时，退化成单次 run 再包装成 SSE。"""
 
@@ -460,6 +558,7 @@ class AgentRunner:
                 message,
                 deps=deps,
                 message_history=message_history or None,
+                instructions=instructions or None,
                 toolsets=run_toolsets or None,
             )
             history_saved = await self._save_history(session_id, result)
@@ -475,6 +574,7 @@ class AgentRunner:
                     history_loaded=history_loaded,
                     stream_mode="fallback",
                     mcp_servers=mcp_servers,
+                    skills=skills,
                 ),
             )
             return
@@ -488,6 +588,7 @@ class AgentRunner:
             history_loaded=history_loaded,
             history_saved=history_saved,
             mcp_servers=mcp_servers,
+            skills=skills,
         )
         response.meta.stream_mode = stream_mode
         yield self._sse_event(
@@ -505,6 +606,7 @@ class AgentRunner:
                     history_saved=False,
                     message_count=len(message_history),
                     mcp_servers=mcp_servers,
+                    skills=skills,
                 ).model_dump(mode="json"),
             },
         )
@@ -750,6 +852,7 @@ class AgentRunner:
             history_saved: bool,
             message_count: int,
             mcp_servers: list[str],
+            skills: list[str],
     ) -> AgentRunMeta:
         return AgentRunMeta(
             run_kind=run_kind,
@@ -758,6 +861,7 @@ class AgentRunner:
             history_saved=history_saved,
             message_count=message_count,
             mcp_servers=mcp_servers,
+            skills=skills,
         )
 
     @staticmethod
@@ -783,6 +887,7 @@ class AgentRunner:
             history_loaded: bool,
             stream_mode: str,
             mcp_servers: list[str],
+            skills: list[str],
     ) -> dict[str, Any]:
         return {
             "error": str(error),
@@ -798,5 +903,18 @@ class AgentRunner:
                 history_saved=False,
                 message_count=0,
                 mcp_servers=mcp_servers,
+                skills=skills,
             ).model_dump(mode="json"),
         }
+
+
+def _dedupe_server_ids(server_ids: list[str]) -> list[str]:
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for server_id in server_ids:
+        normalized = server_id.strip()
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        deduped.append(normalized)
+    return deduped

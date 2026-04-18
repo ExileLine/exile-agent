@@ -8,6 +8,7 @@ from app.ai.runtime.history import SessionHistoryStore
 from app.ai.runtime.manager import AgentManager
 from app.ai.runtime.registry import AgentRegistry
 from app.ai.runtime.runner import AgentRunner
+from app.ai.skills import SkillLoader, SkillRegistry, SkillResolver
 from app.ai.services.tool_audit import ToolAuditService
 from app.core.config import BaseConfig
 from app.db import redis_client
@@ -32,6 +33,9 @@ async def init_ai_runtime(app: FastAPI, project_config: BaseConfig) -> None:
     register_default_agents(registry, settings)
     manager = AgentManager(registry=registry, settings=settings)
     http_client = httpx.AsyncClient(timeout=settings.http_timeout_seconds)
+    skill_loader = SkillLoader(skills_dir=settings.skills_dir)
+    skill_registry = SkillRegistry(skill_loader.load_manifests())
+    skill_resolver = SkillResolver(registry=skill_registry, loader=skill_loader)
     mcp_manager = MCPManager(
         enabled=settings.enable_mcp,
         server_configs=load_mcp_server_configs(settings),
@@ -51,12 +55,17 @@ async def init_ai_runtime(app: FastAPI, project_config: BaseConfig) -> None:
         tool_audit=tool_audit,
         history_store=history_store,
         mcp_manager=mcp_manager,
+        skill_registry=skill_registry,
+        skill_resolver=skill_resolver,
     )
 
     app.state.ai_settings = settings
     app.state.ai_agent_registry = registry
     app.state.ai_agent_manager = manager
     app.state.ai_http_client = http_client
+    app.state.ai_skill_loader = skill_loader
+    app.state.ai_skill_registry = skill_registry
+    app.state.ai_skill_resolver = skill_resolver
     app.state.ai_mcp_manager = mcp_manager
     app.state.ai_tool_audit = tool_audit
     app.state.ai_history_store = history_store
@@ -78,6 +87,9 @@ async def shutdown_ai_runtime(app: FastAPI) -> None:
         "ai_agent_registry",
         "ai_agent_manager",
         "ai_http_client",
+        "ai_skill_loader",
+        "ai_skill_registry",
+        "ai_skill_resolver",
         "ai_mcp_manager",
         "ai_tool_audit",
         "ai_history_store",

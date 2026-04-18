@@ -11,6 +11,7 @@ from app.ai.toolsets.builtin import (
     get_builtin_toolsets,
 )
 from app.ai.toolsets.audit import ToolAuditWrapperToolset, wrap_toolset_with_audit, wrap_toolsets_with_audit
+from app.ai.toolsets.catalog import STATIC_DEFAULT_TOOLSET_IDS, build_registered_toolsets
 from app.ai.toolsets.conventions import (
     READONLY_TOOL_PREFIXES,
     TOOL_NAME_PATTERN,
@@ -28,11 +29,13 @@ from app.ai.toolsets.metadata import (
 __all__ = [
     "READONLY_TOOL_PREFIXES",
     "MetadataApprovalToolset",
+    "STATIC_DEFAULT_TOOLSET_IDS",
     "TOOL_NAME_PATTERN",
     "ToolAuditWrapperToolset",
     "ToolRisk",
     "ToolConventionError",
     "ToolsetKind",
+    "build_registered_toolsets",
     "build_tool_metadata",
     "build_toolset_metadata",
     "create_function_toolset",

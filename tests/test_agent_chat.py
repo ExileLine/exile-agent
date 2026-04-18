@@ -41,6 +41,8 @@ def _build_test_deps(request_id: str) -> AgentDeps:
         http_client=httpx.AsyncClient(),
         tool_audit=ToolAuditService(),
         mcp_manager=None,
+        skill_registry=None,
+        resolved_skill_names=(),
     )
 
 

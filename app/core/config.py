@@ -123,6 +123,7 @@ class BaseConfig(BaseSettings):
     AI_MAX_RETRIES: int = 2
     AI_HTTP_TIMEOUT_SECONDS: float = 30.0
     AI_HISTORY_TTL_SECONDS: int | None = None
+    AI_SKILLS_DIR: Optional[str] = "app/ai/skills/catalog"
     AI_ENABLE_MCP: bool = False
     AI_MCP_SERVERS_JSON: Optional[str] = None
     OPENAI_API_KEY: Optional[str] = None

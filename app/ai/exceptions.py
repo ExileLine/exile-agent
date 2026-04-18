@@ -28,3 +28,11 @@ class MCPServerNotFoundError(AIRuntimeError):
 
 class MCPRuntimeError(AIRuntimeError):
     """MCP server 在初始化、列工具或执行过程中失败时抛出。"""
+
+
+class SkillConfigurationError(AIRuntimeError):
+    """Skill 配置文件格式不正确或引用了无效依赖时抛出。"""
+
+
+class SkillNotFoundError(AIRuntimeError):
+    """请求或解析过程中引用了未注册的 skill 时抛出。"""

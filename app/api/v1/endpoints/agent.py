@@ -14,9 +14,10 @@ router = APIRouter(prefix="/agents", tags=["agents"])
 def _build_chat_service(request: Request) -> ChatService:
     runner = getattr(request.app.state, "ai_runner", None)
     agent_manager = getattr(request.app.state, "ai_agent_manager", None)
+    skill_registry = getattr(request.app.state, "ai_skill_registry", None)
     if runner is None or agent_manager is None:
         raise CustomException(status_code=503, detail="AI runtime 未初始化", custom_code=503)
-    return ChatService(runner=runner, agent_manager=agent_manager)
+    return ChatService(runner=runner, agent_manager=agent_manager, skill_registry=skill_registry)
 
 
 @router.get("", summary="List registered agents")
@@ -26,6 +27,12 @@ async def list_agents(request: Request):
         data=[item.model_dump(mode="json") for item in service.list_agents()],
         is_pop=False,
     )
+
+
+@router.get("/skills", summary="List registered skills")
+async def list_skills(request: Request):
+    service = _build_chat_service(request)
+    return api_response(data=service.list_skills(), is_pop=False)
 
 
 @router.post("/chat", summary="Run agent chat")

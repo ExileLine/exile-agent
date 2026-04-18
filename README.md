@@ -6,6 +6,7 @@
 - `Phase 2` Toolsets 与工具治理基础能力
 - `Phase 3` 运行时增强（history / resume / response metadata）
 - `Phase 4` MCP 基础接入
+- `Phase 5` Skills 基础设施
 - `Phase 6` 中 approval 相关的最小闭环
 
 本文档面向开发人员，重点说明当前项目的：
@@ -38,12 +39,17 @@
 - 支持在 `/chat`、`/chat/stream`、`/chat/resume` 请求中通过 `mcp_servers` 动态挂载 MCP toolsets
 - 支持基于 `route_keywords` 的自动 MCP 路由，未显式传 `mcp_servers` 时可按消息内容自动装配
 - MCP toolsets 已接入现有 approval / audit 治理包装
+- 已接入 filesystem `SkillLoader`、`SkillRegistry`、`SkillResolver`
+- 支持通过 `skill_ids` / `skill_tags` 做请求级 skill 选择
+- 支持基于 skill `route_keywords` 的自动命中与 `SKILL.md` 渐进式加载
+- 支持 skill 依赖的 toolsets / MCP 自动挂载
+- 支持通过 `/api/v1/agents/skills` 查看当前注册的 skills
+- `/chat` / `/chat/resume` / `/chat/stream` 响应会在 `meta.skills` 回显本轮解析出的 skills
 - `/chat/stream` 已支持 `start` / `delta` / `tool_call` / `tool_result` / `approval_pending` / `approval_required` / `done` / `error`
 - 支持真实模型和 `TestModel`
 
 当前尚未覆盖或尚未完整落地的能力包括：
 
-- Skills 基础设施
 - 真实第三方 MCP 的生产级认证、限流、稳定性治理与业务级工具落地
 - 更完整的平台级流式协议（如 thinking / request boundary / richer progress events）
 - 历史摘要压缩 / 裁剪
@@ -67,9 +73,10 @@ POST /api/v1/agents/chat
   -> ChatService.chat(...)
   -> AgentRunner.run_chat(...)
   -> AgentManager.get_agent(...)
+  -> SkillResolver.resolve(...)        # 可选，请求显式传 skill_ids/skill_tags 或命中 skill 路由时触发
   -> MCPManager.build_toolsets(...)  # 可选，请求显式传 mcp_servers 或命中自动路由时触发
   -> build_chat_agent(...)
-  -> agent.run(message, deps=deps, toolsets=...)
+  -> agent.run(message, deps=deps, instructions=..., toolsets=...)
   -> 返回 AgentChatResponse
   -> api_response(...)
 ```
@@ -85,6 +92,7 @@ POST /api/v1/agents/chat
    - 确定要用哪个 Agent
    - 确定要用哪个模型
    - 构造 `AgentDeps`
+   - 解析本轮 skills，并构造运行时 instructions
    - 按请求解析额外的 MCP toolsets
    - 在执行前记录当前 run 可见的工具集合
    - 调用 `agent.run(...)`
@@ -110,6 +118,12 @@ app/
   ai/
     config.py                   # AISettings
     deps.py                     # RequestContext / AgentDeps
+    skills/
+      loader.py                 # filesystem skill loader
+      models.py                 # SkillManifest
+      registry.py               # SkillRegistry
+      resolver.py               # SkillResolver
+      catalog/                  # 项目内置 skill catalog
     mcp/
       config.py                 # MCP 配置解析
       manager.py                # MCP server 生命周期与请求级装配
@@ -376,7 +390,33 @@ http_client = httpx.AsyncClient(timeout=settings.http_timeout_seconds)
 
 都可以走这个共享 client。
 
-### Step 6. 创建 `MCPManager`
+### Step 6. 创建 `SkillLoader` / `SkillRegistry` / `SkillResolver`
+
+代码：
+
+```python
+skill_loader = SkillLoader(skills_dir=settings.skills_dir)
+skill_registry = SkillRegistry(skill_loader.load_manifests())
+skill_resolver = SkillResolver(registry=skill_registry, loader=skill_loader)
+```
+
+这一层对应 `Phase 5 - Skills`，职责分为三段：
+
+1. `SkillLoader`
+   负责从文件系统扫描 `skill.yaml` 与 `SKILL.md`
+2. `SkillRegistry`
+   负责保存当前系统已注册的 skills，并提供按名称查询、按 agent 过滤能力
+3. `SkillResolver`
+   负责在每次 run 前，根据 `agent_id`、用户消息、`skill_ids`、`skill_tags` 解析出本轮应该注入的 skills
+
+当前 skills 设计不是“再造一个 Agent”，而是把 skill 视为一组运行时能力包：
+
+- skill 摘要
+- 可选的完整说明正文
+- 可选依赖的 toolsets
+- 可选依赖的 MCP servers
+
+### Step 7. 创建 `MCPManager`
 
 代码：
 
@@ -401,7 +441,7 @@ mcp_manager = MCPManager(
 - MCP toolset 在进入 run 前，会继续复用现有 approval / audit wrapper
 - 如果当前环境没有安装 `mcp` SDK，服务仍可启动；只有真正构建 MCP server 时才返回明确错误
 
-### Step 7. 创建 `AgentRunner`
+### Step 8. 创建 `AgentRunner`
 
 代码：
 
@@ -441,7 +481,7 @@ runner = AgentRunner(
 - `run_with_history(...)`
 - 更细粒度的 stream event pipeline
 
-### Step 8. 把这些对象挂到 `app.state`
+### Step 9. 把这些对象挂到 `app.state`
 
 代码：
 
@@ -611,6 +651,88 @@ curl -X POST 'http://127.0.0.1:8000/api/v1/agents/chat' \
 - 模型返回内容明确引用了 MCP 工具结果
 
 如果要进一步确认模型是否真的执行了工具，而不是只返回最终文本，建议改用 `/api/v1/agents/chat/stream` 观察 `tool_call` / `tool_result` 事件。
+
+### 3.6 Skills 基础设施的当前设计
+
+当前 skills 采用“本地目录 + manifest + 渐进式注入”的方式。
+
+#### 目录结构
+
+每个 skill 目录至少包含：
+
+- `skill.yaml`
+- `SKILL.md`
+
+其中：
+
+- `skill.yaml` 描述 skill 的元数据、依赖与路由策略
+- `SKILL.md` 描述面向模型的完整执行说明
+
+当前 `skill.yaml` 主要支持这些字段：
+
+- `name`
+- `title`
+- `description`
+- `tags`
+- `enabled`
+- `priority`
+- `load_strategy`
+- `allowed_agents`
+- `required_toolsets`
+- `required_mcp_servers`
+- `instruction_files`
+- `route_keywords`
+- `summary`
+
+#### 运行时职责拆分
+
+skills 主链路由三层完成：
+
+1. `SkillLoader`
+   扫描 `AI_SKILLS_DIR`，读取 `skill.yaml` 与 `SKILL.md`
+2. `SkillRegistry`
+   保存当前已注册 skills，提供查询与 agent 过滤
+3. `SkillResolver`
+   在每次 run 前解析：
+   - 哪些 skills 被显式请求
+   - 哪些 skills 被 `skill_tags` 命中
+   - 哪些 skills 被消息内容中的 `route_keywords` 命中
+
+#### 注入策略
+
+当前实现遵循“摘要优先、正文按需展开”的原则：
+
+- 先注入 skill summary
+- 当 `load_strategy=full_on_match` 且当前请求真正命中 skill 时，再继续加载 `SKILL.md`
+- skills 依赖的 `required_toolsets` / `required_mcp_servers` 会一起挂到当前 run
+
+因此，skills 的职责边界可以概括为：
+
+- `AI_SKILLS_DIR`：定义系统可发现的 skill 能力池
+- `skill_ids` / `skill_tags` / 消息命中：决定本轮 run 采用哪些 skills
+- `meta.skills`：回显本轮最终解析并注入的 skills
+
+#### 当前 API 入口
+
+当前有两类 skill 相关入口：
+
+1. `GET /api/v1/agents/skills`
+   查看当前注册的 skills
+2. `POST /api/v1/agents/chat`
+   可通过请求体传入：
+
+```json
+{
+  "message": "请帮我检查当前运行时健康状态",
+  "skill_tags": ["ops"]
+}
+```
+
+当命中 `ops-observer` 这类 skill 时：
+
+- `AgentRunner` 会把 skill 摘要或正文作为运行时 instructions 注入
+- 同时把 skill 依赖的 toolsets / MCP 一并挂到当前 run
+- 最终响应中的 `meta.skills` 会回显本轮命中的 skill 名称
 
 ---
 

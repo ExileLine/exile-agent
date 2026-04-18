@@ -610,14 +610,25 @@ AI_MCP_SERVERS_JSON={}
 
 ## Phase 5 - Skills 基础设施
 
-- [ ] 定义 `SkillManifest`
-- [ ] 实现 filesystem `SkillLoader`
-- [ ] 实现 `SkillRegistry`
-- [ ] 实现 `SkillResolver`
-- [ ] 支持 skill 摘要注入
-- [ ] 支持按命中加载 `SKILL.md`
-- [ ] 支持 skill 依赖的 toolsets / MCP 自动挂载
-- [ ] 增加示例 skill
+- [x] 定义 `SkillManifest`
+- [x] 实现 filesystem `SkillLoader`
+- [x] 实现 `SkillRegistry`
+- [x] 实现 `SkillResolver`
+- [x] 支持 skill 摘要注入
+- [x] 支持按命中加载 `SKILL.md`
+- [x] 支持 skill 依赖的 toolsets / MCP 自动挂载
+- [x] 增加示例 skill
+
+当前阶段说明：
+
+- 已新增 `app/ai/skills/models.py`、`loader.py`、`registry.py`、`resolver.py`
+- `init_ai_runtime(...)` 会统一初始化并挂载 `ai_skill_loader`、`ai_skill_registry`、`ai_skill_resolver`
+- `/chat`、`/chat/stream`、`/chat/resume` 已支持通过 `skill_ids` / `skill_tags` 做请求级 skill 装配
+- 未显式传入 skill 时，`SkillResolver` 也可基于 `route_keywords` 做消息命中
+- 当前已支持“summary 优先，full_on_match 时加载 `SKILL.md` 正文”的渐进式披露策略
+- skill 依赖的 toolsets / MCP servers 会并入本轮 run 的动态能力装配
+- 已提供示例 skill 与基础自动化测试
+- 本阶段目标已经完成，下一阶段进入 `Phase 7 - Observability / Guardrails / Tests`
 
 验收标准：
 
@@ -687,18 +698,18 @@ AI_MCP_SERVERS_JSON={}
 - `Phase 2`
 - `Phase 3`
 - `Phase 4`
+- `Phase 5`
 - `Phase 6` 的最小 approval / streaming 闭环
 
 后续建议按这个顺序继续推进：
 
-1. `Phase 5`
-2. `Phase 7`
-3. `Phase 8`
+1. `Phase 7`
+2. `Phase 8`
 
 原因：
 
-- 没有 `Skills`，能力动态装配还停留在固定 toolsets 层
-- MCP 最小闭环已经接进运行时，下一阶段更适合继续补齐 skills 与观测能力
+- Skills 与 MCP 的最小动态装配已经接进运行时
+- 下一阶段更适合补齐可观测性、guardrails 和更完整的测试治理
 
 ---
 
