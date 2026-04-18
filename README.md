@@ -1,61 +1,546 @@
 # exile-agent
 
-`exile-agent` 是一个基于 `FastAPI` 的服务端项目，当前已完成一套基于 `PydanticAI` 的最小可运行 AI 基建设施。现阶段重点覆盖运行时装配、Agent 注册与执行、工具治理、审批闭环、基础历史会话与流式响应能力。
+`exile-agent` 是一个面向开发者的 `FastAPI + PydanticAI` 服务端 AI 基建工程。它的目标不是只做一个最小聊天 Demo，而是提供一套可以直接继续扩展到业务系统里的运行时骨架，包括：
+
+- Agent 注册与运行时装配
+- Toolsets 与工具治理
+- 会话历史与流式响应
+- Approval / Resume 闭环
+- MCP 动态接入
+- Skills 渐进式注入
+
+当前已经完成的基础阶段：
 
 - `Phase 1` AI 最小运行骨架
 - `Phase 2` Toolsets 与工具治理基础能力
 - `Phase 3` 运行时增强（history / resume / response metadata）
 - `Phase 4` MCP 基础接入
 - `Phase 5` Skills 基础设施
-- `Phase 6` 中 approval 相关的最小闭环
+- `Phase 6` Approval / Streaming 最小闭环
 
-本文档面向开发人员，重点说明当前项目的：
+本文档的目标是让开发者可以快速理解这套工程能做什么、如何启动、如何调用，以及后续应该从哪里继续扩展。
 
-- 架构边界
-- 运行时初始化方式
-- `/api/v1/agents/chat`、`/chat/stream`、`/chat/resume` 的调用链
-- Agent、Toolset、Approval、History 的当前实现方式
-- 后续演进方向
+## 你可以直接得到什么
 
-## 当前能力
+当前版本已经具备以下可直接使用的能力：
 
-当前版本已经具备以下 AI 能力：
-
-- 应用启动时初始化 AI runtime
-- 注册最小 `chat-agent`
-- 支持通过 `/api/v1/agents/chat` 触发一次 Agent 调用
-- 支持通过 `/api/v1/agents/chat/stream` 进行 SSE 流式输出
-- 支持通过 `/api/v1/agents/chat/resume` 继续审批中断的 run
-- 支持基于 `session_id` 的基础会话历史恢复
-- `/chat` / `/chat/resume` / `/chat/stream` 已具备统一基础 run metadata
-- 支持 `deps_type + RunContext`
-- 支持通过 `FunctionToolset` 装配基础工具
-- 已提供 4 个 builtin 只读工具
-- 已为 builtin tools 增加稳定 metadata
-- 已接入最小 tool audit 记录
-- 已接入 wrapper/audit toolset 与最小 tool execution audit
-- 已接入 metadata 驱动的 approval policy wrapper
-- 已接入 MCP 配置解析与 `MCPManager`
-- 支持在 `/chat`、`/chat/stream`、`/chat/resume` 请求中通过 `mcp_servers` 动态挂载 MCP toolsets
-- 支持基于 `route_keywords` 的自动 MCP 路由，未显式传 `mcp_servers` 时可按消息内容自动装配
-- MCP toolsets 已接入现有 approval / audit 治理包装
-- 已接入 filesystem `SkillLoader`、`SkillRegistry`、`SkillResolver`
-- 支持通过 `skill_ids` / `skill_tags` 做请求级 skill 选择
-- 支持基于 skill `route_keywords` 的自动命中与 `SKILL.md` 渐进式加载
-- 支持 skill 依赖的 toolsets / MCP 自动挂载
-- 支持通过 `/api/v1/agents/skills` 查看当前注册的 skills
-- `/chat` / `/chat/resume` / `/chat/stream` 响应会在 `meta.skills` 回显本轮解析出的 skills
-- `/chat/stream` 已支持 `start` / `delta` / `tool_call` / `tool_result` / `approval_pending` / `approval_required` / `done` / `error`
+- 启动时自动初始化 AI runtime，并挂载到 `FastAPI app.state`
+- 默认注册一个可直接使用的 `chat-agent`
+- 提供 `/api/v1/agents/chat`、`/chat/stream`、`/chat/resume`、`/agents`、`/agents/skills`
+- 支持基于 `session_id` 的基础多轮对话历史
+- 支持 builtin toolsets、tool metadata、tool audit、approval policy wrapper
+- 支持 MCP 配置驱动接入、显式挂载与自动路由
+- 支持 filesystem skills、自动命中、渐进式注入与依赖能力挂载
 - 支持真实模型和 `TestModel`
 
-当前尚未覆盖或尚未完整落地的能力包括：
+当前还未完整落地的增强方向：
 
-- 真实第三方 MCP 的生产级认证、限流、稳定性治理与业务级工具落地
-- 更完整的平台级流式协议（如 thinking / request boundary / richer progress events）
+- 真实第三方 MCP 的生产级认证、限流、稳定性治理与业务工具落地
+- 更完整的平台级流式协议
 - 历史摘要压缩 / 裁剪
-- 更完整的 `toolsets` 包装、审批治理与基于 hooks 的细粒度审计
+- 更细粒度的 hooks / observability / guardrails
 
----
+## 快速开始
+
+### 1. 安装依赖
+
+推荐使用 `uv`：
+
+```bash
+uv sync --group dev
+```
+
+### 2. 准备环境变量
+
+项目会根据 `FAST_API_ENV` 读取对应环境文件，例如：
+
+- `development -> .env.development`
+- `test -> .env.test`
+- `production -> .env.production`
+
+如果你只是先验证 AI 基建链路，可以准备一个最小的 `.env.development`：
+
+```env
+ENV=development
+DEBUG=true
+
+DB_INIT_ON_STARTUP=false
+REDIS_INIT_ON_STARTUP=false
+
+AI_ENABLED=true
+AI_DEFAULT_AGENT=chat-agent
+AI_DEFAULT_MODEL=openai:deepseek-chat
+AI_MAX_RETRIES=2
+AI_HTTP_TIMEOUT_SECONDS=30
+AI_SKILLS_DIR=app/ai/skills/catalog
+
+AI_ENABLE_MCP=false
+AI_MCP_SERVERS_JSON=
+
+OPENAI_API_KEY=your_api_key
+OPENAI_BASE_URL=https://api.deepseek.com
+```
+
+说明：
+
+- 如果只调试 AI 主链，可以先关闭 DB / Redis 初始化
+- `AI_SKILLS_DIR` 默认指向项目内置 skill catalog
+- `AI_ENABLE_MCP=false` 时，请求不会启用 MCP toolsets
+
+### 3. 启动服务
+
+```bash
+FAST_API_ENV=development uv run uvicorn app.main:app --reload
+```
+
+启动后默认访问：
+
+- `http://127.0.0.1:8000/`
+- `http://127.0.0.1:8000/docs`
+- `http://127.0.0.1:8000/api/v1/openapi.json`
+
+## 开箱即用的调用方式
+
+### 1. 查看当前注册的 agents
+
+```bash
+curl 'http://127.0.0.1:8000/api/v1/agents'
+```
+
+### 2. 查看当前注册的 skills
+
+```bash
+curl 'http://127.0.0.1:8000/api/v1/agents/skills'
+```
+
+### 3. 触发一次普通 chat
+
+```bash
+curl -X POST 'http://127.0.0.1:8000/api/v1/agents/chat' \
+  -H 'Content-Type: application/json' \
+  -H 'x-user-id: tester' \
+  -d '{
+    "agent_id": "chat-agent",
+    "message": "你好，帮我介绍一下当前系统具备哪些 AI 能力",
+    "session_id": "demo-chat-001"
+  }'
+```
+
+返回里重点关注：
+
+- `data.message`
+- `data.meta.run_kind`
+- `data.meta.skills`
+- `data.meta.mcp_servers`
+- `data.usage`
+
+### 4. 测试 skill 自动命中
+
+当前项目内置了一个 `ops-observer` skill，适合运行时诊断、配置检查、资源确认等场景。
+
+```bash
+curl -X POST 'http://127.0.0.1:8000/api/v1/agents/chat' \
+  -H 'Content-Type: application/json' \
+  -H 'x-user-id: tester' \
+  -d '{
+    "agent_id": "chat-agent",
+    "message": "请帮我检查当前运行时健康状态，不要猜测，先基于系统能力判断",
+    "session_id": "skill-demo-001"
+  }'
+```
+
+如果 skill 自动命中成功，响应里通常会看到：
+
+```json
+{
+  "data": {
+    "meta": {
+      "skills": ["ops-observer"]
+    }
+  }
+}
+```
+
+### 5. 显式指定 skill
+
+如果你不想依赖消息自动命中，也可以显式传入：
+
+```json
+{
+  "agent_id": "chat-agent",
+  "message": "请检查当前运行时配置",
+  "session_id": "skill-demo-002",
+  "skill_ids": ["ops-observer"]
+}
+```
+
+或通过标签缩小候选范围：
+
+```json
+{
+  "agent_id": "chat-agent",
+  "message": "请检查当前运行时配置",
+  "session_id": "skill-demo-003",
+  "skill_tags": ["ops"]
+}
+```
+
+### 6. 测试显式 MCP 装配
+
+前提是你已经配置好了 `AI_MCP_SERVERS_JSON` 并启用了 `AI_ENABLE_MCP=true`。
+
+```json
+{
+  "agent_id": "chat-agent",
+  "message": "请不要猜测，必须调用 demo MCP 工具先执行 ping，再回答当前 MCP 是否可用",
+  "session_id": "mcp-demo-001",
+  "mcp_servers": ["demo"]
+}
+```
+
+返回里可以关注：
+
+- `meta.mcp_servers`
+- `usage.tool_calls`
+
+### 7. 使用流式接口观察工具调用
+
+如果你要确认模型是否真的执行了工具或进入审批流程，推荐用 `/chat/stream`：
+
+```bash
+curl -N -X POST 'http://127.0.0.1:8000/api/v1/agents/chat/stream' \
+  -H 'Content-Type: application/json' \
+  -H 'x-user-id: tester' \
+  -d '{
+    "agent_id": "chat-agent",
+    "message": "请检查当前运行时健康状态、配置摘要和资源可用性，不要猜测，先调用工具再回答",
+    "session_id": "stream-demo-001"
+  }'
+```
+
+当前 SSE 事件包括：
+
+- `start`
+- `delta`
+- `tool_call`
+- `tool_result`
+- `approval_pending`
+- `approval_required`
+- `done`
+- `error`
+
+### 8. 在 approval 场景下继续 resume
+
+当 `/chat` 或 `/chat/stream` 返回：
+
+- `status = approval_required`
+
+调用方需要拿返回里的：
+
+- `message_history_json`
+- `approvals`
+
+再调用 `/api/v1/agents/chat/resume` 继续执行。
+
+## 常用接口概览
+
+### `GET /api/v1/agents`
+
+列出当前注册的 agents。
+
+### `GET /api/v1/agents/skills`
+
+列出当前注册的 skills，便于调试 skill catalog 是否正确加载。
+
+### `POST /api/v1/agents/chat`
+
+标准同步式 chat 调用。支持：
+
+- `agent_id`
+- `message`
+- `session_id`
+- `model`
+- `skill_ids`
+- `skill_tags`
+- `mcp_servers`
+
+### `POST /api/v1/agents/chat/stream`
+
+SSE 流式输出版本。适合：
+
+- 前端实时对话
+- 观察 `tool_call` / `tool_result`
+- 观察 approval 中断信号
+
+### `POST /api/v1/agents/chat/resume`
+
+用于 approval / deferred 工具结果后的继续执行。
+
+## 关键请求体示例
+
+```json
+{
+  "agent_id": "chat-agent",
+  "message": "请检查当前运行时健康状态",
+  "session_id": "demo-session-001",
+  "model": "openai:deepseek-chat",
+  "skill_ids": [],
+  "skill_tags": ["ops"],
+  "mcp_servers": []
+}
+```
+
+字段含义：
+
+- `agent_id`：要使用的 agent，默认是 `chat-agent`
+- `message`：用户输入
+- `session_id`：会话 ID，用于多轮历史恢复
+- `model`：可选，覆盖默认模型
+- `skill_ids`：显式指定本轮启用哪些 skills
+- `skill_tags`：按标签缩小 skill 候选范围
+- `mcp_servers`：显式指定本轮开放哪些 MCP servers
+
+## 如何接入你自己的能力
+
+当前这套工程不是只能跑内置 demo。开发者可以按三条路径扩展自己的能力：
+
+- 自定义 `tools`：适合把你自己的服务能力包装成可调用工具
+- 自定义 `MCP`：适合接入第三方 MCP server 或你自己维护的 MCP 服务
+- 自定义 `skills`：适合沉淀领域知识、工作流规范和依赖能力组合
+
+### 一、接入你自己的 tools
+
+最直接的方式是新增一个自己的 `FunctionToolset`，然后挂到 agent 上。
+
+推荐步骤：
+
+1. 在 `app/ai/toolsets/` 下新增一个业务 toolset 文件
+2. 使用 `create_function_toolset(...)`、`build_toolset_metadata(...)`、`build_tool_metadata(...)` 定义工具
+3. 在 `build_chat_agent()` 中把你的 toolset 挂进去
+
+最小示例：
+
+```python
+from pydantic_ai import RunContext
+from pydantic_ai.toolsets.function import FunctionToolset
+
+from app.ai.deps import AgentDeps
+from app.ai.toolsets import (
+    build_tool_metadata,
+    build_toolset_metadata,
+    create_function_toolset,
+    validate_toolset_conventions,
+)
+
+
+def get_order_toolset() -> FunctionToolset[AgentDeps]:
+    toolset: FunctionToolset[AgentDeps] = create_function_toolset(
+        id="business-order-toolset",
+        metadata=build_toolset_metadata(
+            toolset_id="business-order-toolset",
+            kind="business",
+            owner="order-domain",
+            readonly=False,
+            risk="medium",
+            approval_required=False,
+            tags=["business", "order"],
+        ),
+        instructions="Use these tools when the user asks about order operations.",
+    )
+
+    @toolset.tool(
+        metadata=build_tool_metadata(
+            category="order",
+            readonly=True,
+            risk="low",
+            approval_required=False,
+            tags=["business", "order", "query"],
+        )
+    )
+    async def get_order_summary(ctx: RunContext[AgentDeps], order_id: str) -> dict[str, str]:
+        """Return a readonly summary for the given order."""
+        return {"order_id": order_id, "status": "paid"}
+
+    validate_toolset_conventions(toolset)
+    return toolset
+```
+
+然后在 [`app/ai/agents/chat_agent.py`](/Users/yangyuexiong/Desktop/exile-agent/app/ai/agents/chat_agent.py) 的 `toolsets=` 中继续追加：
+
+```python
+toolsets=wrap_toolsets_with_audit(
+    wrap_toolsets_with_metadata_approval(
+        [
+            *get_builtin_toolsets(),
+            get_order_toolset(),
+        ]
+    )
+)
+```
+
+如果你希望某个 toolset 只在特定 skill 命中时才动态装配，而不是所有请求默认可见，则还需要再做一步：
+
+- 在 [`app/ai/toolsets/catalog.py`](/Users/yangyuexiong/Desktop/exile-agent/app/ai/toolsets/catalog.py) 的 `TOOLSET_BUILDERS` 中注册你的 `toolset_id -> builder`
+
+这样你的 skill 就可以通过 `required_toolsets` 依赖它。
+
+### 二、接入你自己的 MCP
+
+MCP 的接入是配置驱动的，通常不需要改 Python 代码，重点是配置 `AI_ENABLE_MCP` 和 `AI_MCP_SERVERS_JSON`。
+
+#### 方式 1：接入本地命令型 MCP
+
+```env
+AI_ENABLE_MCP=true
+AI_MCP_SERVERS_JSON={"mcpServers":{"my-search":{"transport":"stdio","command":"npx","args":["-y","your-mcp-package"],"tool_prefix":"my_search","auto_route_enabled":true,"route_keywords":["搜索","检索","查资料"],"timeout":20.0}}}
+```
+
+#### 方式 2：接入托管 HTTP MCP
+
+```env
+AI_ENABLE_MCP=true
+AI_MCP_SERVERS_JSON={"mcpServers":{"my-maps":{"transport":"streamable-http","url":"https://example.com/mcp","headers":{"Authorization":"Bearer your_token"},"tool_prefix":"my_maps","auto_route_enabled":true,"route_keywords":["地图","路线","导航"],"timeout":20.0,"read_timeout":300.0}}}
+```
+
+字段含义：
+
+- `transport`：`stdio` / `sse` / `streamable-http`
+- `tool_prefix`：该 MCP 暴露给模型时的工具名前缀
+- `auto_route_enabled`：是否允许在未显式传 `mcp_servers` 时自动路由
+- `route_keywords`：消息命中这些词时，运行时可自动开放该 MCP 给模型
+
+接入完成后，你可以用两种方式测试：
+
+- 显式传 `mcp_servers=["my-maps"]`
+- 什么都不传，只让消息命中 `route_keywords`
+
+如果你要接入多个第三方 MCP，只需要在 `mcpServers` 下继续并列定义多个 server。
+
+### 三、接入你自己的 skills
+
+skills 采用文件系统 catalog 方式加载。默认目录由 `AI_SKILLS_DIR` 决定。
+
+新增一个 skill 的步骤：
+
+1. 在 `AI_SKILLS_DIR` 下新建一个目录，例如 `app/ai/skills/catalog/order-assistant/`
+2. 新增 `skill.yaml`
+3. 新增 `SKILL.md`
+
+目录示例：
+
+```text
+app/ai/skills/catalog/
+  order-assistant/
+    skill.yaml
+    SKILL.md
+```
+
+`skill.yaml` 最小示例：
+
+```yaml
+name: order-assistant
+title: Order Assistant
+description: 处理订单查询、订单解释和订单状态确认。
+tags:
+  - order
+  - commerce
+enabled: true
+priority: 50
+load_strategy: full_on_match
+allowed_agents:
+  - chat-agent
+required_toolsets:
+  - business-order-toolset
+required_mcp_servers: []
+instruction_files:
+  - SKILL.md
+route_keywords:
+  - 订单
+  - 发货
+  - 退款
+summary: 当问题与订单、发货、退款有关时，优先使用订单域工具返回事实，不要主观猜测。
+```
+
+`SKILL.md` 最小示例：
+
+```md
+# Order Assistant
+
+你负责处理订单相关问题。
+
+执行要求：
+
+- 优先使用订单域工具获取事实
+- 清楚区分订单状态、支付状态和发货状态
+- 如果工具没有返回足够信息，直接说明边界
+```
+
+完成后重启服务，再调用：
+
+```bash
+curl 'http://127.0.0.1:8000/api/v1/agents/skills'
+```
+
+如果 skill 已正确加载，你会在返回结果中看到它。
+
+如果你希望该 skill 自动带上自定义工具或 MCP，需要注意：
+
+- `required_toolsets` 依赖的 `toolset_id` 必须已经在 [`app/ai/toolsets/catalog.py`](/Users/yangyuexiong/Desktop/exile-agent/app/ai/toolsets/catalog.py) 注册
+- `required_mcp_servers` 依赖的 MCP 必须已经出现在 `AI_MCP_SERVERS_JSON` 中
+
+### 四、如果你要新增自己的 agent
+
+当前默认只注册了一个 `chat-agent`。如果你要新增一个业务 agent，最小路径是：
+
+1. 在 `app/ai/agents/` 下新增一个 `build_xxx_agent(...)`
+2. 在 [`app/ai/agents/__init__.py`](/Users/yangyuexiong/Desktop/exile-agent/app/ai/agents/__init__.py) 的 `register_default_agents(...)` 中注册
+
+示意：
+
+```python
+registry.register(
+    manifest=AgentManifest(
+        agent_id="order-agent",
+        name="Order Agent",
+        description="Order domain assistant.",
+        default_model=settings.default_model,
+        supports_stream=False,
+    ),
+    builder=build_order_agent,
+)
+```
+
+这样后续请求里就可以直接传：
+
+```json
+{
+  "agent_id": "order-agent",
+  "message": "帮我查看订单状态"
+}
+```
+
+### 五、推荐的扩展策略
+
+如果你要开始接业务能力，建议按这个顺序扩：
+
+1. 先把真实业务能力封装成 `tools`
+2. 再把一组相关工具组织成 `toolset`
+3. 再用 `skills` 组织领域说明、工作流和依赖关系
+4. 最后再接入需要外部生态的 `MCP`
+
+这样可以保持：
+
+- 工具层负责“做事”
+- skill 层负责“怎么理解和怎么组织”
+- MCP 层负责“接外部能力”
+
+## 核心设计原则
+
+- Agent 是静态定义，运行时能力在每次请求中动态装配
+- `toolsets / skills / MCP / history / approval` 都统一收敛到 `AgentRunner`
+- skill 与 MCP 都支持“显式优先，自动兜底”
+- skill 负责运行时 instructions 注入，tool / MCP 负责模型运行中实际调用
+- endpoint 只做请求转换和异常边界，不直接操作模型
 
 ## 架构概览
 
@@ -65,7 +550,7 @@
 FastAPI app
   -> lifespan.startup_event()
   -> init_ai_runtime()
-  -> app.state 挂载 ai_runner / ai_agent_manager / ai_mcp_manager
+  -> app.state 挂载 ai_runner / ai_agent_manager / ai_mcp_manager / ai_skill_registry
 
 POST /api/v1/agents/chat
   -> agent endpoint
@@ -73,8 +558,8 @@ POST /api/v1/agents/chat
   -> ChatService.chat(...)
   -> AgentRunner.run_chat(...)
   -> AgentManager.get_agent(...)
-  -> SkillResolver.resolve(...)        # 可选，请求显式传 skill_ids/skill_tags 或命中 skill 路由时触发
-  -> MCPManager.build_toolsets(...)  # 可选，请求显式传 mcp_servers 或命中自动路由时触发
+  -> SkillResolver.resolve(...)       # 可选，请求显式传 skill_ids/skill_tags 或命中 skill 路由时触发
+  -> MCPManager.build_toolsets(...)   # 可选，请求显式传 mcp_servers 或命中自动路由时触发
   -> build_chat_agent(...)
   -> agent.run(message, deps=deps, instructions=..., toolsets=...)
   -> 返回 AgentChatResponse
@@ -83,25 +568,20 @@ POST /api/v1/agents/chat
 
 按职责可概括为：
 
-1. 应用启动时，`FastAPI` 会先把 AI 运行时对象准备好。
-2. 这些对象会被挂到 `app.state` 上。
-3. 请求来了以后，endpoint 不自己创建 Agent，也不自己直接调模型。
-4. endpoint 只是从 `app.state` 里取出已经准备好的 `ai_runner` 和 `ai_agent_manager`，组装成 `ChatService`。
-5. `ChatService.chat()` 再继续调用 `AgentRunner.run_chat()`。
-6. `AgentRunner` 是“真正调大模型的运行入口”，负责：
-   - 确定要用哪个 Agent
-   - 确定要用哪个模型
+1. 应用启动时初始化 AI runtime 对象
+2. 所有 runtime 对象统一挂载到 `app.state`
+3. endpoint 从 `app.state` 取出 `runner / manager / skill_registry`
+4. `ChatService` 将请求转换为标准 runner 调用
+5. `AgentRunner` 负责：
+   - 解析 agent 与 model
    - 构造 `AgentDeps`
-   - 解析本轮 skills，并构造运行时 instructions
-   - 按请求解析额外的 MCP toolsets
-   - 在执行前记录当前 run 可见的工具集合
-   - 调用 `agent.run(...)`
-   - 把结果整理成统一响应结构
-7. `AgentManager` 负责“拿 Agent”，如果缓存里没有，就调用 `build_chat_agent()` 构建。
-8. `build_chat_agent()` 负责定义这个 Agent 的模型、输出类型、提示词和 toolsets。
-9. 最后 `pydantic_ai.Agent.run(...)` 才真正触发模型调用或测试模型执行。
-
----
+   - 解析 skills 与运行时 instructions
+   - 解析 MCP toolsets
+   - 记录可见工具暴露
+   - 调用 `agent.run(...)` / `agent.run_stream_events(...)`
+   - 输出统一响应
+6. `AgentManager` 负责缓存和构建 Agent 实例
+7. `build_chat_agent()` 负责定义默认 Agent 的静态部分
 
 ## 关键目录
 
@@ -114,7 +594,7 @@ app/
   api/
     router.py                   # /api
     v1/router.py                # /api/v1
-    v1/endpoints/agent.py       # /api/v1/agents 与 /api/v1/agents/chat
+    v1/endpoints/agent.py       # /api/v1/agents 与相关接口
   ai/
     config.py                   # AISettings
     deps.py                     # RequestContext / AgentDeps
@@ -128,17 +608,19 @@ app/
       config.py                 # MCP 配置解析
       manager.py                # MCP server 生命周期与请求级装配
     toolsets/
-      audit.py                  # wrapper/audit toolset
       builtin.py                # builtin toolsets（time / request / runtime）
-      conventions.py            # toolset 本地注册规范与校验
+      audit.py                  # audit wrapper
+      approval.py               # approval policy wrapper
       metadata.py               # tool / toolset metadata helper
-    runtime/__init__.py         # init_ai_runtime / shutdown_ai_runtime
-    runtime/registry.py         # AgentRegistry
-    runtime/manager.py          # AgentManager
-    runtime/runner.py           # AgentRunner
-    agents/__init__.py          # 默认 agent 注册入口
-    agents/chat_agent.py        # build_chat_agent
-    services/chat_service.py    # ChatService
+    runtime/
+      __init__.py               # init_ai_runtime / shutdown_ai_runtime
+      registry.py               # AgentRegistry
+      manager.py                # AgentManager
+      runner.py                 # AgentRunner
+    agents/
+      chat_agent.py             # build_chat_agent
+    services/
+      chat_service.py           # ChatService
 ```
 
 建议按以下顺序阅读源码：
@@ -150,8 +632,9 @@ app/
 5. [app/ai/services/chat_service.py](./app/ai/services/chat_service.py)
 6. [app/ai/runtime/runner.py](./app/ai/runtime/runner.py)
 7. [app/ai/toolsets/builtin.py](./app/ai/toolsets/builtin.py)
-8. [app/ai/runtime/manager.py](./app/ai/runtime/manager.py)
-9. [app/ai/agents/chat_agent.py](./app/ai/agents/chat_agent.py)
+8. [app/ai/skills/resolver.py](./app/ai/skills/resolver.py)
+9. [app/ai/mcp/manager.py](./app/ai/mcp/manager.py)
+10. [app/ai/agents/chat_agent.py](./app/ai/agents/chat_agent.py)
 
 ---
 
