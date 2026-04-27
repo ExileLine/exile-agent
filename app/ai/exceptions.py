@@ -36,3 +36,15 @@ class SkillConfigurationError(AIRuntimeError):
 
 class SkillNotFoundError(AIRuntimeError):
     """请求或解析过程中引用了未注册的 skill 时抛出。"""
+
+
+class AIConfigNotFoundError(AIRuntimeError):
+    """请求的 AI 控制面配置不存在时抛出。"""
+
+
+class AIConfigConflictError(AIRuntimeError):
+    """AI 控制面配置创建或更新时发生唯一性冲突。"""
+
+
+class AIConfigValidationError(AIRuntimeError):
+    """AI 控制面配置不符合业务约束。"""

@@ -20,7 +20,7 @@ def _build_chat_service(request: Request) -> ChatService:
     return ChatService(runner=runner, agent_manager=agent_manager, skill_registry=skill_registry)
 
 
-@router.get("", summary="List registered agents")
+@router.get("", summary="查询已注册的 Agent 列表")
 async def list_agents(request: Request):
     service = _build_chat_service(request)
     return api_response(
@@ -29,13 +29,13 @@ async def list_agents(request: Request):
     )
 
 
-@router.get("/skills", summary="List registered skills")
+@router.get("/skills", summary="查询已注册的 Skill 列表")
 async def list_skills(request: Request):
     service = _build_chat_service(request)
     return api_response(data=service.list_skills(), is_pop=False)
 
 
-@router.post("/chat", summary="Run agent chat")
+@router.post("/chat", summary="执行 Agent 对话")
 async def chat_with_agent(payload: AgentChatRequest, request: Request):
     service = _build_chat_service(request)
     request_context = RequestContext(
@@ -56,7 +56,7 @@ async def chat_with_agent(payload: AgentChatRequest, request: Request):
     return api_response(data=result.model_dump(mode="json"))
 
 
-@router.post("/chat/stream", summary="Run agent chat stream")
+@router.post("/chat/stream", summary="执行 Agent 流式对话")
 async def stream_agent_chat(payload: AgentChatRequest, request: Request):
     service = _build_chat_service(request)
     request_context = RequestContext(
@@ -77,7 +77,7 @@ async def stream_agent_chat(payload: AgentChatRequest, request: Request):
     return StreamingResponse(event_iterator, media_type="text/event-stream")
 
 
-@router.post("/chat/resume", summary="Resume deferred agent chat")
+@router.post("/chat/resume", summary="继续执行待审批的 Agent 对话")
 async def resume_agent_chat(payload: AgentChatResumeRequest, request: Request):
     service = _build_chat_service(request)
     request_context = RequestContext(
