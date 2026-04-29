@@ -15,6 +15,7 @@ from app.ai.mcp import (
     parse_mcp_servers_json,
 )
 from app.ai.runtime import init_ai_runtime, shutdown_ai_runtime
+from app.ai.skills import SkillResolution
 from app.ai.toolsets.conventions import create_function_toolset
 from app.ai.toolsets.metadata import build_tool_metadata, build_toolset_metadata
 from app.core.config import BaseConfig
@@ -201,3 +202,31 @@ def test_agent_chat_endpoint_can_auto_route_mcp_toolsets(monkeypatch) -> None:
     assert body["code"] == 200
     assert body["data"]["message"] == "auto-routed MCP tool executed"
     assert body["data"]["meta"]["mcp_servers"] == ["demo-server"]
+
+
+def test_runner_can_disable_legacy_mcp_auto_route_for_config_control_plane() -> None:
+    with TestClient(app) as client:
+        runner = client.app.state.ai_runner
+        runner.mcp_manager._config_by_id = {
+            "demo-server": ManagedMCPServerStdioConfig(
+                id="demo-server",
+                command="python",
+                args=["scripts/mock_mcp_server.py"],
+                route_keywords=["演示MCP", "demo mcp"],
+            )
+        }
+
+        resolved_server_ids, toolsets = runner._resolve_request_toolsets(
+            mcp_server_ids=[],
+            route_message="请使用演示MCP确认当前能力是否可用",
+            skill_resolution=SkillResolution(
+                skills=(),
+                instructions=(),
+                required_toolset_ids=(),
+                required_mcp_server_ids=(),
+            ),
+            allow_auto_route=False,
+        )
+
+    assert resolved_server_ids == []
+    assert toolsets == []

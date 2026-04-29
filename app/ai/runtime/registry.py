@@ -9,7 +9,7 @@ from app.ai.deps import AgentDeps
 from app.ai.exceptions import AgentNotFoundError
 from app.ai.schemas.agent import AgentManifest
 
-AgentBuilder = Callable[[AISettings, str], Agent[AgentDeps, Any]]
+AgentBuilder = Callable[[AISettings, Any], Agent[AgentDeps, Any]]
 
 
 @dataclass(slots=True)

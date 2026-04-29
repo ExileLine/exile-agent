@@ -14,7 +14,7 @@ from app.ai.toolsets import (
 ChatAgentOutput = str | DeferredToolRequests
 
 
-def build_chat_agent(settings: AISettings, model_name: str) -> Agent[AgentDeps, ChatAgentOutput]:
+def build_chat_agent(settings: AISettings, model_name: object) -> Agent[AgentDeps, ChatAgentOutput]:
     """构造默认的 chat-agent 定义。
 
     这里做的是“Agent 定义态”的事情：
@@ -55,7 +55,7 @@ def build_chat_agent(settings: AISettings, model_name: str) -> Agent[AgentDeps, 
     return agent
 
 
-def _build_model(settings: AISettings, model_name: str):
+def _build_model(settings: AISettings, model_name: object):
     """根据配置解析当前 Agent 应该使用的模型对象。
 
     当前支持两种路径：
@@ -64,6 +64,9 @@ def _build_model(settings: AISettings, model_name: str):
 
     这样既能兼容测试态/简化场景，也能兼容真实的 OpenAI-compatible 服务端。
     """
+    if not isinstance(model_name, str):
+        return model_name
+
     if not model_name.startswith("openai:"):
         return model_name
 

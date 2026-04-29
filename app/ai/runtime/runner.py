@@ -15,16 +15,21 @@ from pydantic_ai.messages import (
     TextPartDelta,
 )
 from pydantic_ai.run import AgentRunResultEvent
+from pydantic_ai.models.openai import OpenAIChatModel
+from pydantic_ai.providers.openai import OpenAIProvider
 from pydantic_ai.toolsets.abstract import AbstractToolset
 from pydantic_ai.tools import DeferredToolRequests, DeferredToolResults, ToolApproved, ToolDenied
 from pydantic_ai.usage import RunUsage
 
 from app.ai.config import AISettings
+from app.ai.config_store import AICapabilityResolver, AIConfigRepository
+from app.ai.config_store.encryption import decrypt_secret
 from app.ai.deps import AgentDeps, RequestContext
-from app.ai.exceptions import AIDisabledError, AIRunExecutionError, AIRuntimeError, MCPRuntimeError
+from app.ai.exceptions import AIDisabledError, AgentNotFoundError, AIRunExecutionError, AIRuntimeError, MCPRuntimeError
 from app.ai.mcp import MCPManager
 from app.ai.runtime.history import SessionHistoryStore
 from app.ai.runtime.manager import AgentManager
+from app.ai.runtime.resolved_config import ResolvedMCPServerConfig, ResolvedModelConfig, ResolvedRunConfig
 from app.ai.schemas.chat import (
     AgentApprovalDecision,
     AgentApprovalRequest,
@@ -55,6 +60,7 @@ class AgentRunner:
             mcp_manager: MCPManager | None,
             skill_registry: SkillRegistry | None,
             skill_resolver: SkillResolver | None,
+            enable_config_resolver: bool = False,
     ) -> None:
         self.settings = settings
         self.agent_manager = agent_manager
@@ -64,6 +70,7 @@ class AgentRunner:
         self.mcp_manager = mcp_manager
         self.skill_registry = skill_registry
         self.skill_resolver = skill_resolver
+        self.enable_config_resolver = enable_config_resolver
 
     async def run_chat(
             self,
@@ -83,18 +90,25 @@ class AgentRunner:
         再把本轮运行后的完整消息历史写回存储。
         """
 
-        resolved_agent_id, resolved_model, agent = self._resolve_agent(agent_id=agent_id, model_name=model_name)
+        run_config = await self._resolve_run_config(
+            agent_id=agent_id,
+            model_name=model_name,
+            mcp_server_ids=mcp_server_ids,
+            skill_ids=skill_ids,
+        )
+        resolved_agent_id, resolved_model, agent = self._resolve_agent(run_config)
         skill_resolution = self._resolve_skills(
             agent_id=resolved_agent_id,
             message=message,
-            skill_ids=skill_ids,
+            skill_ids=list(run_config.skill_ids),
             skill_tags=skill_tags,
         )
         deps = self._build_deps(request_context, resolved_skill_names=tuple(skill_resolution.skill_names))
         resolved_mcp_server_ids, run_toolsets = self._resolve_request_toolsets(
-            mcp_server_ids=mcp_server_ids,
+            mcp_server_ids=run_config.mcp_server_keys,
             route_message=message,
             skill_resolution=skill_resolution,
+            allow_auto_route=run_config.source != "database",
         )
         message_history = await self.history_store.load_messages(session_id)
         history_loaded = bool(message_history)
@@ -133,6 +147,7 @@ class AgentRunner:
             history_saved=history_saved,
             mcp_servers=resolved_mcp_server_ids,
             skills=skill_resolution.skill_names,
+            run_config=run_config,
         )
 
     async def run_chat_stream(
@@ -158,18 +173,25 @@ class AgentRunner:
         - 再把最终结果包装成 `start -> done` 或审批事件
         """
 
-        resolved_agent_id, resolved_model, agent = self._resolve_agent(agent_id=agent_id, model_name=model_name)
+        run_config = await self._resolve_run_config(
+            agent_id=agent_id,
+            model_name=model_name,
+            mcp_server_ids=mcp_server_ids,
+            skill_ids=skill_ids,
+        )
+        resolved_agent_id, resolved_model, agent = self._resolve_agent(run_config)
         skill_resolution = self._resolve_skills(
             agent_id=resolved_agent_id,
             message=message,
-            skill_ids=skill_ids,
+            skill_ids=list(run_config.skill_ids),
             skill_tags=skill_tags,
         )
         deps = self._build_deps(request_context, resolved_skill_names=tuple(skill_resolution.skill_names))
         resolved_mcp_server_ids, run_toolsets = self._resolve_request_toolsets(
-            mcp_server_ids=mcp_server_ids,
+            mcp_server_ids=run_config.mcp_server_keys,
             route_message=message,
             skill_resolution=skill_resolution,
+            allow_auto_route=run_config.source != "database",
         )
         message_history = await self.history_store.load_messages(session_id)
         history_loaded = bool(message_history)
@@ -185,6 +207,27 @@ class AgentRunner:
         )
 
         try:
+            if not run_config.runtime_flags.get("supports_stream", True):
+                async for event in self._run_chat_stream_fallback(
+                        agent=agent,
+                        deps=deps,
+                        message=message,
+                        message_history=message_history,
+                        request_id=request_context.request_id,
+                        session_id=session_id,
+                        agent_id=resolved_agent_id,
+                        model=resolved_model,
+                        history_loaded=history_loaded,
+                        stream_mode="fallback",
+                        mcp_servers=resolved_mcp_server_ids,
+                        run_toolsets=run_toolsets,
+                        instructions=skill_resolution.instructions,
+                        skills=skill_resolution.skill_names,
+                        run_config=run_config,
+                ):
+                    yield event
+                return
+
             # `run_stream_events()` 是这次改造的核心：
             # 它不是只吐文本，而是会产出 PydanticAI 的统一运行事件流，
             # 包括文本 part、FunctionToolCallEvent、FunctionToolResultEvent、
@@ -221,6 +264,7 @@ class AgentRunner:
                         run_toolsets=run_toolsets,
                         instructions=skill_resolution.instructions,
                         skills=skill_resolution.skill_names,
+                        run_config=run_config,
                 ):
                     yield event
                 return
@@ -244,6 +288,7 @@ class AgentRunner:
                         message_count=len(message_history),
                         mcp_servers=resolved_mcp_server_ids,
                         skills=skill_resolution.skill_names,
+                        run_config=run_config,
                     ).model_dump(mode="json"),
                 },
             )
@@ -301,6 +346,7 @@ class AgentRunner:
                         history_saved=history_saved,
                         mcp_servers=resolved_mcp_server_ids,
                         skills=skill_resolution.skill_names,
+                        run_config=run_config,
                     )
                     response.meta.stream_mode = "native"
 
@@ -327,6 +373,7 @@ class AgentRunner:
                     stream_mode="native",
                     mcp_servers=resolved_mcp_server_ids,
                     skills=skill_resolution.skill_names,
+                    run_config=run_config,
                 ),
             )
             return
@@ -352,20 +399,27 @@ class AgentRunner:
         - run 完成后，如果带了 `session_id`，也会把新历史写回会话存储
         """
 
-        resolved_agent_id, resolved_model, agent = self._resolve_agent(agent_id=agent_id, model_name=model_name)
+        run_config = await self._resolve_run_config(
+            agent_id=agent_id,
+            model_name=model_name,
+            mcp_server_ids=mcp_server_ids,
+            skill_ids=skill_ids,
+        )
+        resolved_agent_id, resolved_model, agent = self._resolve_agent(run_config)
         message_history = ModelMessagesTypeAdapter.validate_json(message_history_json)
         latest_user_message = self._extract_latest_user_message(message_history)
         skill_resolution = self._resolve_skills(
             agent_id=resolved_agent_id,
             message=latest_user_message,
-            skill_ids=skill_ids,
+            skill_ids=list(run_config.skill_ids),
             skill_tags=skill_tags,
         )
         deps = self._build_deps(request_context, resolved_skill_names=tuple(skill_resolution.skill_names))
         resolved_mcp_server_ids, run_toolsets = self._resolve_request_toolsets(
-            mcp_server_ids=mcp_server_ids,
+            mcp_server_ids=run_config.mcp_server_keys,
             route_message=latest_user_message,
             skill_resolution=skill_resolution,
+            allow_auto_route=run_config.source != "database",
         )
         deferred_tool_results = self._build_deferred_tool_results(approvals)
 
@@ -393,16 +447,132 @@ class AgentRunner:
             history_saved=history_saved,
             mcp_servers=resolved_mcp_server_ids,
             skills=skill_resolution.skill_names,
+            run_config=run_config,
         )
 
-    def _resolve_agent(self, *, agent_id: str | None, model_name: str | None) -> tuple[str, str, Any]:
+    async def _resolve_run_config(
+            self,
+            *,
+            agent_id: str | None,
+            model_name: str | None,
+            mcp_server_ids: list[str] | None,
+            skill_ids: list[str] | None,
+    ) -> ResolvedRunConfig:
+        """解析本轮 run 的控制面配置。
+
+        未启用数据库控制面时，返回与旧逻辑一致的 settings fallback；
+        启用后通过 AICapabilityResolver 校验模型与 MCP allowlist。
+        """
+
         if not self.settings.enabled:
             raise AIDisabledError("AI 能力已关闭")
 
+        if not self.enable_config_resolver:
+            return self._build_settings_fallback_run_config(
+                agent_id=agent_id,
+                model_name=model_name,
+                mcp_server_ids=mcp_server_ids,
+                skill_ids=skill_ids,
+            )
+
+        async with AsyncSessionLocal() as session:
+            resolver = AICapabilityResolver(
+                settings=self.settings,
+                repository=AIConfigRepository(session),
+            )
+            return await resolver.resolve(
+                agent_id=agent_id,
+                requested_model=model_name,
+                requested_mcp_servers=mcp_server_ids,
+                requested_skill_ids=skill_ids,
+            )
+
+    def _build_settings_fallback_run_config(
+            self,
+            *,
+            agent_id: str | None,
+            model_name: str | None,
+            mcp_server_ids: list[str] | None,
+            skill_ids: list[str] | None,
+    ) -> ResolvedRunConfig:
         resolved_agent_id = agent_id or self.settings.default_agent
         resolved_model = self.agent_manager.resolve_model(resolved_agent_id, model_name)
-        agent = self.agent_manager.get_agent(resolved_agent_id, resolved_model)
+        return ResolvedRunConfig(
+            agent_id=resolved_agent_id,
+            model=ResolvedModelConfig(
+                model_key=resolved_model,
+                provider_key=None,
+                model_name=resolved_model,
+            ),
+            mcp_servers=tuple(
+                ResolvedMCPServerConfig(
+                    server_key=server_id,
+                    transport="settings_fallback",
+                    tool_prefix=None,
+                )
+                for server_id in _dedupe_server_ids(mcp_server_ids or [])
+            ),
+            skill_ids=tuple(_dedupe_server_ids(skill_ids or [])),
+            source="settings_fallback",
+            runtime_flags={
+                "allow_request_model_override": True,
+                "allow_request_mcp_override": True,
+                "supports_stream": True,
+            },
+        )
+
+    def _resolve_agent(self, run_config: ResolvedRunConfig) -> tuple[str, str, Any]:
+        if not self.settings.enabled:
+            raise AIDisabledError("AI 能力已关闭")
+
+        resolved_agent_id = run_config.agent_id
+        resolved_model = run_config.model_name
+        runtime_model = self._build_runtime_model(run_config)
+        model_cache_key = self._build_model_cache_key(run_config)
+        try:
+            agent = self.agent_manager.get_agent(
+                resolved_agent_id,
+                resolved_model,
+                model=runtime_model,
+                model_cache_key=model_cache_key,
+            )
+        except AgentNotFoundError:
+            if run_config.source != "database":
+                raise
+            # 数据库控制面允许创建多个业务 Agent 配置；当前代码层只有默认 builder。
+            # 因此 DB Agent 缺少同名静态注册时，复用默认 Agent builder，但保留原 agent_id 做治理维度。
+            agent = self.agent_manager.get_agent(
+                resolved_agent_id,
+                resolved_model,
+                runtime_agent_id=self.settings.default_agent,
+                model=runtime_model,
+                model_cache_key=model_cache_key,
+            )
         return resolved_agent_id, resolved_model, agent
+
+    def _build_runtime_model(self, run_config: ResolvedRunConfig) -> Any | None:
+        """把控制面 provider 配置转换成 PydanticAI 可直接消费的模型对象。"""
+
+        provider = run_config.provider
+        if provider is None:
+            return None
+
+        if provider.provider_type in {"openai", "openai_compatible"}:
+            return OpenAIChatModel(
+                model_name=run_config.model_name,
+                provider=OpenAIProvider(
+                    api_key=decrypt_secret(provider.api_key_encrypted) or self.settings.openai_api_key,
+                    base_url=provider.base_url or self.settings.openai_base_url,
+                ),
+            )
+
+        raise AIRunExecutionError(f"暂不支持的模型供应商类型: {provider.provider_type}")
+
+    @staticmethod
+    def _build_model_cache_key(run_config: ResolvedRunConfig) -> str:
+        if run_config.config_version:
+            return f"{run_config.model_key}:{run_config.config_version}"
+        return run_config.model_key
 
     def _build_deps(
             self,
@@ -454,12 +624,14 @@ class AgentRunner:
             mcp_server_ids: list[str] | None,
             route_message: str | None,
             skill_resolution: SkillResolution,
+            allow_auto_route: bool = True,
     ) -> tuple[list[str], list[AbstractToolset[AgentDeps]]]:
         """解析请求级动态能力并转换成本轮附加 toolsets。
 
         规则是：
         - skills 先声明本轮额外需要的 toolsets / MCP
         - 未显式传入 `mcp_servers` 时，允许 MCP manager 根据消息内容做自动路由
+        - 数据库控制面启用时，MCP 选择必须来自 resolver，避免绕过绑定校验
         """
 
         skill_toolsets = build_registered_toolsets(list(skill_resolution.required_toolset_ids))
@@ -477,7 +649,7 @@ class AgentRunner:
         auto_routed_server_ids = self.mcp_manager.resolve_server_ids(
             requested_server_ids=None,
             message=route_message,
-        ) if not mcp_server_ids else []
+        ) if allow_auto_route and not mcp_server_ids else []
 
         resolved_mcp_server_ids = _dedupe_server_ids([*explicit_mcp_server_ids, *auto_routed_server_ids])
         if not resolved_mcp_server_ids:
@@ -501,6 +673,7 @@ class AgentRunner:
             history_saved: bool,
             mcp_servers: list[str],
             skills: list[str],
+            run_config: ResolvedRunConfig | None = None,
     ) -> AgentChatResponse:
         output = result.output
         response = AgentChatResponse(
@@ -520,6 +693,7 @@ class AgentRunner:
                 message_count=len(result.all_messages()),
                 mcp_servers=mcp_servers,
                 skills=skills,
+                run_config=run_config,
             ),
         )
 
@@ -550,6 +724,7 @@ class AgentRunner:
             run_toolsets: list[AbstractToolset[AgentDeps]],
             instructions: tuple[str, ...],
             skills: list[str],
+            run_config: ResolvedRunConfig | None = None,
     ) -> AsyncIterator[str]:
         """当模型不支持真正的 streamed request 时，退化成单次 run 再包装成 SSE。"""
 
@@ -575,6 +750,7 @@ class AgentRunner:
                     stream_mode="fallback",
                     mcp_servers=mcp_servers,
                     skills=skills,
+                    run_config=run_config,
                 ),
             )
             return
@@ -589,6 +765,7 @@ class AgentRunner:
             history_saved=history_saved,
             mcp_servers=mcp_servers,
             skills=skills,
+            run_config=run_config,
         )
         response.meta.stream_mode = stream_mode
         yield self._sse_event(
@@ -607,6 +784,7 @@ class AgentRunner:
                     message_count=len(message_history),
                     mcp_servers=mcp_servers,
                     skills=skills,
+                    run_config=run_config,
                 ).model_dump(mode="json"),
             },
         )
@@ -853,6 +1031,7 @@ class AgentRunner:
             message_count: int,
             mcp_servers: list[str],
             skills: list[str],
+            run_config: ResolvedRunConfig | None = None,
     ) -> AgentRunMeta:
         return AgentRunMeta(
             run_kind=run_kind,
@@ -862,6 +1041,10 @@ class AgentRunner:
             message_count=message_count,
             mcp_servers=mcp_servers,
             skills=skills,
+            config_source=run_config.source if run_config is not None else None,
+            model_key=run_config.model_key if run_config is not None else None,
+            provider_key=run_config.model.provider_key if run_config is not None else None,
+            config_version=run_config.config_version if run_config is not None else None,
         )
 
     @staticmethod
@@ -888,6 +1071,7 @@ class AgentRunner:
             stream_mode: str,
             mcp_servers: list[str],
             skills: list[str],
+            run_config: ResolvedRunConfig | None = None,
     ) -> dict[str, Any]:
         return {
             "error": str(error),
@@ -904,6 +1088,7 @@ class AgentRunner:
                 message_count=0,
                 mcp_servers=mcp_servers,
                 skills=skills,
+                run_config=run_config,
             ).model_dump(mode="json"),
         }
 

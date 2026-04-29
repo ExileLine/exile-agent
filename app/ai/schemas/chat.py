@@ -68,6 +68,10 @@ class AgentRunMeta(BaseModel):
     message_count: int = Field(description="本轮 run 结束后的完整消息数")
     skills: list[str] = Field(default_factory=list, description="本轮实际解析并注入的 skill 列表")
     mcp_servers: list[str] = Field(default_factory=list, description="本轮实际装配的 MCP server ID 列表")
+    config_source: str | None = Field(default=None, description="本轮运行配置来源")
+    model_key: str | None = Field(default=None, description="控制面模型 key")
+    provider_key: str | None = Field(default=None, description="控制面模型供应商 key")
+    config_version: str | None = Field(default=None, description="控制面配置版本标识")
 
 
 class AgentChatResponse(BaseModel):

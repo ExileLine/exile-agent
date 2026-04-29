@@ -1,14 +1,7 @@
 import httpx
 from fastapi import FastAPI
 
-from app.ai.agents import register_default_agents
 from app.ai.config import AISettings
-from app.ai.mcp import MCPManager, load_mcp_server_configs
-from app.ai.runtime.history import SessionHistoryStore
-from app.ai.runtime.manager import AgentManager
-from app.ai.runtime.registry import AgentRegistry
-from app.ai.runtime.runner import AgentRunner
-from app.ai.skills import SkillLoader, SkillRegistry, SkillResolver
 from app.ai.services.tool_audit import ToolAuditService
 from app.core.config import BaseConfig
 from app.db import redis_client
@@ -28,6 +21,14 @@ async def init_ai_runtime(app: FastAPI, project_config: BaseConfig) -> None:
 
     然后再把它们挂到 `app.state`，供 endpoint 按需取用。
     """
+    from app.ai.agents import register_default_agents
+    from app.ai.mcp import MCPManager, load_mcp_server_configs
+    from app.ai.runtime.history import SessionHistoryStore
+    from app.ai.runtime.manager import AgentManager
+    from app.ai.runtime.registry import AgentRegistry
+    from app.ai.runtime.runner import AgentRunner
+    from app.ai.skills import SkillLoader, SkillRegistry, SkillResolver
+
     settings = AISettings.from_config(project_config)
     registry = AgentRegistry()
     register_default_agents(registry, settings)
@@ -57,6 +58,7 @@ async def init_ai_runtime(app: FastAPI, project_config: BaseConfig) -> None:
         mcp_manager=mcp_manager,
         skill_registry=skill_registry,
         skill_resolver=skill_resolver,
+        enable_config_resolver=project_config.DB_INIT_ON_STARTUP,
     )
 
     app.state.ai_settings = settings

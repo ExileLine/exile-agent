@@ -37,17 +37,32 @@ class AgentManager:
         3. 全局 `AISettings.default_model`
         """
         manifest = self.get_manifest(agent_id)
+        print(f"manifest: {manifest}")
         return model_name or manifest.default_model or self.settings.default_model
 
-    def get_agent(self, agent_id: str, model_name: str | None = None) -> Agent[AgentDeps, Any]:
+    def get_agent(
+            self,
+            agent_id: str,
+            model_name: str | None = None,
+            *,
+            runtime_agent_id: str | None = None,
+            model: Any | None = None,
+            model_cache_key: str | None = None,
+    ) -> Agent[AgentDeps, Any]:
         """获取一个可复用的 Agent 实例。
 
         当前缓存 key 是 `(agent_id, resolved_model)`，
         这样同一个 Agent 在相同模型下会复用定义实例，避免重复构造。
+
+        `runtime_agent_id` 用于数据库控制面的动态 Agent 配置：
+        - `agent_id` 仍作为业务配置、审计和缓存维度
+        - `runtime_agent_id` 只决定复用哪个代码里注册的 Agent builder
         """
-        resolved_model = self.resolve_model(agent_id, model_name)
-        cache_key = (agent_id, resolved_model)
+        builder_agent_id = runtime_agent_id or agent_id
+        resolved_model = model_name or self.resolve_model(builder_agent_id, None)
+        cache_model_key = model_cache_key or resolved_model
+        cache_key = (agent_id, cache_model_key)
         if cache_key not in self._cache:
-            registered = self.registry.get(agent_id)
-            self._cache[cache_key] = registered.builder(self.settings, resolved_model)
+            registered = self.registry.get(builder_agent_id)
+            self._cache[cache_key] = registered.builder(self.settings, model or resolved_model)
         return self._cache[cache_key]

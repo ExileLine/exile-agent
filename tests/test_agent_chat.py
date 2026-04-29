@@ -8,15 +8,21 @@ from pydantic_ai import models
 from pydantic_ai.exceptions import ApprovalRequired
 from pydantic_ai.messages import ModelRequest, ModelResponse, TextPart, ToolCallPart, ToolReturnPart
 from pydantic_ai.models.function import AgentInfo, DeltaToolCall, FunctionModel
+from pydantic_ai.models.openai import OpenAIChatModel
 from pydantic_ai.models.test import TestModel
 from pydantic_ai.toolsets.function import FunctionToolset
 from pydantic_ai.tools import DeferredToolRequests
 from pydantic_ai.usage import RunUsage
 
 from app.ai.config import AISettings
+from app.ai.config_store.encryption import encrypt_secret
 from app.ai.deps import AgentDeps, RequestContext
+from app.ai.agents import register_default_agents
+from app.ai.runtime.resolved_config import ResolvedModelConfig, ResolvedProviderConfig, ResolvedRunConfig
 from app.main import app
 from app.ai.schemas.agent import AgentManifest
+from app.ai.runtime.manager import AgentManager
+from app.ai.runtime.registry import AgentRegistry
 from app.ai.toolsets.builtin import (
     get_builtin_request_toolset,
     get_builtin_runtime_toolset,
@@ -107,6 +113,7 @@ def test_list_agents() -> None:
 
 def test_agent_chat_endpoint() -> None:
     with TestClient(app) as client:
+        expected_model_key = client.app.state.ai_settings.default_model
         agent = client.app.state.ai_agent_manager.get_agent("chat-agent")
         with agent.override(model=TestModel(custom_output_text="stubbed chat reply")):
             response = client.post(
@@ -124,6 +131,51 @@ def test_agent_chat_endpoint() -> None:
     assert body["data"]["meta"]["run_kind"] == "chat"
     assert body["data"]["meta"]["history_loaded"] is False
     assert body["data"]["meta"]["history_saved"] is False
+    assert body["data"]["meta"]["config_source"] == "settings_fallback"
+    assert body["data"]["meta"]["model_key"] == expected_model_key
+    assert body["data"]["meta"]["provider_key"] is None
+
+
+def test_agent_manager_can_reuse_default_builder_for_database_config_agent() -> None:
+    settings = AISettings(default_agent="chat-agent", default_model="openai:gpt-5.2")
+    registry = AgentRegistry()
+    register_default_agents(registry, settings)
+    manager = AgentManager(registry=registry, settings=settings)
+
+    agent = manager.get_agent(
+        "yyx-agent",
+        "openai:gpt-5.2",
+        runtime_agent_id="chat-agent",
+    )
+
+    assert agent.name == "chat-agent"
+    assert manager.get_agent("yyx-agent", "openai:gpt-5.2", runtime_agent_id="chat-agent") is agent
+
+
+def test_runner_builds_openai_compatible_model_from_database_provider() -> None:
+    with TestClient(app) as client:
+        runner = client.app.state.ai_runner
+        runtime_model = runner._build_runtime_model(
+            ResolvedRunConfig(
+                agent_id="yyx-agent",
+                model=ResolvedModelConfig(
+                    model_key="deepseek-v4-pro",
+                    provider_key="deepseek",
+                    model_name="deepseek-v4-pro",
+                ),
+                provider=ResolvedProviderConfig(
+                    provider_key="deepseek",
+                    provider_type="openai_compatible",
+                    base_url="https://api.deepseek.example/v1",
+                    api_key_encrypted=encrypt_secret("secret-token"),
+                    timeout_seconds=None,
+                    max_retries=None,
+                ),
+                source="database",
+            )
+        )
+
+    assert isinstance(runtime_model, OpenAIChatModel)
 
 
 def test_agent_chat_session_history_roundtrip() -> None:
@@ -181,6 +233,7 @@ def test_agent_chat_session_history_roundtrip() -> None:
 
 def test_agent_chat_stream_endpoint() -> None:
     with TestClient(app) as client:
+        expected_model_key = client.app.state.ai_settings.default_model
         agent = client.app.state.ai_agent_manager.get_agent("chat-agent")
         with agent.override(model=TestModel(custom_output_text="streamed reply")):
             with client.stream(
@@ -200,6 +253,8 @@ def test_agent_chat_stream_endpoint() -> None:
     assert done_event["message"] == "streamed reply"
     assert done_event["session_id"] == "sess-stream"
     assert done_event["meta"]["run_kind"] == "stream"
+    assert done_event["meta"]["config_source"] == "settings_fallback"
+    assert done_event["meta"]["model_key"] == expected_model_key
 
 
 def test_chat_stream_emits_tool_call_and_result_events() -> None:
