@@ -2,7 +2,18 @@ from fastapi import APIRouter, Request
 from fastapi.responses import StreamingResponse
 
 from app.ai.deps import RequestContext
-from app.ai.exceptions import AIDisabledError, AgentNotFoundError, AIRuntimeError
+from app.ai.exceptions import (
+    AIDisabledError,
+    AgentNotFoundError,
+    AIConfigNotFoundError,
+    AIConfigValidationError,
+    AIRuntimeError,
+    MCPConfigurationError,
+    MCPRuntimeError,
+    MCPServerNotFoundError,
+    SkillConfigurationError,
+    SkillNotFoundError,
+)
 from app.ai.schemas.chat import AgentChatRequest, AgentChatResumeRequest
 from app.ai.services import ChatService
 from app.core.custom_exception import CustomException
@@ -18,6 +29,24 @@ def _build_chat_service(request: Request) -> ChatService:
     if runner is None or agent_manager is None:
         raise CustomException(status_code=503, detail="AI runtime 未初始化", custom_code=503)
     return ChatService(runner=runner, agent_manager=agent_manager, skill_registry=skill_registry)
+
+
+def _raise_agent_api_exception(exc: AIRuntimeError) -> None:
+    """把 AI runtime 异常映射成对前端更明确的 HTTP 响应。"""
+
+    if isinstance(exc, (AIConfigValidationError, MCPConfigurationError, SkillConfigurationError)):
+        raise CustomException(status_code=400, detail=str(exc), custom_code=10005) from exc
+
+    if isinstance(exc, (AgentNotFoundError, AIConfigNotFoundError, MCPServerNotFoundError, SkillNotFoundError)):
+        raise CustomException(status_code=404, detail=str(exc), custom_code=10002) from exc
+
+    if isinstance(exc, AIDisabledError):
+        raise CustomException(status_code=503, detail=str(exc), custom_code=503) from exc
+
+    if isinstance(exc, MCPRuntimeError):
+        raise CustomException(status_code=502, detail=str(exc), custom_code=502) from exc
+
+    raise CustomException(status_code=500, detail=str(exc), custom_code=500) from exc
 
 
 @router.get("", summary="查询已注册的 Agent 列表")
@@ -46,12 +75,8 @@ async def chat_with_agent(payload: AgentChatRequest, request: Request):
 
     try:
         result = await service.chat(request_context=request_context, payload=payload)
-    except AgentNotFoundError as exc:
-        raise CustomException(status_code=404, detail=str(exc), custom_code=404) from exc
-    except AIDisabledError as exc:
-        raise CustomException(status_code=503, detail=str(exc), custom_code=503) from exc
     except AIRuntimeError as exc:
-        raise CustomException(status_code=500, detail=str(exc), custom_code=500) from exc
+        _raise_agent_api_exception(exc)
 
     return api_response(data=result.model_dump(mode="json"))
 
@@ -67,12 +92,8 @@ async def stream_agent_chat(payload: AgentChatRequest, request: Request):
 
     try:
         event_iterator = service.stream(request_context=request_context, payload=payload)
-    except AgentNotFoundError as exc:
-        raise CustomException(status_code=404, detail=str(exc), custom_code=404) from exc
-    except AIDisabledError as exc:
-        raise CustomException(status_code=503, detail=str(exc), custom_code=503) from exc
     except AIRuntimeError as exc:
-        raise CustomException(status_code=500, detail=str(exc), custom_code=500) from exc
+        _raise_agent_api_exception(exc)
 
     return StreamingResponse(event_iterator, media_type="text/event-stream")
 
@@ -88,11 +109,7 @@ async def resume_agent_chat(payload: AgentChatResumeRequest, request: Request):
 
     try:
         result = await service.resume(request_context=request_context, payload=payload)
-    except AgentNotFoundError as exc:
-        raise CustomException(status_code=404, detail=str(exc), custom_code=404) from exc
-    except AIDisabledError as exc:
-        raise CustomException(status_code=503, detail=str(exc), custom_code=503) from exc
     except AIRuntimeError as exc:
-        raise CustomException(status_code=500, detail=str(exc), custom_code=500) from exc
+        _raise_agent_api_exception(exc)
 
     return api_response(data=result.model_dump(mode="json"))

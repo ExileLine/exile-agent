@@ -2,6 +2,7 @@ import asyncio
 import json
 import httpx
 from fastapi.testclient import TestClient
+import pytest
 from pydantic_ai import Agent
 from pydantic_ai import RunContext
 from pydantic_ai import models
@@ -17,6 +18,7 @@ from pydantic_ai.usage import RunUsage
 from app.ai.config import AISettings
 from app.ai.config_store.encryption import encrypt_secret
 from app.ai.deps import AgentDeps, RequestContext
+from app.ai.exceptions import AIConfigValidationError, MCPConfigurationError, MCPRuntimeError, MCPServerNotFoundError
 from app.ai.agents import register_default_agents
 from app.ai.runtime.resolved_config import ResolvedModelConfig, ResolvedProviderConfig, ResolvedRunConfig
 from app.main import app
@@ -134,6 +136,40 @@ def test_agent_chat_endpoint() -> None:
     assert body["data"]["meta"]["config_source"] == "settings_fallback"
     assert body["data"]["meta"]["model_key"] == expected_model_key
     assert body["data"]["meta"]["provider_key"] is None
+
+
+@pytest.mark.parametrize(
+    ("exc", "expected_status", "expected_code"),
+    [
+        (AIConfigValidationError("模型不在 Agent allowlist 中: demo"), 400, 10005),
+        (MCPConfigurationError("MCP server 缺少 command: demo"), 400, 10005),
+        (MCPServerNotFoundError("未找到 MCP server: demo"), 404, 10002),
+        (MCPRuntimeError("MCP server 初始化失败: demo"), 502, 502),
+    ],
+)
+def test_agent_chat_endpoint_maps_runtime_errors_to_specific_http_status(
+    monkeypatch,
+    exc: Exception,
+    expected_status: int,
+    expected_code: int,
+) -> None:
+    async def fail_chat(**kwargs):
+        del kwargs
+        raise exc
+
+    with TestClient(app) as client:
+        monkeypatch.setattr(client.app.state.ai_runner, "run_chat", fail_chat)
+        response = client.post(
+            "/api/v1/agents/chat",
+            json={"message": "你好"},
+            headers={"x-user-id": "tester"},
+        )
+
+    assert response.status_code == expected_status
+    body = response.json()
+    assert body["code"] == expected_code
+    assert body["message"] == str(exc)
+    assert body["request_id"]
 
 
 def test_agent_manager_can_reuse_default_builder_for_database_config_agent() -> None:

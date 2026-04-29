@@ -28,6 +28,7 @@ from app.ai.deps import AgentDeps, RequestContext
 from app.ai.exceptions import (
     AIDisabledError,
     AgentNotFoundError,
+    AIConfigValidationError,
     AIRunExecutionError,
     AIRuntimeError,
     MCPConfigurationError,
@@ -587,7 +588,7 @@ class AgentRunner:
                 ),
             )
 
-        raise AIRunExecutionError(f"暂不支持的模型供应商类型: {provider.provider_type}")
+        raise AIConfigValidationError(f"暂不支持的模型供应商类型: {provider.provider_type}")
 
     @staticmethod
     def _build_model_cache_key(run_config: ResolvedRunConfig) -> str:
