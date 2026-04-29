@@ -324,7 +324,7 @@ app/
 
 ## 分阶段开发规划
 
-### Phase 1：配置控制面数据结构
+### Phase 1：配置控制面数据结构（已完成）
 
 目标：先定义数据库模型和 repository，不改变现有 chat 行为。
 
@@ -346,8 +346,12 @@ app/
 - 不影响现有 `uv run pytest`
 - repository 可在无真实 DB 的测试中通过 fake/session 或 sqlite 方式验证
 - 数据模型不泄漏 secret 明文
+- 当前状态：
+  - 已落地 config_store ORM / repository / schemas / service / API 基线
+  - 已支持分页、模糊搜索、中文 summary、schema description
+  - 已通过 `uv run pytest`
 
-### Phase 2：运行时配置解析器
+### Phase 2：运行时配置解析器（已完成）
 
 目标：新增 `AICapabilityResolver`，把模型、MCP、skill 的最终选择逻辑从 Runner 中抽出来。
 
@@ -383,24 +387,32 @@ app/
   - 禁用模型拒绝
   - MCP allowlist
   - 数据库缺省 fallback
+- 当前状态：
+  - 已新增 `ResolvedRunConfig`
+  - 已新增 `AICapabilityResolver`
+  - 已实现数据库配置命中与 `settings_fallback` 双路径
+  - 已覆盖模型 allowlist、MCP binding、disabled 配置校验
 
-### Phase 3：接入 Runner
+### Phase 3：接入 Runner（已完成，MCP DB 构造待深化）
 
 目标：Runner 消费 `ResolvedRunConfig`，降低 Runner 自己的配置决策职责。
 
 任务：
 
-- 在 `AgentRunner.run_chat`、`run_chat_stream`、`resume_chat` 前置调用 resolver
-- 替换当前 `_resolve_agent`、`_resolve_request_toolsets` 中的部分逻辑
-- MCPManager 支持从 DB config 构造 server
-- AgentManager 支持 model provider config 构造模型
-- 响应 `meta` 增加 `model_key`、`provider_key`、`config_version`
+- [x] 在 `AgentRunner.run_chat`、`run_chat_stream`、`resume_chat` 前置调用 resolver
+- [x] 替换当前 `_resolve_agent`、`_resolve_request_toolsets` 中的部分逻辑
+- [ ] MCPManager 支持从 DB config 构造 server
+- [x] AgentManager 支持 model provider config 构造模型
+- [x] 响应 `meta` 增加 `model_key`、`provider_key`、`config_version`
 
 验收：
 
-- 现有 24 个测试继续通过
-- 新增测试证明 DB 配置可以影响最终模型和 MCP 装配
-- 请求非法模型/MCP 时返回明确错误
+- [x] 现有测试继续通过，当前为 `39 passed`
+- [x] DB provider 可构造 `OpenAIChatModel + OpenAIProvider`
+- [x] DB Agent 缺少同名静态注册时，可复用默认 `chat-agent` builder，并保留业务 `agent_id`
+- [x] DB 控制面启用时关闭旧 MCP 自动路由，避免绕过 binding 校验
+- [ ] 新增测试证明 DB MCP 配置可以直接影响 MCP 装配
+- [ ] 请求非法模型/MCP 时返回更明确的 4xx 错误，而不是统一 500
 
 ### Phase 4：配置管理 API
 

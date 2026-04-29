@@ -14,6 +14,26 @@
 
 ---
 
+## 当前进度
+
+已完成：
+
+- 已完成 `app/ai/` 基础边界、Agent 注册中心、Runner、Chat API、流式 SSE、会话历史、工具审计和 Skills 基线。
+- 已完成 AI 配置控制面基础表、repository、schemas、管理 API，支持模型供应商、模型、Agent 配置、MCP server、Agent-MCP binding 管理。
+- 已完成 `AICapabilityResolver`，Runner 主链路已接入 `ResolvedRunConfig`，`chat / stream / resume` 都走统一配置解析。
+- 已支持 DB provider 构造运行时模型对象，`openai` / `openai_compatible` 会转换为 `OpenAIChatModel + OpenAIProvider`。
+- 已支持 DB Agent 配置复用默认 runtime builder，允许类似 `yyx-agent` 这样的业务 Agent 配置在没有同名静态 builder 时运行。
+- 已在响应 `meta` 返回 `config_source`、`model_key`、`provider_key`、`config_version`，便于调试和治理。
+
+当前待补：
+
+- MCPManager 还需要支持直接从数据库 `AIMCPServer` 配置构造运行时 server/toolset，而不是只消费 settings 中的 MCP 配置。
+- DB 控制面异常需要细化到更明确的 4xx 响应，例如模型不在 allowlist、MCP 未绑定、provider 类型不支持。
+- 配置管理接口已有基础能力，但还需要补鉴权策略、审计日志持久化和更完整的 secret/KMS 方案。
+- Approval Store 仍是下一阶段重点，需要替换当前客户端回传完整 `message_history_json` 的无状态 resume 协议。
+
+---
+
 ## 当前项目适配结论
 
 当前项目具备以下优点，适合承载 AI 基建：
