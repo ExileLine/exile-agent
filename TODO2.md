@@ -393,7 +393,7 @@ app/
   - 已实现数据库配置命中与 `settings_fallback` 双路径
   - 已覆盖模型 allowlist、MCP binding、disabled 配置校验
 
-### Phase 3：接入 Runner（已完成，MCP DB 构造待深化）
+### Phase 3：接入 Runner（已完成）
 
 目标：Runner 消费 `ResolvedRunConfig`，降低 Runner 自己的配置决策职责。
 
@@ -401,38 +401,47 @@ app/
 
 - [x] 在 `AgentRunner.run_chat`、`run_chat_stream`、`resume_chat` 前置调用 resolver
 - [x] 替换当前 `_resolve_agent`、`_resolve_request_toolsets` 中的部分逻辑
-- [ ] MCPManager 支持从 DB config 构造 server
+- [x] MCPManager 支持从 DB config 构造 server
 - [x] AgentManager 支持 model provider config 构造模型
 - [x] 响应 `meta` 增加 `model_key`、`provider_key`、`config_version`
 
 验收：
 
-- [x] 现有测试继续通过，当前为 `39 passed`
+- [x] 现有测试继续通过，当前为 `42 passed`
 - [x] DB provider 可构造 `OpenAIChatModel + OpenAIProvider`
+- [x] DB MCP 配置可构造运行时 MCP server/toolset，并支持 headers/env 解密
 - [x] DB Agent 缺少同名静态注册时，可复用默认 `chat-agent` builder，并保留业务 `agent_id`
 - [x] DB 控制面启用时关闭旧 MCP 自动路由，避免绕过 binding 校验
-- [ ] 新增测试证明 DB MCP 配置可以直接影响 MCP 装配
+- [x] DB 控制面支持在 Agent 已绑定 MCP 范围内按关键词安全自动路由
+- [x] 新增测试证明 DB MCP 配置可以直接影响 MCP 装配
 - [ ] 请求非法模型/MCP 时返回更明确的 4xx 错误，而不是统一 500
 
-### Phase 4：配置管理 API
+### Phase 4：配置管理 API（基础能力已完成，治理待补）
 
 目标：提供最小可用的配置管理接口。
 
 任务：
 
-- 新增 `/api/v1/ai-config/model-providers`
-- 新增 `/api/v1/ai-config/models`
-- 新增 `/api/v1/ai-config/agents/{agent_id}/config`
-- 新增 `/api/v1/ai-config/mcp-servers`
-- 新增 `/api/v1/ai-config/agents/{agent_id}/mcp-bindings`
-- 增加基础鉴权占位，避免公开配置管理接口
-- 所有写操作记录 `ai_audit_log`
+- [x] 新增 `/api/v1/ai-config/model-providers`
+- [x] 新增 `/api/v1/ai-config/models`
+- [x] 新增 `/api/v1/ai-config/agents/{agent_id}/config`
+- [x] 新增 `/api/v1/ai-config/mcp-servers`
+- [x] 新增 `/api/v1/ai-config/agents/{agent_id}/mcp-bindings`
+- [ ] 增加基础鉴权占位，避免公开配置管理接口
+- [ ] 所有写操作记录 `ai_audit_log`
 
 验收：
 
-- OpenAPI 可见配置管理接口
-- secret 字段写入时加密，读取时不返回明文
-- 配置变更有审计记录
+- [x] OpenAPI 可见配置管理接口
+- [x] secret 字段写入时加密，读取时不返回明文
+- [ ] 配置变更有审计记录
+
+当前状态：
+
+- 已支持分页和关键词模糊搜索
+- 已支持中文 summary 和 schema description
+- 写接口已采用 `PUT` 更新并使用数据库主键 ID
+- 后续重点是鉴权、审计、配置变更事件和更完整的 secret/KMS 方案
 
 ### Phase 5：服务端 Approval Store
 
@@ -511,22 +520,28 @@ app/
 
 ## 首批开发顺序
 
-建议先按这个顺序推进：
+当前已完成：
 
 1. `config_store` 数据模型与 repository
 2. `ResolvedRunConfig` 与 `AICapabilityResolver`
-3. Runner 接入 resolver，但保持现有行为 fallback
-4. MCP 从 DB config 构造
-5. 配置管理 API
-6. 服务端 approval store
-7. history manager 与 observability
+3. Runner 接入 resolver，并保持 settings fallback
+4. MCP 从 DB config 构造和安全自动路由
+5. 配置管理 API 基础能力
+
+建议继续按这个顺序推进：
+
+1. DB 控制面异常 4xx 化
+2. 服务端 approval store
+3. history manager
+4. observability / guardrails
+5. 业务 Agent 落地
 
 原因：
 
-- 先把模型和 MCP 配置数据库化，能支撑后续管理后台
-- resolver 是后续权限、灰度、预算、审批的统一入口
-- Runner 越早减负，后续改动越不容易互相牵连
-- approval store 和 history manager 涉及协议变化，放在配置控制面稳定后推进更稳
+- 模型和 MCP 配置数据库化已完成，可以支撑后续管理后台和灰度策略
+- resolver 已成为权限、灰度、预算、审批的统一入口
+- Runner 已完成减负，后续应避免继续把策略分支堆回 Runner
+- approval store 和 history manager 涉及协议变化，应在业务 Agent 大规模接入前推进
 
 ---
 
@@ -547,6 +562,5 @@ app/
 - 当前是否需要多租户。如果暂时没有，也建议数据结构预留 `tenant_id`
 - 配置管理接口的鉴权来源是什么，是已有用户体系、API key，还是先做内部 header 占位
 - secret 加密首期使用 Fernet/AES-GCM 本地密钥，还是直接规划 KMS/Vault
-- Alembic 是否需要在本阶段引入，还是先只写 ORM model 和测试
 - MCP stdio 命令白名单首期允许哪些命令
 - 模型价格是否需要首期用于成本统计，还是先只记录 usage

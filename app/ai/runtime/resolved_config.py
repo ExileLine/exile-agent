@@ -32,11 +32,23 @@ class ResolvedProviderConfig:
 
 @dataclass(frozen=True, slots=True)
 class ResolvedMCPServerConfig:
-    """一次 run 最终允许装配的 MCP server 配置摘要。"""
+    """一次 run 最终允许装配的 MCP server 配置。"""
 
     server_key: str
     transport: str
     tool_prefix: str | None
+    command: str | None = None
+    args: tuple[str, ...] = ()
+    url: str | None = None
+    headers: dict[str, str] = field(default_factory=dict)
+    env: dict[str, str] = field(default_factory=dict)
+    cwd: str | None = None
+    auto_route_enabled: bool = True
+    route_keywords: tuple[str, ...] = ()
+    timeout_seconds: float | None = None
+    read_timeout_seconds: float | None = None
+    max_retries: int | None = None
+    include_instructions: bool = False
     required_approval: bool = False
     allow_auto_route: bool = True
     risk_level: str = "low"

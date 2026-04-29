@@ -1,6 +1,7 @@
 from collections.abc import Sequence
 
 from app.ai.config import AISettings
+from app.ai.config_store.encryption import decrypt_secret_mapping
 from app.ai.config_store.models import AIAgentConfig, AIAgentMCPBinding, AIMCPServer, AIModel, AIModelProvider
 from app.ai.config_store.repository import AIConfigRepository
 from app.ai.exceptions import AIConfigValidationError
@@ -32,6 +33,7 @@ class AICapabilityResolver:
         requested_model: str | None = None,
         requested_mcp_servers: Sequence[str] | None = None,
         requested_skill_ids: Sequence[str] | None = None,
+        route_message: str | None = None,
     ) -> ResolvedRunConfig:
         resolved_agent_id = agent_id or self.settings.default_agent
         agent_config = await self.repository.get_agent_config(resolved_agent_id)
@@ -50,6 +52,7 @@ class AICapabilityResolver:
         mcp_servers = await self._resolve_mcp_servers(
             agent_config=agent_config,
             requested_mcp_servers=requested_mcp_servers,
+            route_message=route_message,
         )
         skill_ids = _dedupe([*agent_config.default_skill_ids_json, *(requested_skill_ids or [])])
 
@@ -138,6 +141,7 @@ class AICapabilityResolver:
         *,
         agent_config: AIAgentConfig,
         requested_mcp_servers: Sequence[str] | None,
+        route_message: str | None,
     ) -> list[ResolvedMCPServerConfig]:
         bindings = await self.repository.list_agent_mcp_bindings(agent_config.agent_id)
         binding_by_server_key = {binding.server_key: binding for binding in bindings}
@@ -146,8 +150,10 @@ class AICapabilityResolver:
             if not agent_config.allow_request_mcp_override:
                 raise AIConfigValidationError(f"Agent 不允许请求覆盖 MCP: {agent_config.agent_id}")
             selected_server_keys = _dedupe(requested_mcp_servers)
-        else:
+        elif agent_config.default_mcp_server_ids_json:
             selected_server_keys = _dedupe(agent_config.default_mcp_server_ids_json or [])
+        else:
+            return await self._auto_route_mcp_servers(bindings=bindings, route_message=route_message)
 
         resolved: list[ResolvedMCPServerConfig] = []
         for server_key in selected_server_keys:
@@ -158,6 +164,32 @@ class AICapabilityResolver:
             if server is None or not server.enabled:
                 raise AIConfigValidationError(f"MCP server 未启用或不存在: {server_key}")
             resolved.append(_mcp_to_resolved(server, binding))
+        return resolved
+
+    async def _auto_route_mcp_servers(
+        self,
+        *,
+        bindings: Sequence[AIAgentMCPBinding],
+        route_message: str | None,
+    ) -> list[ResolvedMCPServerConfig]:
+        """从已绑定 MCP 中按消息关键词安全自动路由。
+
+        自动路由只会在数据库绑定 allowlist 内发生，不会读取 settings 中的全局 MCP 池。
+        """
+
+        normalized_message = _normalize_text(route_message or "")
+        if not normalized_message:
+            return []
+
+        resolved: list[ResolvedMCPServerConfig] = []
+        for binding in bindings:
+            if not binding.allow_auto_route:
+                continue
+            server = await self.repository.get_mcp_server(binding.server_key)
+            if server is None or server.enabled is False or server.auto_route_enabled is False:
+                continue
+            if _mcp_server_matches_message(server, normalized_message):
+                resolved.append(_mcp_to_resolved(server, binding))
         return resolved
 
 
@@ -189,6 +221,18 @@ def _mcp_to_resolved(server: AIMCPServer, binding: AIAgentMCPBinding) -> Resolve
         server_key=server.server_key,
         transport=server.transport,
         tool_prefix=server.tool_prefix,
+        command=server.command,
+        args=tuple(str(item) for item in (server.args_json or [])),
+        url=server.url,
+        headers=decrypt_secret_mapping(server.headers_encrypted_json),
+        env=decrypt_secret_mapping(server.env_encrypted_json),
+        cwd=server.cwd,
+        auto_route_enabled=server.auto_route_enabled,
+        route_keywords=tuple(str(item) for item in (server.route_keywords_json or [])),
+        timeout_seconds=server.timeout_seconds,
+        read_timeout_seconds=server.read_timeout_seconds,
+        max_retries=server.max_retries,
+        include_instructions=server.include_instructions,
         required_approval=binding.required_approval,
         allow_auto_route=binding.allow_auto_route,
         risk_level=server.risk_level,
@@ -209,3 +253,30 @@ def _dedupe(values: Sequence[str]) -> list[str]:
         seen.add(normalized)
         deduped.append(normalized)
     return deduped
+
+
+def _mcp_server_matches_message(server: AIMCPServer, normalized_message: str) -> bool:
+    for keyword in _mcp_route_keywords(server):
+        if keyword in normalized_message:
+            return True
+    return False
+
+
+def _mcp_route_keywords(server: AIMCPServer) -> list[str]:
+    keywords: list[str] = []
+    seen: set[str] = set()
+    for raw_keyword in [
+        *(server.route_keywords_json or []),
+        server.server_key,
+        server.tool_prefix or "",
+    ]:
+        normalized_keyword = _normalize_text(str(raw_keyword))
+        if not normalized_keyword or normalized_keyword in seen:
+            continue
+        seen.add(normalized_keyword)
+        keywords.append(normalized_keyword)
+    return keywords
+
+
+def _normalize_text(value: str) -> str:
+    return " ".join(value.casefold().split())

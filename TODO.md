@@ -22,12 +22,13 @@
 - 已完成 AI 配置控制面基础表、repository、schemas、管理 API，支持模型供应商、模型、Agent 配置、MCP server、Agent-MCP binding 管理。
 - 已完成 `AICapabilityResolver`，Runner 主链路已接入 `ResolvedRunConfig`，`chat / stream / resume` 都走统一配置解析。
 - 已支持 DB provider 构造运行时模型对象，`openai` / `openai_compatible` 会转换为 `OpenAIChatModel + OpenAIProvider`。
+- 已支持 DB MCP 配置构造运行时 MCP server/toolset，并完成 headers/env 解密、配置指纹缓存和绑定范围内的自动路由。
 - 已支持 DB Agent 配置复用默认 runtime builder，允许类似 `yyx-agent` 这样的业务 Agent 配置在没有同名静态 builder 时运行。
 - 已在响应 `meta` 返回 `config_source`、`model_key`、`provider_key`、`config_version`，便于调试和治理。
+- 当前自动化测试基线：`42 passed`。
 
 当前待补：
 
-- MCPManager 还需要支持直接从数据库 `AIMCPServer` 配置构造运行时 server/toolset，而不是只消费 settings 中的 MCP 配置。
 - DB 控制面异常需要细化到更明确的 4xx 响应，例如模型不在 allowlist、MCP 未绑定、provider 类型不支持。
 - 配置管理接口已有基础能力，但还需要补鉴权策略、审计日志持久化和更完整的 secret/KMS 方案。
 - Approval Store 仍是下一阶段重点，需要替换当前客户端回传完整 `message_history_json` 的无状态 resume 协议。
@@ -43,14 +44,15 @@
 - `app/db/session.py`、`app/db/redis_client.py` 已具备 DB/Redis 基础设施，可作为 Agent deps 的一部分
 - 当前 `api` 层较薄，适合新增独立的 `ai` 服务层，避免把 Agent 逻辑散落在 endpoint 中
 
-当前项目也有明显空白：
+当前仍需补齐的能力：
 
-- 尚无 `AI/Agent` 目录边界
-- 尚无统一 `service / registry / runtime / toolset / session history` 抽象
-- 尚无模型配置、提示词治理、工具权限、MCP 生命周期、技能装载约定
-- 尚无 AI 相关测试基线
+- DB 控制面异常与 HTTP 响应码还需要更精确映射
+- 配置管理接口还缺少正式鉴权、审计日志持久化和操作人维度
+- Approval 仍是无状态 `message_history_json` 回传协议，后续应改为服务端 Approval Store
+- History 还缺少 tenant/user/agent 维度隔离、裁剪和摘要能力
+- Observability 还需要 run/tool/model 级事件持久化、usage/cost 聚合和脱敏策略
 
-因此，建议先完成一套“AI 基建层”，再逐步接入具体业务 Agent。
+因此，当前重点已从“搭骨架”转向“治理、安全、可观测和协议稳定化”。
 
 ---
 
@@ -487,8 +489,11 @@ AI_MCP_SERVERS_JSON={}
 - `Phase 0` 设计落盘
 - `Phase 1` AI 最小运行骨架
 - `Phase 2` Toolsets 与工具治理基础能力
-- `Phase 3` 当前阶段的最小运行时增强
-- `Phase 6` 中与 approval 相关的最小闭环
+- `Phase 3` 会话历史与运行时管理
+- `Phase 4` MCP 基础接入
+- `Phase 5` Skills 基础设施
+- `Phase 6` Streaming / Approval / External Tools 的最小闭环
+- DB 配置控制面主链路：模型、Agent、MCP、resolver、Runner 接入
 
 当前已经具备：
 
@@ -508,11 +513,16 @@ AI_MCP_SERVERS_JSON={}
 - 多轮对话基础测试
 - 流式文本输出与 approval fallback 流式测试
 - README 调用链与 approval 闭环文档
+- 数据库模型供应商、模型、Agent、MCP server、Agent-MCP binding 管理接口
+- `AICapabilityResolver` 与 `ResolvedRunConfig`
+- DB provider 到运行时模型对象的构造
+- DB MCP 到运行时 MCP toolset 的构造和自动路由
 
 当前最自然的下一阶段是：
 
-- `Phase 3` 的增强项与 `Phase 6` 的流式深化
-- 重点补 `更完整 history 策略 + streaming 事件细化 + 更细粒度观测`
+- DB 控制面异常 4xx 化
+- 服务端 Approval Store
+- History Manager 与 Observability / Guardrails
 
 ## Phase 0 - 设计落盘
 
@@ -606,8 +616,10 @@ AI_MCP_SERVERS_JSON={}
 - [x] 定义 `MCPServerConfig`
 - [x] 实现 `MCPManager`
 - [x] 支持从配置加载 MCP server
+- [x] 支持从数据库 MCP 配置动态构造 MCP server
 - [x] 支持为指定 agent/run 动态装配 MCP toolset
 - [x] 支持未显式传入 `mcp_servers` 时按消息关键词自动路由 MCP
+- [x] 支持 DB 控制面下只在 Agent 已绑定 MCP 范围内自动路由
 - [x] 增加 MCP 错误处理、超时和日志
 - [x] 新增一个示例 MCP server 配置与联调说明
 
@@ -622,7 +634,8 @@ AI_MCP_SERVERS_JSON={}
 - 已新增 `app/ai/mcp/config.py` 与 `app/ai/mcp/manager.py`
 - `init_ai_runtime(...)` 会统一初始化并挂载 `ai_mcp_manager`
 - `/chat`、`/chat/stream`、`/chat/resume` 已支持通过 `mcp_servers` 做请求级动态装配
-- 未显式传入 `mcp_servers` 时，`MCPManager` 会基于 `route_keywords` 做自动 MCP 路由
+- settings fallback 路径下，`MCPManager` 会基于 `route_keywords` 做自动 MCP 路由
+- DB 控制面路径下，`AICapabilityResolver` 会基于 Agent 绑定和 `route_keywords_json/server_key/tool_prefix` 做安全自动路由
 - MCP toolset 会统一经过现有 approval / audit wrapper
 - 当前环境如果未安装 `mcp` SDK，服务仍可正常启动；只有真正构建 MCP server 时才会返回明确错误
 - 已提供本地 mock MCP server 与联调测试路径
@@ -720,16 +733,21 @@ AI_MCP_SERVERS_JSON={}
 - `Phase 4`
 - `Phase 5`
 - `Phase 6` 的最小 approval / streaming 闭环
+- DB 配置控制面主链路
 
 后续建议按这个顺序继续推进：
 
-1. `Phase 7`
-2. `Phase 8`
+1. DB 控制面异常 4xx 化
+2. 服务端 Approval Store
+3. History Manager
+4. `Phase 7` Observability / Guardrails / Tests
+5. `Phase 8` 业务 Agent 落地
 
 原因：
 
-- Skills 与 MCP 的最小动态装配已经接进运行时
-- 下一阶段更适合补齐可观测性、guardrails 和更完整的测试治理
+- 模型、Agent、MCP 已经进入数据库控制面，下一步应先把错误语义和审批协议稳定下来
+- Approval Store 和 History Manager 会影响 API 协议，应在业务 Agent 大规模接入前完成
+- 可观测性和 guardrails 是上线治理的前置条件
 
 ---
 

@@ -25,8 +25,21 @@ from app.ai.config import AISettings
 from app.ai.config_store import AICapabilityResolver, AIConfigRepository
 from app.ai.config_store.encryption import decrypt_secret
 from app.ai.deps import AgentDeps, RequestContext
-from app.ai.exceptions import AIDisabledError, AgentNotFoundError, AIRunExecutionError, AIRuntimeError, MCPRuntimeError
-from app.ai.mcp import MCPManager
+from app.ai.exceptions import (
+    AIDisabledError,
+    AgentNotFoundError,
+    AIRunExecutionError,
+    AIRuntimeError,
+    MCPConfigurationError,
+    MCPRuntimeError,
+)
+from app.ai.mcp import (
+    MCPManager,
+    ManagedMCPServerConfig,
+    ManagedMCPServerSSEConfig,
+    ManagedMCPServerStdioConfig,
+    ManagedMCPServerStreamableHTTPConfig,
+)
 from app.ai.runtime.history import SessionHistoryStore
 from app.ai.runtime.manager import AgentManager
 from app.ai.runtime.resolved_config import ResolvedMCPServerConfig, ResolvedModelConfig, ResolvedRunConfig
@@ -95,6 +108,7 @@ class AgentRunner:
             model_name=model_name,
             mcp_server_ids=mcp_server_ids,
             skill_ids=skill_ids,
+            route_message=message,
         )
         resolved_agent_id, resolved_model, agent = self._resolve_agent(run_config)
         skill_resolution = self._resolve_skills(
@@ -106,6 +120,7 @@ class AgentRunner:
         deps = self._build_deps(request_context, resolved_skill_names=tuple(skill_resolution.skill_names))
         resolved_mcp_server_ids, run_toolsets = self._resolve_request_toolsets(
             mcp_server_ids=run_config.mcp_server_keys,
+            mcp_server_configs=run_config.mcp_servers if run_config.source == "database" else (),
             route_message=message,
             skill_resolution=skill_resolution,
             allow_auto_route=run_config.source != "database",
@@ -178,6 +193,7 @@ class AgentRunner:
             model_name=model_name,
             mcp_server_ids=mcp_server_ids,
             skill_ids=skill_ids,
+            route_message=message,
         )
         resolved_agent_id, resolved_model, agent = self._resolve_agent(run_config)
         skill_resolution = self._resolve_skills(
@@ -189,6 +205,7 @@ class AgentRunner:
         deps = self._build_deps(request_context, resolved_skill_names=tuple(skill_resolution.skill_names))
         resolved_mcp_server_ids, run_toolsets = self._resolve_request_toolsets(
             mcp_server_ids=run_config.mcp_server_keys,
+            mcp_server_configs=run_config.mcp_servers if run_config.source == "database" else (),
             route_message=message,
             skill_resolution=skill_resolution,
             allow_auto_route=run_config.source != "database",
@@ -399,15 +416,16 @@ class AgentRunner:
         - run 完成后，如果带了 `session_id`，也会把新历史写回会话存储
         """
 
+        message_history = ModelMessagesTypeAdapter.validate_json(message_history_json)
+        latest_user_message = self._extract_latest_user_message(message_history)
         run_config = await self._resolve_run_config(
             agent_id=agent_id,
             model_name=model_name,
             mcp_server_ids=mcp_server_ids,
             skill_ids=skill_ids,
+            route_message=latest_user_message,
         )
         resolved_agent_id, resolved_model, agent = self._resolve_agent(run_config)
-        message_history = ModelMessagesTypeAdapter.validate_json(message_history_json)
-        latest_user_message = self._extract_latest_user_message(message_history)
         skill_resolution = self._resolve_skills(
             agent_id=resolved_agent_id,
             message=latest_user_message,
@@ -417,6 +435,7 @@ class AgentRunner:
         deps = self._build_deps(request_context, resolved_skill_names=tuple(skill_resolution.skill_names))
         resolved_mcp_server_ids, run_toolsets = self._resolve_request_toolsets(
             mcp_server_ids=run_config.mcp_server_keys,
+            mcp_server_configs=run_config.mcp_servers if run_config.source == "database" else (),
             route_message=latest_user_message,
             skill_resolution=skill_resolution,
             allow_auto_route=run_config.source != "database",
@@ -457,6 +476,7 @@ class AgentRunner:
             model_name: str | None,
             mcp_server_ids: list[str] | None,
             skill_ids: list[str] | None,
+            route_message: str | None = None,
     ) -> ResolvedRunConfig:
         """解析本轮 run 的控制面配置。
 
@@ -485,6 +505,7 @@ class AgentRunner:
                 requested_model=model_name,
                 requested_mcp_servers=mcp_server_ids,
                 requested_skill_ids=skill_ids,
+                route_message=route_message,
             )
 
     def _build_settings_fallback_run_config(
@@ -622,6 +643,7 @@ class AgentRunner:
             self,
             *,
             mcp_server_ids: list[str] | None,
+            mcp_server_configs: tuple[ResolvedMCPServerConfig, ...] = (),
             route_message: str | None,
             skill_resolution: SkillResolution,
             allow_auto_route: bool = True,
@@ -639,8 +661,10 @@ class AgentRunner:
             wrap_toolsets_with_metadata_approval(skill_toolsets)
         )
 
+        db_mcp_server_ids = [config.server_key for config in mcp_server_configs]
+        skill_mcp_server_ids = [] if mcp_server_configs else skill_resolution.required_mcp_server_ids
         explicit_mcp_server_ids = _dedupe_server_ids(
-            [*(mcp_server_ids or []), *skill_resolution.required_mcp_server_ids]
+            [*(db_mcp_server_ids or mcp_server_ids or []), *skill_mcp_server_ids]
         )
 
         if self.mcp_manager is None:
@@ -655,10 +679,55 @@ class AgentRunner:
         if not resolved_mcp_server_ids:
             return resolved_mcp_server_ids, wrapped_skill_toolsets
 
+        if mcp_server_configs:
+            managed_configs = [self._build_managed_mcp_config(config) for config in mcp_server_configs]
+            return (
+                resolved_mcp_server_ids,
+                [*wrapped_skill_toolsets, *self.mcp_manager.build_toolsets_from_configs(managed_configs)],
+            )
+
         return (
             resolved_mcp_server_ids,
             [*wrapped_skill_toolsets, *self.mcp_manager.build_toolsets(resolved_mcp_server_ids)],
         )
+
+    @staticmethod
+    def _build_managed_mcp_config(config: ResolvedMCPServerConfig) -> ManagedMCPServerConfig:
+        common = {
+            "id": config.server_key,
+            "enabled": True,
+            "auto_route_enabled": config.auto_route_enabled and config.allow_auto_route,
+            "route_keywords": list(config.route_keywords),
+            "tool_prefix": config.tool_prefix,
+            "timeout": config.timeout_seconds or 5.0,
+            "read_timeout": config.read_timeout_seconds or 300.0,
+            "max_retries": config.max_retries if config.max_retries is not None else 1,
+            "include_instructions": config.include_instructions,
+        }
+        headers = dict(config.headers or {})
+
+        if config.transport == "stdio":
+            if not config.command:
+                raise MCPConfigurationError(f"MCP server 缺少 command: {config.server_key}")
+            return ManagedMCPServerStdioConfig(
+                **common,
+                command=config.command,
+                args=list(config.args),
+                env=dict(config.env or {}) or None,
+                cwd=config.cwd,
+            )
+
+        if config.transport == "sse":
+            if not config.url:
+                raise MCPConfigurationError(f"MCP server 缺少 url: {config.server_key}")
+            return ManagedMCPServerSSEConfig(**common, url=config.url, headers=headers or None)
+
+        if config.transport == "streamable-http":
+            if not config.url:
+                raise MCPConfigurationError(f"MCP server 缺少 url: {config.server_key}")
+            return ManagedMCPServerStreamableHTTPConfig(**common, url=config.url, headers=headers or None)
+
+        raise MCPConfigurationError(f"不支持的 MCP transport: {config.transport}")
 
     def _build_chat_response(
             self,

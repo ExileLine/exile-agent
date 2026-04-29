@@ -43,6 +43,15 @@ def encrypt_secret_mapping(value: dict[str, Any] | None) -> dict[str, str]:
     return encrypted
 
 
+def decrypt_secret_mapping(value: dict[str, str] | None) -> dict[str, str]:
+    """对存储的秘密映射中的每个值进行解密。"""
+
+    decrypted: dict[str, str] = {}
+    for key, encrypted_value in (value or {}).items():
+        decrypted[str(key)] = decrypt_secret(encrypted_value) or ""
+    return decrypted
+
+
 def _serialize_secret_value(value: Any) -> str:
     if isinstance(value, str):
         return value

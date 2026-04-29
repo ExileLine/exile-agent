@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any
 
@@ -78,6 +80,24 @@ class MCPManager:
         # 这里统一复用现有 approval + audit 包装，保证治理策略与内建工具一致。
         return wrap_toolsets_with_audit(wrap_toolsets_with_metadata_approval(servers))
 
+    def build_toolsets_from_configs(
+        self,
+        server_configs: Sequence[ManagedMCPServerConfig] | None,
+    ) -> list[AbstractToolset[AgentDeps]]:
+        """把数据库控制面解析出的 MCP 配置直接转换为本轮附加 toolsets。"""
+
+        if not server_configs:
+            return []
+        if not self.enabled:
+            raise MCPConfigurationError("MCP 能力未启用，请先打开 AI_ENABLE_MCP")
+
+        servers = [
+            self._get_or_create_server_from_config(config)
+            for config in server_configs
+            if config.enabled
+        ]
+        return wrap_toolsets_with_audit(wrap_toolsets_with_metadata_approval(servers))
+
     async def shutdown(self) -> None:
         """关闭已缓存的 MCP server 连接。"""
 
@@ -97,6 +117,12 @@ class MCPManager:
                 raise MCPServerNotFoundError(f"未找到 MCP server: {server_id}")
             self._server_cache[server_id] = self._build_server(config)
         return self._server_cache[server_id]
+
+    def _get_or_create_server_from_config(self, config: ManagedMCPServerConfig) -> ManagedMCPServer:
+        cache_key = f"dynamic:{config.id}:{_config_cache_fingerprint(config)}"
+        if cache_key not in self._server_cache:
+            self._server_cache[cache_key] = self._build_server(config)
+        return self._server_cache[cache_key]
 
     def _build_server(self, config: ManagedMCPServerConfig) -> ManagedMCPServer:
         try:
@@ -174,6 +200,12 @@ def _dedupe_server_ids(server_ids: Sequence[str]) -> list[str]:
         seen.add(server_id)
         deduped.append(server_id)
     return deduped
+
+
+def _config_cache_fingerprint(config: ManagedMCPServerConfig) -> str:
+    payload = config.model_dump(mode="json")
+    raw_fingerprint = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(raw_fingerprint.encode("utf-8")).hexdigest()
 
 
 def _normalize_text(value: str) -> str:

@@ -9,12 +9,14 @@ from pydantic_ai.models.function import AgentInfo, FunctionModel
 
 from app.ai.mcp import (
     MCPManager,
+    ManagedMCPServerConfig,
     ManagedMCPServerSSEConfig,
     ManagedMCPServerStdioConfig,
     ManagedMCPServerStreamableHTTPConfig,
     parse_mcp_servers_json,
 )
 from app.ai.runtime import init_ai_runtime, shutdown_ai_runtime
+from app.ai.runtime.resolved_config import ResolvedMCPServerConfig
 from app.ai.skills import SkillResolution
 from app.ai.toolsets.conventions import create_function_toolset
 from app.ai.toolsets.metadata import build_tool_metadata, build_toolset_metadata
@@ -230,3 +232,69 @@ def test_runner_can_disable_legacy_mcp_auto_route_for_config_control_plane() -> 
 
     assert resolved_server_ids == []
     assert toolsets == []
+
+
+def test_mcp_manager_can_build_toolsets_from_database_configs(monkeypatch) -> None:
+    manager = MCPManager(enabled=True, server_configs=[], http_client=httpx.AsyncClient())
+    built_configs: list[ManagedMCPServerConfig] = []
+
+    def build_server(config: ManagedMCPServerConfig):
+        built_configs.append(config)
+        return _build_demo_mcp_toolset()
+
+    monkeypatch.setattr(manager, "_build_server", build_server)
+
+    toolsets = manager.build_toolsets_from_configs(
+        [
+            ManagedMCPServerStreamableHTTPConfig(
+                id="docs",
+                url="https://example.com/mcp",
+                headers={"authorization": "Bearer token"},
+                tool_prefix="docs",
+            )
+        ]
+    )
+    second_toolsets = manager.build_toolsets_from_configs(
+        [
+            ManagedMCPServerStreamableHTTPConfig(
+                id="docs",
+                url="https://example.com/mcp",
+                headers={"authorization": "Bearer token"},
+                tool_prefix="docs",
+            )
+        ]
+    )
+
+    assert len(toolsets) == 1
+    assert len(second_toolsets) == 1
+    assert len(built_configs) == 1
+    assert built_configs[0].headers == {"authorization": "Bearer token"}
+
+
+def test_runner_converts_resolved_database_mcp_config_to_managed_config() -> None:
+    with TestClient(app) as client:
+        runner = client.app.state.ai_runner
+        managed = runner._build_managed_mcp_config(
+            ResolvedMCPServerConfig(
+                server_key="docs",
+                transport="streamable-http",
+                tool_prefix="docs",
+                url="https://example.com/mcp",
+                headers={"authorization": "Bearer token"},
+                route_keywords=("文档",),
+                timeout_seconds=8.0,
+                read_timeout_seconds=60.0,
+                max_retries=2,
+                include_instructions=True,
+            )
+        )
+
+    assert isinstance(managed, ManagedMCPServerStreamableHTTPConfig)
+    assert managed.id == "docs"
+    assert managed.url == "https://example.com/mcp"
+    assert managed.headers == {"authorization": "Bearer token"}
+    assert managed.route_keywords == ["文档"]
+    assert managed.timeout == 8.0
+    assert managed.read_timeout == 60.0
+    assert managed.max_retries == 2
+    assert managed.include_instructions is True

@@ -2,6 +2,7 @@ import asyncio
 from typing import Any
 
 from app.ai.config import AISettings
+from app.ai.config_store.encryption import encrypt_secret_mapping
 from app.ai.config_store.models import AIAgentConfig, AIAgentMCPBinding, AIMCPServer, AIModel, AIModelProvider
 from app.ai.config_store.resolver import AICapabilityResolver
 from app.ai.exceptions import AIConfigValidationError
@@ -84,6 +85,12 @@ def _mcp_server(server_key: str = "docs", *, enabled: bool = True) -> AIMCPServe
         name="Docs",
         transport="streamable-http",
         url="https://example.com/mcp",
+        headers_encrypted_json=encrypt_secret_mapping({"authorization": "Bearer docs-token"}),
+        route_keywords_json=["文档", "docs"],
+        timeout_seconds=8.0,
+        read_timeout_seconds=60.0,
+        max_retries=2,
+        include_instructions=True,
         enabled=enabled,
         risk_level="low",
     )
@@ -141,6 +148,13 @@ def test_resolver_uses_database_config_and_merges_defaults() -> None:
         assert resolved.provider is not None
         assert resolved.provider.provider_key == "deepseek"
         assert resolved.mcp_server_keys == ["docs"]
+        assert resolved.mcp_servers[0].url == "https://example.com/mcp"
+        assert resolved.mcp_servers[0].headers == {"authorization": "Bearer docs-token"}
+        assert resolved.mcp_servers[0].route_keywords == ("文档", "docs")
+        assert resolved.mcp_servers[0].timeout_seconds == 8.0
+        assert resolved.mcp_servers[0].read_timeout_seconds == 60.0
+        assert resolved.mcp_servers[0].max_retries == 2
+        assert resolved.mcp_servers[0].include_instructions is True
         assert resolved.mcp_servers[0].required_approval is True
         assert resolved.mcp_servers[0].allow_auto_route is False
         assert resolved.skill_ids == ("ops-observer", "custom-skill")
@@ -178,5 +192,46 @@ def test_resolver_rejects_unbound_requested_mcp_server() -> None:
             assert "未绑定" in str(exc)
             return
         raise AssertionError("expected AIConfigValidationError")
+
+    asyncio.run(run())
+
+
+def test_resolver_auto_routes_bound_database_mcp_server() -> None:
+    async def run() -> None:
+        repository = _ResolverRepository(
+            agent_config=_agent_config(default_mcp_server_ids_json=[]),
+        )
+        repository.models["deepseek-chat"] = _model()
+        repository.providers["deepseek"] = _provider()
+        repository.mcp_servers["chrome-devtools"] = AIMCPServer(
+            server_key="chrome-devtools",
+            name="Chrome DevTools",
+            transport="stdio",
+            command="npx",
+            args_json=["chrome-devtools-mcp@latest"],
+            tool_prefix="chrome",
+            route_keywords_json=["chrome", "浏览器", "devtools"],
+            enabled=True,
+        )
+        repository.bindings.append(
+            AIAgentMCPBinding(
+                agent_id="chat-agent",
+                server_key="chrome-devtools",
+                enabled=True,
+                required_approval=False,
+                allow_auto_route=True,
+            )
+        )
+        resolver = AICapabilityResolver(settings=AISettings(), repository=repository)  # type: ignore[arg-type]
+
+        resolved = await resolver.resolve(
+            agent_id="chat-agent",
+            route_message="请使用 Chrome DevTools MCP 检查当前浏览器页面信息",
+        )
+
+        assert resolved.source == "database"
+        assert resolved.mcp_server_keys == ["chrome-devtools"]
+        assert resolved.mcp_servers[0].command == "npx"
+        assert resolved.mcp_servers[0].args == ("chrome-devtools-mcp@latest",)
 
     asyncio.run(run())
