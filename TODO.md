@@ -25,11 +25,11 @@
 - 已支持 DB MCP 配置构造运行时 MCP server/toolset，并完成 headers/env 解密、配置指纹缓存和绑定范围内的自动路由。
 - 已支持 DB Agent 配置复用默认 runtime builder，允许类似 `yyx-agent` 这样的业务 Agent 配置在没有同名静态 builder 时运行。
 - 已在响应 `meta` 返回 `config_source`、`model_key`、`provider_key`、`config_version`，便于调试和治理。
-- 当前自动化测试基线：`42 passed`。
+- 已完成 DB 控制面异常 4xx/502 映射，模型/MCP/Skill 配置类错误不再统一返回 500。
+- 当前自动化测试基线：`46 passed`。
 
 当前待补：
 
-- DB 控制面异常需要细化到更明确的 4xx 响应，例如模型不在 allowlist、MCP 未绑定、provider 类型不支持。
 - 配置管理接口已有基础能力，但还需要补鉴权策略、审计日志持久化和更完整的 secret/KMS 方案。
 - Approval Store 仍是下一阶段重点，需要替换当前客户端回传完整 `message_history_json` 的无状态 resume 协议。
 
@@ -46,7 +46,7 @@
 
 当前仍需补齐的能力：
 
-- DB 控制面异常与 HTTP 响应码还需要更精确映射
+- Streaming SSE 路径的错误事件协议还需要进一步标准化
 - 配置管理接口还缺少正式鉴权、审计日志持久化和操作人维度
 - Approval 仍是无状态 `message_history_json` 回传协议，后续应改为服务端 Approval Store
 - History 还缺少 tenant/user/agent 维度隔离、裁剪和摘要能力
@@ -520,7 +520,6 @@ AI_MCP_SERVERS_JSON={}
 
 当前最自然的下一阶段是：
 
-- DB 控制面异常 4xx 化
 - 服务端 Approval Store
 - History Manager 与 Observability / Guardrails
 
@@ -737,11 +736,10 @@ AI_MCP_SERVERS_JSON={}
 
 后续建议按这个顺序继续推进：
 
-1. DB 控制面异常 4xx 化
-2. 服务端 Approval Store
-3. History Manager
-4. `Phase 7` Observability / Guardrails / Tests
-5. `Phase 8` 业务 Agent 落地
+1. 服务端 Approval Store
+2. History Manager
+3. `Phase 7` Observability / Guardrails / Tests
+4. `Phase 8` 业务 Agent 落地
 
 原因：
 

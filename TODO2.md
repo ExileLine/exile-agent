@@ -407,14 +407,14 @@ app/
 
 验收：
 
-- [x] 现有测试继续通过，当前为 `42 passed`
+- [x] 现有测试继续通过，当前为 `46 passed`
 - [x] DB provider 可构造 `OpenAIChatModel + OpenAIProvider`
 - [x] DB MCP 配置可构造运行时 MCP server/toolset，并支持 headers/env 解密
 - [x] DB Agent 缺少同名静态注册时，可复用默认 `chat-agent` builder，并保留业务 `agent_id`
 - [x] DB 控制面启用时关闭旧 MCP 自动路由，避免绕过 binding 校验
 - [x] DB 控制面支持在 Agent 已绑定 MCP 范围内按关键词安全自动路由
 - [x] 新增测试证明 DB MCP 配置可以直接影响 MCP 装配
-- [ ] 请求非法模型/MCP 时返回更明确的 4xx 错误，而不是统一 500
+- [x] 请求非法模型/MCP 时返回更明确的 4xx/502 错误，而不是统一 500
 
 ### Phase 4：配置管理 API（基础能力已完成，治理待补）
 
@@ -527,14 +527,14 @@ app/
 3. Runner 接入 resolver，并保持 settings fallback
 4. MCP 从 DB config 构造和安全自动路由
 5. 配置管理 API 基础能力
+6. DB 控制面异常 4xx/502 化
 
 建议继续按这个顺序推进：
 
-1. DB 控制面异常 4xx 化
-2. 服务端 approval store
-3. history manager
-4. observability / guardrails
-5. 业务 Agent 落地
+1. 服务端 approval store
+2. history manager
+3. observability / guardrails
+4. 业务 Agent 落地
 
 原因：
 

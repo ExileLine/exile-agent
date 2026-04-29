@@ -8,6 +8,7 @@
 - Approval / Resume 闭环
 - MCP 动态接入
 - Skills 渐进式注入
+- 数据库配置控制面
 
 当前已经完成的基础阶段：
 
@@ -17,6 +18,7 @@
 - `Phase 4` MCP 基础接入
 - `Phase 5` Skills 基础设施
 - `Phase 6` Approval / Streaming 最小闭环
+- 配置控制面：模型供应商、模型、Agent、MCP、Agent-MCP binding、Resolver 和 Runner 主链路接入
 
 本文档的目标是让开发者可以快速理解这套工程能做什么、如何启动、如何调用，以及后续应该从哪里继续扩展。
 
@@ -31,6 +33,12 @@
 - 支持 builtin toolsets、tool metadata、tool audit、approval policy wrapper
 - 支持 MCP 配置驱动接入、显式挂载与自动路由
 - 支持 filesystem skills、自动命中、渐进式注入与依赖能力挂载
+- 支持 `/api/v1/ai-config/*` 管理模型供应商、模型、Agent 配置、MCP server、Agent-MCP binding
+- 支持 `AICapabilityResolver` 从数据库解析本轮模型、MCP、skills，并保留 `settings_fallback`
+- 支持 DB provider 构造运行时模型对象，`openai` / `openai_compatible` 会转换为 `OpenAIChatModel + OpenAIProvider`
+- 支持 DB MCP 配置构造运行时 MCP server/toolset，并完成 headers/env 解密、配置指纹缓存和绑定范围内自动路由
+- 支持 DB Agent 配置复用默认 runtime builder，让业务 `agent_id` 可以独立于代码注册 builder
+- 支持更明确的控制面异常响应：配置错误返回 `400`，未找到返回 `404`，MCP 运行失败返回 `502`
 - 支持真实模型和 `TestModel`
 
 当前还未完整落地的增强方向：
@@ -39,6 +47,8 @@
 - 更完整的平台级流式协议
 - 历史摘要压缩 / 裁剪
 - 更细粒度的 hooks / observability / guardrails
+- 配置管理接口鉴权、审计日志持久化和 KMS/Vault 级 secret 管理
+- 服务端 Approval Store，替换当前客户端回传 `message_history_json` 的无状态 resume 协议
 
 ## 快速开始
 
@@ -84,8 +94,10 @@ OPENAI_BASE_URL=https://api.deepseek.com
 说明：
 
 - 如果只调试 AI 主链，可以先关闭 DB / Redis 初始化
+- 如果需要测试数据库配置控制面，必须打开 `DB_INIT_ON_STARTUP=true`
 - `AI_SKILLS_DIR` 默认指向项目内置 skill catalog
 - `AI_ENABLE_MCP=false` 时，请求不会启用 MCP toolsets
+- `AI_ENABLE_MCP=true` 时，settings fallback 和数据库控制面都可以装配 MCP toolsets
 
 ### 3. 启动服务
 
@@ -98,6 +110,93 @@ FAST_API_ENV=development uv run uvicorn app.main:app --reload
 - `http://127.0.0.1:8000/`
 - `http://127.0.0.1:8000/docs`
 - `http://127.0.0.1:8000/api/v1/openapi.json`
+
+## 数据库配置控制面
+
+当前 AI 运行时已经支持把模型、Agent、MCP 等重配置项从 `.env` 迁移到数据库管理。控制面入口统一在 `/api/v1/ai-config` 下。
+
+已完成接口：
+
+- `GET /api/v1/ai-config/model-providers`：查询模型供应商列表
+- `POST /api/v1/ai-config/model-providers`：创建模型供应商
+- `PUT /api/v1/ai-config/model-providers/{provider_id}`：按数据库主键更新模型供应商
+- `GET /api/v1/ai-config/models`：查询模型列表
+- `POST /api/v1/ai-config/models`：创建模型配置
+- `PUT /api/v1/ai-config/models/{model_id}`：按数据库主键更新模型配置
+- `GET /api/v1/ai-config/agents`：查询 Agent 配置列表
+- `POST /api/v1/ai-config/agents`：创建 Agent 配置
+- `GET /api/v1/ai-config/agents/{agent_id}/config`：查询 Agent 配置详情
+- `PUT /api/v1/ai-config/agents/{config_id}/config`：按数据库主键更新 Agent 配置
+- `GET /api/v1/ai-config/mcp-servers`：查询 MCP Server 列表
+- `POST /api/v1/ai-config/mcp-servers`：创建 MCP Server 配置
+- `PUT /api/v1/ai-config/mcp-servers/{server_id}`：按数据库主键更新 MCP Server 配置
+- `GET /api/v1/ai-config/agents/{agent_id}/mcp-bindings`：查询 Agent 的 MCP 绑定
+- `PUT /api/v1/ai-config/agents/{agent_id}/mcp-bindings`：整体替换 Agent-MCP 绑定
+
+列表接口支持分页与关键词模糊搜索，参数沿用项目内 `CommonPage` 约定，并额外支持 `keyword`。
+
+### 控制面运行规则
+
+- 当 `DB_INIT_ON_STARTUP=true` 时，Runner 会启用 `AICapabilityResolver`，优先读取数据库配置。
+- 如果数据库里没有对应 `agent_id` 配置，会 fallback 到当前 `.env` / settings 行为。
+- 数据库存在 Agent 配置时，请求模型必须通过 Agent allowlist 校验。
+- 请求 MCP 或自动路由 MCP 必须在 Agent-MCP binding 范围内，不能绕过数据库 allowlist。
+- DB Agent 缺少同名静态 builder 时，会复用默认 `chat-agent` builder，但响应和审计仍保留业务 `agent_id`。
+- DB provider 支持 `openai` / `openai_compatible`，运行时会构造 `OpenAIChatModel + OpenAIProvider`。
+- DB MCP 支持 `stdio` / `sse` / `streamable-http`，headers/env 会加密落库，运行时解密后装配。
+
+### 最小配置顺序
+
+1. 创建 `model-provider`
+2. 创建 `model`
+3. 创建 `agent config`
+4. 创建 `mcp-server`
+5. 创建或替换 `agent mcp-bindings`
+6. 调用 `/api/v1/agents/chat` 验证 `data.meta.config_source == "database"`
+
+### 响应 meta
+
+`/api/v1/agents/chat`、`/chat/resume`、`/chat/stream` 都会返回统一运行元信息：
+
+```json
+{
+  "meta": {
+    "run_kind": "chat",
+    "skills": [],
+    "mcp_servers": ["chrome-devtools"],
+    "config_source": "database",
+    "model_key": "yyx",
+    "provider_key": "deepseek",
+    "config_version": "agent:yyx-agent:1777276536"
+  }
+}
+```
+
+调试时优先看：
+
+- `config_source`：`database` 表示本轮命中数据库控制面，`settings_fallback` 表示走 `.env` fallback。
+- `model_key` / `provider_key`：本轮实际使用的控制面模型与供应商。
+- `mcp_servers`：本轮实际装配给模型的 MCP server key 列表。
+
+### 控制面错误响应
+
+`/api/v1/agents/chat` 和 `/chat/resume` 会把 AI runtime 异常映射成更明确的 HTTP 状态码：
+
+- `400`：配置或策略校验错误，例如模型不在 Agent allowlist、Agent 不允许覆盖模型/MCP、MCP 配置缺少 `command/url`、provider 类型暂不支持。
+- `404`：请求的 Agent、MCP server、Skill 或控制面配置不存在。
+- `502`：MCP server 已被选中，但初始化、列工具或运行时连接失败，例如 `npx` 权限错误、命令不存在、远程 MCP 不可用。
+- `503`：AI 能力未启用。
+- `500`：真正的未分类运行时错误。
+
+典型响应：
+
+```json
+{
+  "code": 10005,
+  "message": "模型不在 Agent allowlist 中: demo-model",
+  "request_id": "..."
+}
+```
 
 ## 开箱即用的调用方式
 
@@ -187,7 +286,12 @@ curl -X POST 'http://127.0.0.1:8000/api/v1/agents/chat' \
 
 ### 6. 测试显式 MCP 装配
 
-前提是你已经配置好了 `AI_MCP_SERVERS_JSON` 并启用了 `AI_ENABLE_MCP=true`。
+前提是你已经配置好了 MCP，并启用了 `AI_ENABLE_MCP=true`。
+
+MCP 配置可以来自两条路径：
+
+- settings fallback：配置 `AI_MCP_SERVERS_JSON`
+- 数据库控制面：创建 `/api/v1/ai-config/mcp-servers` 并绑定到 Agent
 
 ```json
 {
@@ -386,7 +490,96 @@ toolsets=wrap_toolsets_with_audit(
 
 ### 二、接入你自己的 MCP
 
-MCP 的接入是配置驱动的，通常不需要改 Python 代码，重点是配置 `AI_ENABLE_MCP` 和 `AI_MCP_SERVERS_JSON`。
+MCP 的接入是配置驱动的，通常不需要改 Python 代码。当前支持两种来源：
+
+- `.env` settings fallback：适合本地快速验证
+- 数据库配置控制面：适合运行期管理、后台维护和灰度治理
+
+无论哪种来源，都必须设置：
+
+```env
+AI_ENABLE_MCP=true
+```
+
+#### 方式 0：通过数据库控制面接入 MCP
+
+创建一个 stdio MCP server：
+
+```bash
+curl -X POST 'http://127.0.0.1:8000/api/v1/ai-config/mcp-servers' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "server_key": "chrome-devtools",
+    "name": "Chrome DevTools MCP",
+    "transport": "stdio",
+    "command": "/usr/local/bin/npx",
+    "args_json": ["-y", "chrome-devtools-mcp@latest", "--no-usage-statistics"],
+    "tool_prefix": "chrome",
+    "enabled": true,
+    "auto_route_enabled": true,
+    "route_keywords_json": ["chrome", "浏览器", "页面", "devtools"],
+    "timeout_seconds": 30,
+    "read_timeout_seconds": 300,
+    "max_retries": 1
+  }'
+```
+
+绑定到 Agent：
+
+```bash
+curl -X PUT 'http://127.0.0.1:8000/api/v1/ai-config/agents/yyx-agent/mcp-bindings' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "bindings": [
+      {
+        "server_key": "chrome-devtools",
+        "enabled": true,
+        "required_approval": false,
+        "allow_auto_route": true
+      }
+    ]
+  }'
+```
+
+显式测试：
+
+```bash
+curl -X POST 'http://127.0.0.1:8000/api/v1/agents/chat' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "agent_id": "yyx-agent",
+    "message": "请使用 Chrome DevTools MCP 检查当前浏览器页面信息",
+    "session_id": "mcp-chrome-test-001",
+    "mcp_servers": ["chrome-devtools"]
+  }'
+```
+
+自动路由测试：
+
+```bash
+curl -X POST 'http://127.0.0.1:8000/api/v1/agents/chat' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "agent_id": "yyx-agent",
+    "message": "请使用 Chrome DevTools MCP 检查当前浏览器页面信息",
+    "session_id": "mcp-chrome-test-002"
+  }'
+```
+
+成功时至少应看到：
+
+```json
+{
+  "data": {
+    "meta": {
+      "config_source": "database",
+      "mcp_servers": ["chrome-devtools"]
+    }
+  }
+}
+```
+
+数据库控制面下，自动路由只会在 Agent 已绑定且 `allow_auto_route=true` 的 MCP 范围内发生。
 
 #### 方式 1：接入本地命令型 MCP
 
@@ -415,6 +608,12 @@ AI_MCP_SERVERS_JSON={"mcpServers":{"my-maps":{"transport":"streamable-http","url
 - 什么都不传，只让消息命中 `route_keywords`
 
 如果你要接入多个第三方 MCP，只需要在 `mcpServers` 下继续并列定义多个 server。
+
+注意：
+
+- 不建议在 MCP command 中使用 `sudo`，服务进程通常无法交互式输入密码。
+- `npx` 类 stdio MCP 建议使用绝对路径，例如 `/usr/local/bin/npx`。
+- 如果曾用 `sudo npx` 导致 npm cache 权限异常，可先修复 `~/.npm` 所有权。
 
 ### 三、接入你自己的 skills
 
@@ -1001,7 +1200,8 @@ app.state.ai_runner = runner
 
 在当前实现里，可以把 MCP 的职责边界理解为：
 
-- `AI_MCP_SERVERS_JSON`：定义系统级“可用 MCP 能力池”
+- `AI_MCP_SERVERS_JSON`：settings fallback 下定义系统级“可用 MCP 能力池”
+- `ai_mcp_server` / `ai_agent_mcp_binding`：数据库控制面下定义 MCP 配置和 Agent allowlist
 - `mcp_servers` 或自动路由：决定当前这轮 run “向模型开放哪些 MCP”
 - 模型 tool call：在本轮已开放的工具范围内，自主决定是否调用
 
@@ -1068,7 +1268,7 @@ app.state.ai_runner = runner
 1. 请求显式传了 `mcp_servers`
    当前 run 直接使用显式值，不做自动推断
 2. 请求未显式传 `mcp_servers`
-   `MCPManager` 会遍历已注册 server 的 `route_keywords`，根据用户消息做关键词匹配
+   settings fallback 路径下，`MCPManager` 会遍历已注册 server 的 `route_keywords`；数据库控制面路径下，`AICapabilityResolver` 会在当前 Agent 已绑定 MCP 范围内匹配 `route_keywords_json/server_key/tool_prefix`
 
 例如：
 
@@ -1096,6 +1296,8 @@ AI_MCP_SERVERS_JSON={"mcpServers":{"maps":{"transport":"streamable-http","url":"
 - 在 `/chat/resume` 需要续跑时，调用方可以明确回传同一组 `mcp_servers`
 
 当本轮是通过自动路由命中 MCP 时，这里回显的仍然是最终实际装配的 server ID，因此前端可以据此判断当前回答是否使用了自动装配的外部能力。
+
+数据库控制面路径下，自动路由不会读取 settings 的全局 MCP 池，也不会允许未绑定到 Agent 的 MCP 被挂载。
 
 ### 3.5 本地 mock MCP server 联调
 
