@@ -449,26 +449,36 @@ app/
 
 任务：
 
-- 新增 `ApprovalStore`
-- approval_required 时服务端保存：
+- [x] 新增 `ApprovalStore`
+- [x] approval_required 时服务端保存：
   - message history
   - tool calls
-  - args hash
   - user/tenant/session/request/run
   - 过期时间
-- 响应只返回 `approval_id`、待审批工具摘要、过期时间
-- `/chat/resume` 改为通过 `approval_id` 续跑
-- 审批时校验：
+- [x] 响应返回 `approval_id`、待审批工具摘要、过期时间和状态
+- [x] `/chat/resume` 支持通过 `approval_id` 续跑，并保留旧版 `message_history_json` 兼容
+- [x] 审批时校验：
   - 审批状态
   - 过期时间
   - 审批人权限
   - tool_call_id 是否匹配
+- [ ] 增加 args hash 校验
+- [ ] 增加审批单查询/撤销接口
+- [ ] 将审批生命周期事件持久化到审计日志
 
 验收：
 
-- 旧协议可临时保留兼容，但新协议优先
-- 客户端无法篡改 message history 影响 resume
-- approval 状态可查询、可过期、可审计
+- [x] 旧协议可临时保留兼容，但新协议优先
+- [x] 客户端无法通过新协议篡改 message history 影响 resume
+- [x] approval 可过期，完成后不可重复续跑
+- [ ] approval 状态可查询、可撤销、可审计
+
+当前状态：
+
+- 已完成 Redis 优先、内存 fallback 的 `ApprovalStore`
+- `/chat` 和 `/chat/stream` 进入 `approval_required` 时会创建服务端审批单
+- `/chat/resume` 可只传 `approval_id + approvals` 续跑，不再要求客户端回传完整 `message_history_json`
+- 已补充服务端审批单续跑、重复续跑拒绝、未知 `tool_call_id` 拒绝和流式审批事件测试
 
 ### Phase 6：History Manager
 

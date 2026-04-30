@@ -41,6 +41,7 @@ from app.ai.mcp import (
     ManagedMCPServerStdioConfig,
     ManagedMCPServerStreamableHTTPConfig,
 )
+from app.ai.runtime.approvals import ApprovalRecord, ApprovalStore
 from app.ai.runtime.history import SessionHistoryStore
 from app.ai.runtime.manager import AgentManager
 from app.ai.runtime.resolved_config import ResolvedMCPServerConfig, ResolvedModelConfig, ResolvedRunConfig
@@ -71,6 +72,7 @@ class AgentRunner:
             http_client: httpx.AsyncClient,
             tool_audit: ToolAuditService,
             history_store: SessionHistoryStore,
+            approval_store: ApprovalStore,
             mcp_manager: MCPManager | None,
             skill_registry: SkillRegistry | None,
             skill_resolver: SkillResolver | None,
@@ -81,6 +83,7 @@ class AgentRunner:
         self.http_client = http_client
         self.tool_audit = tool_audit
         self.history_store = history_store
+        self.approval_store = approval_store
         self.mcp_manager = mcp_manager
         self.skill_registry = skill_registry
         self.skill_resolver = skill_resolver
@@ -152,7 +155,7 @@ class AgentRunner:
             raise
         except Exception as exc:
             raise AIRunExecutionError("chat run 执行失败") from exc
-        return self._build_chat_response(
+        response = self._build_chat_response(
             result=result,
             request_id=request_context.request_id,
             session_id=session_id,
@@ -165,6 +168,8 @@ class AgentRunner:
             skills=skill_resolution.skill_names,
             run_config=run_config,
         )
+        await self._attach_approval_record(response, request_context)
+        return response
 
     async def run_chat_stream(
             self,
@@ -242,6 +247,7 @@ class AgentRunner:
                         instructions=skill_resolution.instructions,
                         skills=skill_resolution.skill_names,
                         run_config=run_config,
+                        user_id=request_context.user_id,
                 ):
                     yield event
                 return
@@ -283,6 +289,7 @@ class AgentRunner:
                         instructions=skill_resolution.instructions,
                         skills=skill_resolution.skill_names,
                         run_config=run_config,
+                        user_id=request_context.user_id,
                 ):
                     yield event
                 return
@@ -367,6 +374,7 @@ class AgentRunner:
                         run_config=run_config,
                     )
                     response.meta.stream_mode = "native"
+                    await self._attach_approval_record(response, request_context)
 
                     if response.status == "approval_required":
                         payload = response.model_dump(mode="json")
@@ -400,8 +408,9 @@ class AgentRunner:
             self,
             *,
             request_context: RequestContext,
-            message_history_json: str,
+            message_history_json: str | None,
             approvals: list[AgentApprovalDecision],
+            approval_id: str | None = None,
             agent_id: str | None = None,
             session_id: str | None = None,
             model_name: str | None = None,
@@ -411,13 +420,26 @@ class AgentRunner:
     ) -> AgentChatResponse:
         """基于上一轮 deferred tool requests 继续执行一次 run。
 
-        当前 `resume` 仍采用无状态协议：
-        - 前端回传 `message_history_json`
+        当前 `resume` 支持两种协议：
+        - 新协议：前端回传 `approval_id`
+        - 旧协议：前端回传 `message_history_json`
         - runner 负责把审批结果组装成 `DeferredToolResults`
         - run 完成后，如果带了 `session_id`，也会把新历史写回会话存储
         """
 
-        message_history = ModelMessagesTypeAdapter.validate_json(message_history_json)
+        approval_record = await self._load_approval_record_for_resume(
+            approval_id=approval_id,
+            agent_id=agent_id,
+            session_id=session_id,
+            user_id=request_context.user_id,
+        )
+        resolved_message_history_json = (
+            approval_record.message_history_json if approval_record is not None else message_history_json
+        )
+        if not resolved_message_history_json:
+            raise AIConfigValidationError("resume 需要 approval_id 或 message_history_json")
+        self._validate_approval_decisions(approvals=approvals, approval_record=approval_record)
+        message_history = ModelMessagesTypeAdapter.validate_json(resolved_message_history_json)
         latest_user_message = self._extract_latest_user_message(message_history)
         run_config = await self._resolve_run_config(
             agent_id=agent_id,
@@ -456,7 +478,7 @@ class AgentRunner:
             raise
         except Exception as exc:
             raise AIRunExecutionError("resume run 执行失败") from exc
-        return self._build_chat_response(
+        response = self._build_chat_response(
             result=result,
             request_id=request_context.request_id,
             session_id=session_id,
@@ -469,6 +491,10 @@ class AgentRunner:
             skills=skill_resolution.skill_names,
             run_config=run_config,
         )
+        if approval_record is not None:
+            await self.approval_store.mark_completed(approval_record.approval_id)
+        await self._attach_approval_record(response, request_context)
+        return response
 
     async def _resolve_run_config(
             self,
@@ -795,6 +821,7 @@ class AgentRunner:
             instructions: tuple[str, ...],
             skills: list[str],
             run_config: ResolvedRunConfig | None = None,
+            user_id: str | None = None,
     ) -> AsyncIterator[str]:
         """当模型不支持真正的 streamed request 时，退化成单次 run 再包装成 SSE。"""
 
@@ -838,6 +865,10 @@ class AgentRunner:
             run_config=run_config,
         )
         response.meta.stream_mode = stream_mode
+        await self._attach_approval_record(
+            response,
+            RequestContext(request_id=request_id, user_id=user_id, session_id=session_id),
+        )
         yield self._sse_event(
             "start",
             {
@@ -904,6 +935,68 @@ class AgentRunner:
             calls=calls,
             message_history_json=result.all_messages_json().decode(),
         )
+
+    async def _attach_approval_record(
+        self,
+        response: AgentChatResponse,
+        request_context: RequestContext,
+    ) -> None:
+        payload = response.deferred_tool_requests
+        if response.status != "approval_required" or payload is None:
+            return
+
+        record = await self.approval_store.create(
+            run_id=response.run_id,
+            agent_id=response.agent_id,
+            request_id=request_context.request_id,
+            session_id=response.session_id or request_context.session_id,
+            user_id=request_context.user_id,
+            message_history_json=payload.message_history_json,
+            approval_tool_call_ids=[item.tool_call_id for item in payload.approvals],
+            call_tool_call_ids=[item.tool_call_id for item in payload.calls],
+            metadata={
+                "model": response.model,
+                "mcp_servers": response.meta.mcp_servers,
+                "skills": response.meta.skills,
+                "config_source": response.meta.config_source,
+            },
+        )
+        payload.approval_id = record.approval_id
+        payload.expires_at = record.expires_at
+        payload.status = record.status
+
+    async def _load_approval_record_for_resume(
+        self,
+        *,
+        approval_id: str | None,
+        agent_id: str | None,
+        session_id: str | None,
+        user_id: str | None,
+    ) -> ApprovalRecord | None:
+        if not approval_id:
+            return None
+        return await self.approval_store.get_pending(
+            approval_id,
+            agent_id=agent_id,
+            session_id=session_id,
+            user_id=user_id,
+        )
+
+    @staticmethod
+    def _validate_approval_decisions(
+        *,
+        approvals: list[AgentApprovalDecision],
+        approval_record: ApprovalRecord | None,
+    ) -> None:
+        if approval_record is None:
+            return
+        valid_tool_call_ids = set(approval_record.approval_tool_call_ids)
+        submitted_tool_call_ids = {item.tool_call_id for item in approvals}
+        unknown_tool_call_ids = submitted_tool_call_ids - valid_tool_call_ids
+        if unknown_tool_call_ids:
+            raise AIConfigValidationError(
+                f"审批结果包含未知 tool_call_id: {', '.join(sorted(unknown_tool_call_ids))}"
+            )
 
     @staticmethod
     def _build_deferred_tool_results(approvals: list[AgentApprovalDecision]) -> DeferredToolResults:

@@ -26,12 +26,13 @@
 - 已支持 DB Agent 配置复用默认 runtime builder，允许类似 `yyx-agent` 这样的业务 Agent 配置在没有同名静态 builder 时运行。
 - 已在响应 `meta` 返回 `config_source`、`model_key`、`provider_key`、`config_version`，便于调试和治理。
 - 已完成 DB 控制面异常 4xx/502 映射，模型/MCP/Skill 配置类错误不再统一返回 500。
-- 当前自动化测试基线：`46 passed`。
+- 已完成服务端 `ApprovalStore` 基线，`/chat` 和 `/chat/stream` 可返回 `approval_id`，`/chat/resume` 可通过 `approval_id + approvals` 续跑，并保留旧协议兼容。
+- 当前自动化测试基线：`48 passed`。
 
 当前待补：
 
 - 配置管理接口已有基础能力，但还需要补鉴权策略、审计日志持久化和更完整的 secret/KMS 方案。
-- Approval Store 仍是下一阶段重点，需要替换当前客户端回传完整 `message_history_json` 的无状态 resume 协议。
+- Approval Store 后续还需要补审批单查询/撤销接口、args hash 校验和审批生命周期审计。
 
 ---
 
@@ -48,7 +49,7 @@
 
 - Streaming SSE 路径的错误事件协议还需要进一步标准化
 - 配置管理接口还缺少正式鉴权、审计日志持久化和操作人维度
-- Approval 仍是无状态 `message_history_json` 回传协议，后续应改为服务端 Approval Store
+- Approval 已支持服务端 `approval_id` 续跑，但审批单查询、撤销和审计仍需补齐
 - History 还缺少 tenant/user/agent 维度隔离、裁剪和摘要能力
 - Observability 还需要 run/tool/model 级事件持久化、usage/cost 聚合和脱敏策略
 
@@ -427,9 +428,9 @@ Runner 负责：
 
 当前实现说明：
 
-- 当前已落地无状态 `resume` 协议
-- 前端需要回传 `message_history_json + approvals`
-- 后续如要升级为审批中心，再考虑引入 `run_id` 级状态持久化
+- 当前已支持服务端 `approval_id + approvals` 续跑协议
+- 旧版 `message_history_json + approvals` 暂时保留兼容
+- 后续需要补审批单查询、撤销、args hash 校验和生命周期审计
 
 ### 4. `GET /api/v1/agents`
 
@@ -673,6 +674,7 @@ AI_MCP_SERVERS_JSON={}
 - [x] 增加 `chat/stream` SSE 接口
 - [x] 引入 `DeferredToolRequests` / `DeferredToolResults`
 - [x] 实现无状态 `chat/resume` 协议
+- [x] 实现服务端 `ApprovalStore` 基线和 `approval_id` 续跑协议
 - [x] 对敏感工具启用审批流程
 - [ ] 如有前端工具调用需求，评估 `ExternalToolset`
 - [x] 增加 approval 端到端测试
@@ -682,9 +684,9 @@ AI_MCP_SERVERS_JSON={}
 
 - approval 最小闭环已完成
 - SSE stream 接口已完成，并已补齐工具执行与审批前置信号
-- 当前仍是无状态 `resume`，由前端回传 `message_history_json`
+- 当前优先使用服务端 `approval_id` 续跑，客户端不再需要回传完整 `message_history_json`
 - 本阶段目标已经完成
-- 后续如果要升级为平台级审批能力，还需要审批单持久化、状态管理和更完整的平台级事件协议
+- 后续如果要升级为平台级审批能力，还需要审批单查询/撤销、状态管理、审计持久化和更完整的平台级事件协议
 
 验收标准：
 
@@ -736,8 +738,8 @@ AI_MCP_SERVERS_JSON={}
 
 后续建议按这个顺序继续推进：
 
-1. 服务端 Approval Store
-2. History Manager
+1. History Manager
+2. Approval Store 查询/撤销与审计持久化
 3. `Phase 7` Observability / Guardrails / Tests
 4. `Phase 8` 业务 Agent 落地
 

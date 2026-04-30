@@ -1,3 +1,4 @@
+from datetime import datetime
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field
@@ -30,6 +31,9 @@ class AgentDeferredToolRequestsPayload(BaseModel):
     approvals: list[AgentApprovalRequest] = Field(default_factory=list, description="待人工审批的工具调用")
     calls: list[AgentApprovalRequest] = Field(default_factory=list, description="待外部执行的工具调用")
     message_history_json: str = Field(description="续跑所需的 message_history JSON")
+    approval_id: str | None = Field(default=None, description="服务端审批单 ID，推荐续跑时优先使用")
+    expires_at: datetime | None = Field(default=None, description="审批单过期时间")
+    status: Literal["pending", "completed", "expired"] | None = Field(default=None, description="审批单状态")
 
 
 class AgentApprovalDecision(BaseModel):
@@ -50,7 +54,8 @@ class AgentChatResumeRequest(BaseModel):
     skill_ids: list[str] = Field(default_factory=list, description="本轮继续启用的 skill ID 列表")
     skill_tags: list[str] = Field(default_factory=list, description="本轮继续按标签筛选的 skill 条件")
     mcp_servers: list[str] = Field(default_factory=list, description="本轮需要继续挂载的 MCP server ID 列表")
-    message_history_json: str = Field(min_length=1, description="上一次 run 返回的完整 message_history JSON")
+    approval_id: str | None = Field(default=None, min_length=1, description="服务端审批单 ID；传入后无需回传 message_history_json")
+    message_history_json: str | None = Field(default=None, min_length=1, description="上一次 run 返回的完整 message_history JSON；兼容旧协议")
     approvals: list[AgentApprovalDecision] = Field(default_factory=list, description="人工审批结果列表")
 
 

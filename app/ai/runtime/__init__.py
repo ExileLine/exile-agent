@@ -23,6 +23,7 @@ async def init_ai_runtime(app: FastAPI, project_config: BaseConfig) -> None:
     """
     from app.ai.agents import register_default_agents
     from app.ai.mcp import MCPManager, load_mcp_server_configs
+    from app.ai.runtime.approvals import ApprovalStore
     from app.ai.runtime.history import SessionHistoryStore
     from app.ai.runtime.manager import AgentManager
     from app.ai.runtime.registry import AgentRegistry
@@ -49,12 +50,17 @@ async def init_ai_runtime(app: FastAPI, project_config: BaseConfig) -> None:
         redis=redis_client.redis_pool,
         ttl_seconds=settings.history_ttl_seconds,
     )
+    approval_store = ApprovalStore(
+        redis=redis_client.redis_pool,
+        ttl_seconds=settings.history_ttl_seconds or 1800,
+    )
     runner = AgentRunner(
         settings=settings,
         agent_manager=manager,
         http_client=http_client,
         tool_audit=tool_audit,
         history_store=history_store,
+        approval_store=approval_store,
         mcp_manager=mcp_manager,
         skill_registry=skill_registry,
         skill_resolver=skill_resolver,
@@ -71,6 +77,7 @@ async def init_ai_runtime(app: FastAPI, project_config: BaseConfig) -> None:
     app.state.ai_mcp_manager = mcp_manager
     app.state.ai_tool_audit = tool_audit
     app.state.ai_history_store = history_store
+    app.state.ai_approval_store = approval_store
     app.state.ai_runner = runner
 
 
@@ -95,6 +102,7 @@ async def shutdown_ai_runtime(app: FastAPI) -> None:
         "ai_mcp_manager",
         "ai_tool_audit",
         "ai_history_store",
+        "ai_approval_store",
         "ai_runner",
     ):
         if hasattr(app.state, attr):

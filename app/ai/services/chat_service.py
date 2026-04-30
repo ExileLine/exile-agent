@@ -71,6 +71,7 @@ class ChatService:
             request_context=request_context,
             message_history_json=payload.message_history_json,
             approvals=payload.approvals,
+            approval_id=payload.approval_id,
             agent_id=payload.agent_id,
             session_id=payload.session_id,
             model_name=payload.model,

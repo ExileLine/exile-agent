@@ -598,6 +598,9 @@ def test_chat_approval_resume_flow() -> None:
             assert deferred["approvals"][0]["tool_name"] == "delete_demo_resource"
             tool_call_id = deferred["approvals"][0]["tool_call_id"]
             message_history_json = deferred["message_history_json"]
+            assert deferred["approval_id"]
+            assert deferred["expires_at"]
+            assert deferred["status"] == "pending"
 
             resume_response = client.post(
                 "/api/v1/agents/chat/resume",
@@ -616,6 +619,128 @@ def test_chat_approval_resume_flow() -> None:
     assert resume_body["data"]["message"] == "审批后已执行: deleted"
     assert resume_body["data"]["deferred_tool_requests"] is None
     assert resume_body["data"]["meta"]["run_kind"] == "resume"
+
+
+def test_chat_approval_resume_flow_with_server_approval_id() -> None:
+    def approval_model(messages: list[ModelRequest | ModelResponse], info: AgentInfo) -> ModelResponse:
+        del info
+        for message in messages:
+            if isinstance(message, ModelRequest):
+                for part in message.parts:
+                    if isinstance(part, ToolReturnPart) and part.tool_name == "delete_demo_resource":
+                        return ModelResponse(parts=[TextPart(content="approval_id resume executed")])
+
+        return ModelResponse(parts=[ToolCallPart(tool_name="delete_demo_resource", args={})])
+
+    with TestClient(app) as client:
+        registry = client.app.state.ai_agent_registry
+        manager = client.app.state.ai_agent_manager
+        registry.register(
+            AgentManifest(
+                agent_id="approval-server-store-agent",
+                name="Approval Server Store Agent",
+                description="Agent used to test approval store resume flow.",
+                default_model="test",
+            ),
+            _build_approval_demo_agent,
+        )
+
+        agent = manager.get_agent("approval-server-store-agent")
+        with agent.override(model=FunctionModel(approval_model)):
+            first_response = client.post(
+                "/api/v1/agents/chat",
+                json={
+                    "agent_id": "approval-server-store-agent",
+                    "message": "请删除演示资源",
+                    "session_id": "approval-server-store",
+                },
+                headers={"x-user-id": "tester"},
+            )
+
+            assert first_response.status_code == 200
+            deferred = first_response.json()["data"]["deferred_tool_requests"]
+            approval_id = deferred["approval_id"]
+            tool_call_id = deferred["approvals"][0]["tool_call_id"]
+
+            resume_response = client.post(
+                "/api/v1/agents/chat/resume",
+                json={
+                    "agent_id": "approval-server-store-agent",
+                    "session_id": "approval-server-store",
+                    "approval_id": approval_id,
+                    "approvals": [{"tool_call_id": tool_call_id, "approved": True}],
+                },
+                headers={"x-user-id": "tester"},
+            )
+            duplicate_response = client.post(
+                "/api/v1/agents/chat/resume",
+                json={
+                    "agent_id": "approval-server-store-agent",
+                    "session_id": "approval-server-store",
+                    "approval_id": approval_id,
+                    "approvals": [{"tool_call_id": tool_call_id, "approved": True}],
+                },
+                headers={"x-user-id": "tester"},
+            )
+
+    assert resume_response.status_code == 200
+    resume_body = resume_response.json()
+    assert resume_body["code"] == 200
+    assert resume_body["data"]["status"] == "completed"
+    assert resume_body["data"]["message"] == "approval_id resume executed"
+    assert resume_body["data"]["meta"]["run_kind"] == "resume"
+
+    assert duplicate_response.status_code == 400
+    duplicate_body = duplicate_response.json()
+    assert duplicate_body["code"] == 10005
+    assert "审批单状态不可续跑" in duplicate_body["message"]
+
+
+def test_chat_approval_resume_rejects_unknown_tool_call_id() -> None:
+    def approval_model(messages: list[ModelRequest | ModelResponse], info: AgentInfo) -> ModelResponse:
+        del messages, info
+        return ModelResponse(parts=[ToolCallPart(tool_name="delete_demo_resource", args={})])
+
+    with TestClient(app) as client:
+        registry = client.app.state.ai_agent_registry
+        manager = client.app.state.ai_agent_manager
+        registry.register(
+            AgentManifest(
+                agent_id="approval-unknown-tool-agent",
+                name="Approval Unknown Tool Agent",
+                description="Agent used to test approval decision validation.",
+                default_model="test",
+            ),
+            _build_approval_demo_agent,
+        )
+
+        agent = manager.get_agent("approval-unknown-tool-agent")
+        with agent.override(model=FunctionModel(approval_model)):
+            first_response = client.post(
+                "/api/v1/agents/chat",
+                json={
+                    "agent_id": "approval-unknown-tool-agent",
+                    "message": "请删除演示资源",
+                },
+                headers={"x-user-id": "tester"},
+            )
+
+            assert first_response.status_code == 200
+            approval_id = first_response.json()["data"]["deferred_tool_requests"]["approval_id"]
+            resume_response = client.post(
+                "/api/v1/agents/chat/resume",
+                json={
+                    "agent_id": "approval-unknown-tool-agent",
+                    "approval_id": approval_id,
+                    "approvals": [{"tool_call_id": "unknown-call-id", "approved": True}],
+                },
+                headers={"x-user-id": "tester"},
+            )
+
+    assert resume_response.status_code == 400
+    body = resume_response.json()
+    assert body["code"] == 10005
+    assert "审批结果包含未知 tool_call_id" in body["message"]
 
 
 def test_chat_stream_approval_flow() -> None:
@@ -656,10 +781,14 @@ def test_chat_stream_approval_flow() -> None:
     approval_pending_event = next(payload for event, payload in events if event == "approval_pending")
     assert approval_pending_event["status"] == "approval_required"
     assert approval_pending_event["deferred_tool_requests"]["approvals"][0]["tool_name"] == "delete_demo_resource"
+    assert approval_pending_event["deferred_tool_requests"]["approval_id"]
+    assert approval_pending_event["deferred_tool_requests"]["status"] == "pending"
     approval_event = next(payload for event, payload in events if event == "approval_required")
     assert approval_event["status"] == "approval_required"
     assert approval_event["message"] is None
     assert approval_event["deferred_tool_requests"]["approvals"][0]["tool_name"] == "delete_demo_resource"
+    assert approval_event["deferred_tool_requests"]["approval_id"]
+    assert approval_event["deferred_tool_requests"]["status"] == "pending"
     assert approval_event["meta"]["run_kind"] == "stream"
 
 
