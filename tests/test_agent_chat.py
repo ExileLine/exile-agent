@@ -267,6 +267,132 @@ def test_agent_chat_session_history_roundtrip() -> None:
     assert second_body["data"]["meta"]["history_saved"] is True
 
 
+def test_agent_chat_session_history_is_scoped_by_user() -> None:
+    def history_model(messages: list[ModelRequest | ModelResponse], info: AgentInfo) -> ModelResponse:
+        del info
+        request_texts: list[str] = []
+        for message in messages:
+            if not isinstance(message, ModelRequest):
+                continue
+            for part in message.parts:
+                content = getattr(part, "content", None)
+                if isinstance(content, str):
+                    request_texts.append(content)
+
+        latest_prompt = request_texts[-1] if request_texts else ""
+        if latest_prompt == "第二次提问":
+            if "第一次提问" in request_texts[:-1]:
+                return ModelResponse(parts=[TextPart(content="已读取到当前用户历史")])
+            return ModelResponse(parts=[TextPart(content="未读取到当前用户历史")])
+
+        return ModelResponse(parts=[TextPart(content="首次消息已记录")])
+
+    session_id = "sess-history-user-scope"
+    with TestClient(app) as client:
+        history_store = client.app.state.ai_history_store
+        asyncio.run(
+            history_store.delete_messages(
+                session_id,
+                request_context=RequestContext(request_id="cleanup", user_id="user-a"),
+                agent_id="chat-agent",
+            )
+        )
+        asyncio.run(
+            history_store.delete_messages(
+                session_id,
+                request_context=RequestContext(request_id="cleanup", user_id="user-b"),
+                agent_id="chat-agent",
+            )
+        )
+        agent = client.app.state.ai_agent_manager.get_agent("chat-agent")
+        with agent.override(model=FunctionModel(history_model)):
+            first_user_response = client.post(
+                "/api/v1/agents/chat",
+                json={"message": "第一次提问", "session_id": session_id},
+                headers={"x-user-id": "user-a"},
+            )
+            second_user_response = client.post(
+                "/api/v1/agents/chat",
+                json={"message": "第二次提问", "session_id": session_id},
+                headers={"x-user-id": "user-b"},
+            )
+            first_user_followup_response = client.post(
+                "/api/v1/agents/chat",
+                json={"message": "第二次提问", "session_id": session_id},
+                headers={"x-user-id": "user-a"},
+            )
+
+    assert first_user_response.status_code == 200
+    assert first_user_response.json()["data"]["message"] == "首次消息已记录"
+    assert second_user_response.status_code == 200
+    assert second_user_response.json()["data"]["message"] == "未读取到当前用户历史"
+    assert first_user_followup_response.status_code == 200
+    assert first_user_followup_response.json()["data"]["message"] == "已读取到当前用户历史"
+
+
+def test_session_history_store_saves_metadata_and_trims_messages() -> None:
+    session_id = "sess-history-metadata"
+    with TestClient(app) as client:
+        history_store = client.app.state.ai_history_store
+        original_max_messages = history_store.max_messages
+        history_store.max_messages = 2
+        request_context = RequestContext(
+            request_id="history-meta",
+            user_id="tester",
+            tenant_id="tenant-a",
+            session_id=session_id,
+        )
+        asyncio.run(
+            history_store.delete_messages(
+                session_id,
+                request_context=request_context,
+                agent_id="chat-agent",
+            )
+        )
+        agent = client.app.state.ai_agent_manager.get_agent("chat-agent")
+        try:
+            with agent.override(model=TestModel(custom_output_text="metadata ready")):
+                client.post(
+                    "/api/v1/agents/chat",
+                    json={"message": "第一次提问", "session_id": session_id},
+                    headers={"x-user-id": "tester", "x-tenant-id": "tenant-a"},
+                )
+                response = client.post(
+                    "/api/v1/agents/chat",
+                    json={"message": "第二次提问", "session_id": session_id},
+                    headers={"x-user-id": "tester", "x-tenant-id": "tenant-a"},
+                )
+
+            record = asyncio.run(
+                history_store.load_record(
+                    session_id,
+                    request_context=request_context,
+                    agent_id="chat-agent",
+                )
+            )
+        finally:
+            history_store.max_messages = original_max_messages
+            asyncio.run(
+                history_store.delete_messages(
+                    session_id,
+                    request_context=request_context,
+                    agent_id="chat-agent",
+                )
+            )
+
+    assert response.status_code == 200
+    assert record is not None
+    assert len(record.messages) == 2
+    assert record.metadata.message_count == 2
+    assert record.metadata.agent_id == "chat-agent"
+    assert record.metadata.user_id == "tester"
+    assert record.metadata.tenant_id == "tenant-a"
+    assert record.metadata.model
+    assert record.metadata.skills == []
+    assert record.metadata.mcp_servers == []
+    assert record.metadata.updated_at >= record.metadata.created_at
+
+
 def test_agent_chat_stream_endpoint() -> None:
     with TestClient(app) as client:
         expected_model_key = client.app.state.ai_settings.default_model

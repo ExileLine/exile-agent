@@ -24,6 +24,7 @@ class RequestContext:
     """
     request_id: str
     user_id: str | None = None
+    tenant_id: str | None = None
     session_id: str | None = None
 
 

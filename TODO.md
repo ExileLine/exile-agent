@@ -27,7 +27,8 @@
 - 已在响应 `meta` 返回 `config_source`、`model_key`、`provider_key`、`config_version`，便于调试和治理。
 - 已完成 DB 控制面异常 4xx/502 映射，模型/MCP/Skill 配置类错误不再统一返回 500。
 - 已完成服务端 `ApprovalStore` 基线，`/chat` 和 `/chat/stream` 可返回 `approval_id`，`/chat/resume` 可通过 `approval_id + approvals` 续跑，并保留旧协议兼容。
-- 当前自动化测试基线：`48 passed`。
+- 已完成 History Manager 基线，支持 `tenant/user/agent/session` 历史隔离、metadata 保存和最大 message 数裁剪。
+- 当前自动化测试基线：`50 passed`。
 
 当前待补：
 
@@ -50,7 +51,7 @@
 - Streaming SSE 路径的错误事件协议还需要进一步标准化
 - 配置管理接口还缺少正式鉴权、审计日志持久化和操作人维度
 - Approval 已支持服务端 `approval_id` 续跑，但审批单查询、撤销和审计仍需补齐
-- History 还缺少 tenant/user/agent 维度隔离、裁剪和摘要能力
+- History 已支持 tenant/user/agent 维度隔离和 message 数裁剪，后续还需要 token 预算与摘要压缩
 - Observability 还需要 run/tool/model 级事件持久化、usage/cost 聚合和脱敏策略
 
 因此，当前重点已从“搭骨架”转向“治理、安全、可观测和协议稳定化”。
@@ -593,17 +594,19 @@ AI_MCP_SERVERS_JSON={}
 - [x] 抽象最小 `run_stream`
 - [x] 统一基础 run metadata、usage、error handling
 - [x] 支持历史加载与保存
+- [x] 支持 tenant/user/agent/session 维度 history key 隔离
+- [x] 支持 history metadata 与最大 message 数裁剪
 - [x] 为历史存储增加测试
 
 当前阶段说明：
 
 - `Runner` 已成为普通运行与审批续跑的统一入口
-- 基础 `session_id` 历史读写已经接通
+- 基础 `session_id` 历史读写已经接通，并已升级为按 tenant/user/agent/session 隔离
 - 已具备基础 `SSE run_stream`
 - 已支持 `tool_call` / `tool_result` / `approval_pending` 等关键流式事件
 - 已具备统一基础 run metadata / error handling
 - 当前这轮最小运行时增强已经完成
-- 后续增强点主要集中在历史裁剪/摘要与更完整的平台级流式协议
+- 后续增强点主要集中在 token 预算、摘要压缩与更完整的平台级流式协议
 
 验收标准：
 
@@ -738,7 +741,7 @@ AI_MCP_SERVERS_JSON={}
 
 后续建议按这个顺序继续推进：
 
-1. History Manager
+1. History token 预算与摘要压缩
 2. Approval Store 查询/撤销与审计持久化
 3. `Phase 7` Observability / Guardrails / Tests
 4. `Phase 8` 业务 Agent 落地

@@ -20,6 +20,7 @@
 - `Phase 6` Approval / Streaming 最小闭环
 - 配置控制面：模型供应商、模型、Agent、MCP、Agent-MCP binding、Resolver 和 Runner 主链路接入
 - 服务端 Approval Store：`approval_id` 续跑、过期校验、重复续跑拒绝、旧协议兼容
+- History Manager：tenant/user/agent/session 隔离、metadata 保存、最大 message 数裁剪
 
 本文档的目标是让开发者可以快速理解这套工程能做什么、如何启动、如何调用，以及后续应该从哪里继续扩展。
 
@@ -30,7 +31,8 @@
 - 启动时自动初始化 AI runtime，并挂载到 `FastAPI app.state`
 - 默认注册一个可直接使用的 `chat-agent`
 - 提供 `/api/v1/agents/chat`、`/chat/stream`、`/chat/resume`、`/agents`、`/agents/skills`
-- 支持基于 `session_id` 的基础多轮对话历史
+- 支持基于 `tenant_id / user_id / agent_id / session_id` 隔离的多轮对话历史
+- 支持 history metadata 保存和 `AI_HISTORY_MAX_MESSAGES` 最大消息数裁剪
 - 支持 builtin toolsets、tool metadata、tool audit、approval policy wrapper
 - 支持 MCP 配置驱动接入、显式挂载与自动路由
 - 支持 filesystem skills、自动命中、渐进式注入与依赖能力挂载
@@ -47,7 +49,7 @@
 
 - 真实第三方 MCP 的生产级认证、限流、稳定性治理与业务工具落地
 - 更完整的平台级流式协议
-- 历史摘要压缩 / 裁剪
+- 历史 token 预算与摘要压缩
 - 更细粒度的 hooks / observability / guardrails
 - 配置管理接口鉴权、审计日志持久化和 KMS/Vault 级 secret 管理
 - Approval Store 的查询、撤销、args hash 校验和审批生命周期审计
@@ -3709,6 +3711,8 @@ endpoint 接协议
 - `/api/v1/agents/chat/stream` 可以输出文本、工具执行与审批前置信号的 SSE 事件流
 - `/api/v1/agents/chat/resume` 可以基于 `DeferredToolRequests` 继续执行
 - 同一个 `session_id` 的后续 `/chat` 可以读取上一轮 message history
+- 同名 `session_id` 已按 tenant/user/agent 维度隔离，避免不同用户或 Agent 串历史
+- history 保存时会记录 model、skills、MCP、usage、message_count、created_at、updated_at，并按 `AI_HISTORY_MAX_MESSAGES` 裁剪
 - 三条运行链都能返回统一的基础 run metadata
 - `AgentManager` 可以正确获取和缓存 Agent
 - `build_chat_agent()` 可以正确构造 Agent
@@ -3728,14 +3732,14 @@ endpoint 接协议
 - 单次 chat 调用
 - 基础 SSE 流式输出
 - 服务端 approval_id resume 基线
-- 基础 `session_id` 多轮恢复
+- 隔离后的 `session_id` 多轮恢复
 - 单 Agent
 - 少量基础工具
 
 还没覆盖：
 
 - thinking / request boundary / progress 这类更完整的 stream event pipeline
-- history 摘要压缩 / 裁剪 / processors
+- history token 预算 / 摘要压缩 / processors
 - MCP manager
 - Skills resolver
 

@@ -97,6 +97,7 @@ def get_builtin_request_toolset() -> FunctionToolset[AgentDeps]:
         return {
             "request_id": request.request_id,
             "user_id": request.user_id,
+            "tenant_id": request.tenant_id,
             "session_id": request.session_id,
         }
 

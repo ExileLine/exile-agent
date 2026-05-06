@@ -486,22 +486,31 @@ app/
 
 任务：
 
-- session key 加入 tenant/user/agent 维度
-- 保存 message metadata：
+- [x] session key 加入 tenant/user/agent 维度
+- [x] 保存 message metadata：
   - model
   - skills
   - MCP
   - token usage
   - created_at
-- 增加 token/message 数量上限
-- 增加历史裁剪策略
-- 预留摘要压缩接口
+- [x] 增加 message 数量上限
+- [x] 增加历史裁剪策略
+- [ ] 增加 token 数量上限
+- [ ] 预留摘要压缩接口
 
 验收：
 
-- 不同 user/tenant 的同名 session 不串线
-- 长会话不会无限增长
-- 历史裁剪有测试覆盖
+- [x] 不同 user/tenant 的同名 session 不串线
+- [x] 长会话不会无限增长
+- [x] 历史裁剪有测试覆盖
+- [ ] 摘要压缩有接口和测试覆盖
+
+当前状态：
+
+- 已支持 `AI_HISTORY_MAX_MESSAGES` 控制保存的最大 message 数
+- 已按 `tenant_id / user_id / agent_id / session_id` 生成隔离 history key
+- 已保存 history metadata，包括 model、skills、MCP、usage、message_count、created_at、updated_at
+- 已补充同名 session 用户隔离、metadata 写入和裁剪测试
 
 ### Phase 7：观测与成本
 

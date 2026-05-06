@@ -70,6 +70,7 @@ async def chat_with_agent(payload: AgentChatRequest, request: Request):
     request_context = RequestContext(
         request_id=getattr(request.state, "request_id", None) or request.headers.get("x-request-id", ""),
         user_id=request.headers.get("x-user-id"),
+        tenant_id=request.headers.get("x-tenant-id"),
         session_id=payload.session_id,
     )
 
@@ -87,6 +88,7 @@ async def stream_agent_chat(payload: AgentChatRequest, request: Request):
     request_context = RequestContext(
         request_id=getattr(request.state, "request_id", None) or request.headers.get("x-request-id", ""),
         user_id=request.headers.get("x-user-id"),
+        tenant_id=request.headers.get("x-tenant-id"),
         session_id=payload.session_id,
     )
 
@@ -104,6 +106,7 @@ async def resume_agent_chat(payload: AgentChatResumeRequest, request: Request):
     request_context = RequestContext(
         request_id=getattr(request.state, "request_id", None) or request.headers.get("x-request-id", ""),
         user_id=request.headers.get("x-user-id"),
+        tenant_id=request.headers.get("x-tenant-id"),
         session_id=payload.session_id,
     )
 

@@ -129,7 +129,11 @@ class AgentRunner:
             skill_resolution=skill_resolution,
             allow_auto_route=run_config.source != "database",
         )
-        message_history = await self.history_store.load_messages(session_id)
+        message_history = await self.history_store.load_messages(
+            session_id,
+            request_context=request_context,
+            agent_id=resolved_agent_id,
+        )
         history_loaded = bool(message_history)
 
         await self._record_tool_exposure(
@@ -150,7 +154,15 @@ class AgentRunner:
                 instructions=skill_resolution.instructions or None,
                 toolsets=run_toolsets or None,
             )
-            history_saved = await self._save_history(session_id, result)
+            history_saved = await self._save_history(
+                session_id=session_id,
+                result=result,
+                request_context=request_context,
+                agent_id=resolved_agent_id,
+                model=resolved_model,
+                mcp_servers=resolved_mcp_server_ids,
+                skills=skill_resolution.skill_names,
+            )
         except AIRuntimeError:
             raise
         except Exception as exc:
@@ -216,7 +228,11 @@ class AgentRunner:
             skill_resolution=skill_resolution,
             allow_auto_route=run_config.source != "database",
         )
-        message_history = await self.history_store.load_messages(session_id)
+        message_history = await self.history_store.load_messages(
+            session_id,
+            request_context=request_context,
+            agent_id=resolved_agent_id,
+        )
         history_loaded = bool(message_history)
 
         tool_metadata_by_name = await self._record_tool_exposure(
@@ -248,6 +264,7 @@ class AgentRunner:
                         skills=skill_resolution.skill_names,
                         run_config=run_config,
                         user_id=request_context.user_id,
+                        tenant_id=request_context.tenant_id,
                 ):
                     yield event
                 return
@@ -290,6 +307,7 @@ class AgentRunner:
                         skills=skill_resolution.skill_names,
                         run_config=run_config,
                         user_id=request_context.user_id,
+                        tenant_id=request_context.tenant_id,
                 ):
                     yield event
                 return
@@ -359,7 +377,15 @@ class AgentRunner:
                     # 真正的“本轮运行结束”信号在这里。
                     # 在此之前，前面的 delta/tool_call/tool_result 都只是过程事件。
                     result = event.result
-                    history_saved = await self._save_history(session_id, result)
+                    history_saved = await self._save_history(
+                        session_id=session_id,
+                        result=result,
+                        request_context=request_context,
+                        agent_id=resolved_agent_id,
+                        model=resolved_model,
+                        mcp_servers=resolved_mcp_server_ids,
+                        skills=skill_resolution.skill_names,
+                    )
                     response = self._build_chat_response(
                         result=result,
                         request_id=request_context.request_id,
@@ -473,7 +499,15 @@ class AgentRunner:
                 instructions=skill_resolution.instructions or None,
                 toolsets=run_toolsets or None,
             )
-            history_saved = await self._save_history(session_id, result)
+            history_saved = await self._save_history(
+                session_id=session_id,
+                result=result,
+                request_context=request_context,
+                agent_id=resolved_agent_id,
+                model=resolved_model,
+                mcp_servers=resolved_mcp_server_ids,
+                skills=skill_resolution.skill_names,
+            )
         except AIRuntimeError:
             raise
         except Exception as exc:
@@ -822,6 +856,7 @@ class AgentRunner:
             skills: list[str],
             run_config: ResolvedRunConfig | None = None,
             user_id: str | None = None,
+            tenant_id: str | None = None,
     ) -> AsyncIterator[str]:
         """当模型不支持真正的 streamed request 时，退化成单次 run 再包装成 SSE。"""
 
@@ -833,7 +868,21 @@ class AgentRunner:
                 instructions=instructions or None,
                 toolsets=run_toolsets or None,
             )
-            history_saved = await self._save_history(session_id, result)
+            fallback_request_context = RequestContext(
+                request_id=request_id,
+                user_id=user_id,
+                tenant_id=tenant_id,
+                session_id=session_id,
+            )
+            history_saved = await self._save_history(
+                session_id=session_id,
+                result=result,
+                request_context=fallback_request_context,
+                agent_id=agent_id,
+                model=model,
+                mcp_servers=mcp_servers,
+                skills=skills,
+            )
         except Exception as exc:
             yield self._sse_event(
                 "error",
@@ -867,7 +916,7 @@ class AgentRunner:
         response.meta.stream_mode = stream_mode
         await self._attach_approval_record(
             response,
-            RequestContext(request_id=request_id, user_id=user_id, session_id=session_id),
+            RequestContext(request_id=request_id, user_id=user_id, tenant_id=tenant_id, session_id=session_id),
         )
         yield self._sse_event(
             "start",
@@ -899,12 +948,31 @@ class AgentRunner:
 
         yield self._sse_event("done", response.model_dump(mode="json"))
 
-    async def _save_history(self, session_id: str | None, result: Any) -> bool:
+    async def _save_history(
+            self,
+            *,
+            session_id: str | None,
+            result: Any,
+            request_context: RequestContext,
+            agent_id: str,
+            model: str,
+            mcp_servers: list[str],
+            skills: list[str],
+    ) -> bool:
         """把本轮 run 结束后的完整消息历史写回会话存储。"""
 
         if not session_id:
             return False
-        await self.history_store.save_messages(session_id, result.all_messages())
+        await self.history_store.save_messages(
+            session_id,
+            result.all_messages(),
+            request_context=request_context,
+            agent_id=agent_id,
+            model=model,
+            mcp_servers=mcp_servers,
+            skills=skills,
+            usage=self._serialize_usage(result),
+        )
         return True
 
     def _serialize_deferred_tool_requests(
