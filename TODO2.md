@@ -550,13 +550,16 @@ app/
 7. 服务端 Approval Store 基线
 8. History Manager 基线
 9. 第一批通用内置 Runtime Agent
+10. 轻量 AgentRouter 自动命中
+11. Multi-hit AgentRouter + Parallel Team MVP
+12. Parallel Team history 保存
 
 建议继续按这个顺序推进：
 
 1. History token 预算与摘要压缩
 2. Approval Store 查询/撤销与审计持久化
-3. Agent Job 后台任务管理
-4. Agent Teams 编排
+3. Agent Teams 配置化与 sequential 编排
+4. Agent Job 后台任务管理
 5. observability / guardrails
 
 原因：

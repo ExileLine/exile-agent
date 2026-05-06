@@ -148,6 +148,180 @@ def test_agent_manager_can_instantiate_builtin_mode_agents() -> None:
             assert agent.name == agent_id
 
 
+def test_agent_router_selects_planner_agent_when_agent_id_is_omitted() -> None:
+    with TestClient(app) as client:
+        agent = client.app.state.ai_agent_manager.get_agent("planner-agent")
+        with agent.override(model=TestModel(custom_output_text="planner routed")):
+            response = client.post(
+                "/api/v1/agents/chat",
+                json={"message": "帮我规划一个多 Agent 后台任务系统"},
+                headers={"x-user-id": "tester"},
+            )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["code"] == 200
+    assert body["data"]["agent_id"] == "planner-agent"
+    assert body["data"]["message"] == "planner routed"
+    assert body["data"]["meta"]["agent_route"]["source"] == "router"
+    assert body["data"]["meta"]["agent_route"]["selected_agent_id"] == "planner-agent"
+    assert "规划" in body["data"]["meta"]["agent_route"]["matched_keywords"]
+
+
+def test_agent_router_respects_explicit_agent_id() -> None:
+    with TestClient(app) as client:
+        agent = client.app.state.ai_agent_manager.get_agent("review-agent")
+        with agent.override(model=TestModel(custom_output_text="explicit review")):
+            response = client.post(
+                "/api/v1/agents/chat",
+                json={"agent_id": "review-agent", "message": "帮我规划一个审查流程"},
+                headers={"x-user-id": "tester"},
+            )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["code"] == 200
+    assert body["data"]["agent_id"] == "review-agent"
+    assert body["data"]["message"] == "explicit review"
+    assert body["data"]["meta"]["agent_route"]["source"] == "explicit"
+    assert body["data"]["meta"]["agent_route"]["selected_agent_id"] == "review-agent"
+
+
+def test_agent_router_runs_parallel_team_when_multiple_safe_agents_match() -> None:
+    def review_model(messages: list[ModelRequest | ModelResponse], info: AgentInfo) -> ModelResponse:
+        del messages, info
+        return ModelResponse(parts=[TextPart(content="风险：需要补充审批和回滚策略")])
+
+    def planner_model(messages: list[ModelRequest | ModelResponse], info: AgentInfo) -> ModelResponse:
+        del messages, info
+        return ModelResponse(parts=[TextPart(content="计划：先设计接口，再补测试")])
+
+    def summary_model(messages: list[ModelRequest | ModelResponse], info: AgentInfo) -> ModelResponse:
+        del info
+        prompt_text = "\n".join(
+            str(getattr(part, "content", ""))
+            for message in messages
+            if isinstance(message, ModelRequest)
+            for part in message.parts
+        )
+        if "风险：需要补充审批和回滚策略" in prompt_text and "计划：先设计接口，再补测试" in prompt_text:
+            return ModelResponse(parts=[TextPart(content="并行汇总：先规划接口，再处理审批风险")])
+        return ModelResponse(parts=[TextPart(content="并行汇总缺失")])
+
+    with TestClient(app) as client:
+        review_agent = client.app.state.ai_agent_manager.get_agent("review-agent")
+        planner_agent = client.app.state.ai_agent_manager.get_agent("planner-agent")
+        summary_agent = client.app.state.ai_agent_manager.get_agent("summary-agent")
+        with review_agent.override(model=FunctionModel(review_model)):
+            with planner_agent.override(model=FunctionModel(planner_model)):
+                with summary_agent.override(model=FunctionModel(summary_model)):
+                    response = client.post(
+                        "/api/v1/agents/chat",
+                        json={"message": "请规划这个功能，并评估风险"},
+                        headers={"x-user-id": "tester"},
+                    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["code"] == 200
+    assert body["data"]["agent_id"] == "team:auto-parallel"
+    assert body["data"]["message"] == "并行汇总：先规划接口，再处理审批风险"
+    agent_route = body["data"]["meta"]["agent_route"]
+    assert agent_route["mode"] == "parallel"
+    assert agent_route["worker_agent_ids"] == ["review-agent", "planner-agent"]
+    assert agent_route["aggregator_agent_id"] == "summary-agent"
+    team_results = body["data"]["meta"]["team_results"]
+    assert [item["agent_id"] for item in team_results] == ["review-agent", "planner-agent"]
+
+
+def test_parallel_team_chat_saves_summary_history() -> None:
+    def review_model(messages: list[ModelRequest | ModelResponse], info: AgentInfo) -> ModelResponse:
+        del messages, info
+        return ModelResponse(parts=[TextPart(content="风险：需要控制并发")])
+
+    def planner_model(messages: list[ModelRequest | ModelResponse], info: AgentInfo) -> ModelResponse:
+        del messages, info
+        return ModelResponse(parts=[TextPart(content="计划：先做任务表")])
+
+    def summary_model(messages: list[ModelRequest | ModelResponse], info: AgentInfo) -> ModelResponse:
+        del info
+        request_texts = [
+            str(getattr(part, "content", ""))
+            for message in messages
+            for part in message.parts
+        ]
+        if "上一轮团队汇总结果" in "\n".join(request_texts):
+            return ModelResponse(parts=[TextPart(content="第二轮汇总：已读取团队历史")])
+        return ModelResponse(parts=[TextPart(content="上一轮团队汇总结果")])
+
+    session_id = "parallel-team-history"
+    request_context = RequestContext(
+        request_id="parallel-history-cleanup",
+        user_id="tester",
+        session_id=session_id,
+    )
+    with TestClient(app) as client:
+        history_store = client.app.state.ai_history_store
+        asyncio.run(
+            history_store.delete_messages(
+                session_id,
+                request_context=request_context,
+                agent_id="team:auto-parallel",
+            )
+        )
+        review_agent = client.app.state.ai_agent_manager.get_agent("review-agent")
+        planner_agent = client.app.state.ai_agent_manager.get_agent("planner-agent")
+        summary_agent = client.app.state.ai_agent_manager.get_agent("summary-agent")
+        try:
+            with review_agent.override(model=FunctionModel(review_model)):
+                with planner_agent.override(model=FunctionModel(planner_model)):
+                    with summary_agent.override(model=FunctionModel(summary_model)):
+                        first_response = client.post(
+                            "/api/v1/agents/chat",
+                            json={"message": "请规划这个功能，并评估风险", "session_id": session_id},
+                            headers={"x-user-id": "tester"},
+                        )
+                        second_response = client.post(
+                            "/api/v1/agents/chat",
+                            json={"message": "请继续规划这个功能，并评估风险", "session_id": session_id},
+                            headers={"x-user-id": "tester"},
+                        )
+            record = asyncio.run(
+                history_store.load_record(
+                    session_id,
+                    request_context=request_context,
+                    agent_id="team:auto-parallel",
+                )
+            )
+        finally:
+            asyncio.run(
+                history_store.delete_messages(
+                    session_id,
+                    request_context=request_context,
+                    agent_id="team:auto-parallel",
+                )
+            )
+
+    assert first_response.status_code == 200
+    first_body = first_response.json()
+    assert first_body["data"]["meta"]["history_loaded"] is False
+    assert first_body["data"]["meta"]["history_saved"] is True
+    assert first_body["data"]["meta"]["message_count"] == 2
+    assert first_body["data"]["message"] == "上一轮团队汇总结果"
+
+    assert second_response.status_code == 200
+    second_body = second_response.json()
+    assert second_body["data"]["meta"]["history_loaded"] is True
+    assert second_body["data"]["meta"]["history_saved"] is True
+    assert second_body["data"]["meta"]["message_count"] == 4
+    assert second_body["data"]["message"] == "第二轮汇总：已读取团队历史"
+
+    assert record is not None
+    assert record.metadata.agent_id == "team:auto-parallel"
+    assert record.metadata.message_count == 4
+    assert len(record.messages) == 4
+
+
 def test_agent_chat_endpoint() -> None:
     with TestClient(app) as client:
         expected_model_key = client.app.state.ai_settings.default_model
@@ -171,6 +345,8 @@ def test_agent_chat_endpoint() -> None:
     assert body["data"]["meta"]["config_source"] == "settings_fallback"
     assert body["data"]["meta"]["model_key"] == expected_model_key
     assert body["data"]["meta"]["provider_key"] is None
+    assert body["data"]["meta"]["agent_route"]["source"] == "default"
+    assert body["data"]["meta"]["agent_route"]["selected_agent_id"] == "chat-agent"
 
 
 @pytest.mark.parametrize(
@@ -664,7 +840,7 @@ def test_runner_records_latest_tool_exposure() -> None:
         with agent.override(model=tool_model):
             response = client.post(
                 "/api/v1/agents/chat",
-                json={"message": "请说明当前 runtime 配置摘要"},
+                json={"agent_id": "chat-agent", "message": "请说明当前 runtime 配置摘要"},
                 headers={"x-user-id": "tester"},
             )
 

@@ -120,7 +120,7 @@ def test_agent_chat_endpoint_injects_skill_instructions() -> None:
         with agent.override(model=FunctionModel(skill_model)):
             response = client.post(
                 "/api/v1/agents/chat",
-                json={"message": "请帮我检查当前运行时健康状态", "skill_tags": ["ops"]},
+                json={"agent_id": "chat-agent", "message": "请帮我检查当前运行时健康状态", "skill_tags": ["ops"]},
                 headers={"x-user-id": "tester"},
             )
 

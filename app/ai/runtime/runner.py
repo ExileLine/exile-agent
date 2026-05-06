@@ -1,5 +1,7 @@
 import json
+import asyncio
 from collections.abc import AsyncIterator
+from dataclasses import replace
 from typing import Any
 
 import httpx
@@ -11,8 +13,11 @@ from pydantic_ai.messages import (
     PartDeltaEvent,
     PartStartEvent,
     RetryPromptPart,
+    ModelRequest,
+    ModelResponse,
     TextPart,
     TextPartDelta,
+    UserPromptPart,
 )
 from pydantic_ai.run import AgentRunResultEvent
 from pydantic_ai.models.openai import OpenAIChatModel
@@ -41,10 +46,11 @@ from app.ai.mcp import (
     ManagedMCPServerStdioConfig,
     ManagedMCPServerStreamableHTTPConfig,
 )
+from app.ai.runtime.agent_router import AgentRouter
 from app.ai.runtime.approvals import ApprovalRecord, ApprovalStore
 from app.ai.runtime.history import SessionHistoryStore
 from app.ai.runtime.manager import AgentManager
-from app.ai.runtime.resolved_config import ResolvedMCPServerConfig, ResolvedModelConfig, ResolvedRunConfig
+from app.ai.runtime.resolved_config import ResolvedAgentRoute, ResolvedMCPServerConfig, ResolvedModelConfig, ResolvedRunConfig
 from app.ai.schemas.chat import (
     AgentApprovalDecision,
     AgentApprovalRequest,
@@ -84,6 +90,7 @@ class AgentRunner:
         self.tool_audit = tool_audit
         self.history_store = history_store
         self.approval_store = approval_store
+        self.agent_router = AgentRouter()
         self.mcp_manager = mcp_manager
         self.skill_registry = skill_registry
         self.skill_resolver = skill_resolver
@@ -113,7 +120,21 @@ class AgentRunner:
             mcp_server_ids=mcp_server_ids,
             skill_ids=skill_ids,
             route_message=message,
+            allow_agent_routing=True,
+            allow_parallel_routing=True,
         )
+        if self._should_run_parallel_team(run_config):
+            return await self._run_parallel_agent_team(
+                request_context=request_context,
+                message=message,
+                session_id=session_id,
+                model_name=model_name,
+                mcp_server_ids=mcp_server_ids,
+                skill_ids=skill_ids,
+                skill_tags=skill_tags,
+                route_run_config=run_config,
+            )
+
         resolved_agent_id, resolved_model, agent = self._resolve_agent(run_config)
         skill_resolution = self._resolve_skills(
             agent_id=resolved_agent_id,
@@ -212,6 +233,8 @@ class AgentRunner:
             mcp_server_ids=mcp_server_ids,
             skill_ids=skill_ids,
             route_message=message,
+            allow_agent_routing=True,
+            allow_parallel_routing=False,
         )
         resolved_agent_id, resolved_model, agent = self._resolve_agent(run_config)
         skill_resolution = self._resolve_skills(
@@ -467,12 +490,15 @@ class AgentRunner:
         self._validate_approval_decisions(approvals=approvals, approval_record=approval_record)
         message_history = ModelMessagesTypeAdapter.validate_json(resolved_message_history_json)
         latest_user_message = self._extract_latest_user_message(message_history)
+        resume_agent_id = agent_id or (approval_record.agent_id if approval_record is not None else None)
         run_config = await self._resolve_run_config(
-            agent_id=agent_id,
+            agent_id=resume_agent_id,
             model_name=model_name,
             mcp_server_ids=mcp_server_ids,
             skill_ids=skill_ids,
             route_message=latest_user_message,
+            allow_agent_routing=False,
+            allow_parallel_routing=False,
         )
         resolved_agent_id, resolved_model, agent = self._resolve_agent(run_config)
         skill_resolution = self._resolve_skills(
@@ -538,6 +564,8 @@ class AgentRunner:
             mcp_server_ids: list[str] | None,
             skill_ids: list[str] | None,
             route_message: str | None = None,
+            allow_agent_routing: bool = True,
+            allow_parallel_routing: bool = False,
     ) -> ResolvedRunConfig:
         """解析本轮 run 的控制面配置。
 
@@ -548,26 +576,73 @@ class AgentRunner:
         if not self.settings.enabled:
             raise AIDisabledError("AI 能力已关闭")
 
+        agent_route = self._resolve_agent_route(
+            agent_id=agent_id,
+            route_message=route_message,
+            allow_agent_routing=allow_agent_routing,
+            allow_parallel_routing=allow_parallel_routing,
+        )
+        selected_agent_id = (
+            agent_route.worker_agent_ids[0]
+            if agent_route.mode == "parallel" and agent_route.worker_agent_ids
+            else agent_route.selected_agent_id
+        )
+
         if not self.enable_config_resolver:
-            return self._build_settings_fallback_run_config(
-                agent_id=agent_id,
+            run_config = self._build_settings_fallback_run_config(
+                agent_id=selected_agent_id,
                 model_name=model_name,
                 mcp_server_ids=mcp_server_ids,
                 skill_ids=skill_ids,
             )
+            return replace(run_config, agent_route=agent_route)
 
         async with AsyncSessionLocal() as session:
             resolver = AICapabilityResolver(
                 settings=self.settings,
                 repository=AIConfigRepository(session),
             )
-            return await resolver.resolve(
-                agent_id=agent_id,
+            run_config = await resolver.resolve(
+                agent_id=selected_agent_id,
                 requested_model=model_name,
                 requested_mcp_servers=mcp_server_ids,
                 requested_skill_ids=skill_ids,
                 route_message=route_message,
             )
+            return replace(run_config, agent_route=agent_route)
+
+    def _resolve_agent_route(
+            self,
+            *,
+            agent_id: str | None,
+            route_message: str | None,
+            allow_agent_routing: bool,
+            allow_parallel_routing: bool,
+    ) -> ResolvedAgentRoute:
+        if allow_agent_routing:
+            route = self.agent_router.resolve(
+                requested_agent_id=agent_id,
+                message=route_message,
+                default_agent_id=self.settings.default_agent,
+            )
+            if allow_parallel_routing or route.mode != "parallel":
+                return route
+            first_worker_agent_id = route.worker_agent_ids[0] if route.worker_agent_ids else route.selected_agent_id
+            return ResolvedAgentRoute(
+                requested_agent_id=route.requested_agent_id,
+                selected_agent_id=first_worker_agent_id,
+                source=route.source,
+                reason=f"{route.reason}；当前接口使用单 Agent 路由",
+                matched_keywords=route.matched_keywords,
+                candidate_agent_ids=route.candidate_agent_ids,
+            )
+        selected_agent_id = agent_id or self.settings.default_agent
+        return ResolvedAgentRoute(
+            requested_agent_id=agent_id,
+            selected_agent_id=selected_agent_id,
+            source="explicit" if agent_id else "default",
+            reason="续跑阶段不重新执行 AgentRouter",
+        )
 
     def _build_settings_fallback_run_config(
             self,
@@ -631,6 +706,267 @@ class AgentRunner:
                 model_cache_key=model_cache_key,
             )
         return resolved_agent_id, resolved_model, agent
+
+    @staticmethod
+    def _should_run_parallel_team(run_config: ResolvedRunConfig) -> bool:
+        route = run_config.agent_route
+        return bool(route and route.mode == "parallel" and len(route.worker_agent_ids) >= 2)
+
+    async def _run_parallel_agent_team(
+            self,
+            *,
+            request_context: RequestContext,
+            message: str,
+            session_id: str | None,
+            model_name: str | None,
+            mcp_server_ids: list[str] | None,
+            skill_ids: list[str] | None,
+            skill_tags: list[str] | None,
+            route_run_config: ResolvedRunConfig,
+    ) -> AgentChatResponse:
+        route = route_run_config.agent_route
+        if route is None or not route.worker_agent_ids or route.aggregator_agent_id is None:
+            raise AIConfigValidationError("Agent 并行协同路由配置不完整")
+
+        worker_outputs = await asyncio.gather(
+            *[
+                self._run_parallel_worker(
+                    agent_id=worker_agent_id,
+                    request_context=request_context,
+                    message=message,
+                    session_id=session_id,
+                    model_name=model_name,
+                    mcp_server_ids=mcp_server_ids,
+                    skill_ids=skill_ids,
+                    skill_tags=skill_tags,
+                )
+                for worker_agent_id in route.worker_agent_ids
+            ]
+        )
+        previous_history_messages = await self.history_store.load_messages(
+            session_id,
+            request_context=request_context,
+            agent_id="team:auto-parallel",
+        )
+        aggregator_output = await self._run_parallel_aggregator(
+            aggregator_agent_id=route.aggregator_agent_id,
+            request_context=request_context,
+            message=message,
+            worker_outputs=worker_outputs,
+            model_name=model_name,
+            message_history=previous_history_messages,
+        )
+        history_messages = await self._build_parallel_team_history_messages(
+            previous_messages=previous_history_messages,
+            message=message,
+            final_message=aggregator_output["message"],
+        )
+        history_saved = await self._save_parallel_team_history(
+            session_id=session_id,
+            request_context=request_context,
+            messages=history_messages,
+            model=aggregator_output["model"],
+            team_results=worker_outputs,
+        )
+        response = AgentChatResponse(
+            run_id=shortuuid.uuid(),
+            agent_id=route.selected_agent_id,
+            model=aggregator_output["model"],
+            status="completed",
+            message=aggregator_output["message"],
+            request_id=request_context.request_id,
+            session_id=session_id,
+            usage=aggregator_output["usage"],
+            meta=self._build_run_meta(
+                run_kind="chat",
+                stream_mode=None,
+                history_loaded=bool(previous_history_messages),
+                history_saved=history_saved,
+                message_count=len(history_messages),
+                mcp_servers=[],
+                skills=[],
+                run_config=route_run_config,
+                team_results=worker_outputs,
+            ),
+        )
+        return response
+
+    async def _run_parallel_worker(
+            self,
+            *,
+            agent_id: str,
+            request_context: RequestContext,
+            message: str,
+            session_id: str | None,
+            model_name: str | None,
+            mcp_server_ids: list[str] | None,
+            skill_ids: list[str] | None,
+            skill_tags: list[str] | None,
+    ) -> dict[str, Any]:
+        run_config = await self._resolve_run_config(
+            agent_id=agent_id,
+            model_name=model_name,
+            mcp_server_ids=mcp_server_ids,
+            skill_ids=skill_ids,
+            route_message=message,
+            allow_agent_routing=False,
+        )
+        resolved_agent_id, resolved_model, agent = self._resolve_agent(run_config)
+        skill_resolution = self._resolve_skills(
+            agent_id=resolved_agent_id,
+            message=message,
+            skill_ids=list(run_config.skill_ids),
+            skill_tags=skill_tags,
+        )
+        deps = self._build_deps(request_context, resolved_skill_names=tuple(skill_resolution.skill_names))
+        resolved_mcp_server_ids, run_toolsets = self._resolve_request_toolsets(
+            mcp_server_ids=run_config.mcp_server_keys,
+            mcp_server_configs=run_config.mcp_servers if run_config.source == "database" else (),
+            route_message=message,
+            skill_resolution=skill_resolution,
+            allow_auto_route=run_config.source != "database",
+        )
+        message_history = await self.history_store.load_messages(
+            session_id,
+            request_context=request_context,
+            agent_id=resolved_agent_id,
+        )
+        await self._record_tool_exposure(
+            agent_id=resolved_agent_id,
+            request_id=request_context.request_id,
+            message=message,
+            agent=agent,
+            deps=deps,
+            additional_toolsets=run_toolsets,
+            resolved_mcp_server_ids=resolved_mcp_server_ids,
+        )
+        try:
+            result = await agent.run(
+                message,
+                deps=deps,
+                message_history=message_history or None,
+                instructions=skill_resolution.instructions or None,
+                toolsets=run_toolsets or None,
+            )
+        except AIRuntimeError:
+            raise
+        except Exception as exc:
+            raise AIRunExecutionError(f"parallel worker 执行失败: {resolved_agent_id}") from exc
+
+        output = result.output
+        if isinstance(output, DeferredToolRequests):
+            raise AIConfigValidationError(f"并行协同暂不支持 worker 进入审批: {resolved_agent_id}")
+        return {
+            "agent_id": resolved_agent_id,
+            "model": resolved_model,
+            "message": str(output),
+            "usage": self._serialize_usage(result),
+            "mcp_servers": resolved_mcp_server_ids,
+            "skills": skill_resolution.skill_names,
+        }
+
+    async def _run_parallel_aggregator(
+            self,
+            *,
+            aggregator_agent_id: str,
+            request_context: RequestContext,
+            message: str,
+            worker_outputs: list[dict[str, Any]],
+            model_name: str | None,
+            message_history: list[Any],
+    ) -> dict[str, Any]:
+        run_config = await self._resolve_run_config(
+            agent_id=aggregator_agent_id,
+            model_name=model_name,
+            mcp_server_ids=[],
+            skill_ids=[],
+            route_message=message,
+            allow_agent_routing=False,
+        )
+        resolved_agent_id, resolved_model, agent = self._resolve_agent(run_config)
+        deps = self._build_deps(request_context)
+        aggregate_prompt = self._build_parallel_aggregate_prompt(
+            original_message=message,
+            worker_outputs=worker_outputs,
+        )
+        try:
+            result = await agent.run(
+                aggregate_prompt,
+                deps=deps,
+                message_history=message_history or None,
+            )
+        except AIRuntimeError:
+            raise
+        except Exception as exc:
+            raise AIRunExecutionError("parallel aggregator 执行失败") from exc
+
+        output = result.output
+        if isinstance(output, DeferredToolRequests):
+            raise AIConfigValidationError(f"并行协同暂不支持 aggregator 进入审批: {resolved_agent_id}")
+        return {
+            "agent_id": resolved_agent_id,
+            "model": resolved_model,
+            "message": str(output),
+            "usage": self._serialize_usage(result),
+        }
+
+    @staticmethod
+    def _build_parallel_aggregate_prompt(*, original_message: str, worker_outputs: list[dict[str, Any]]) -> str:
+        worker_sections = "\n\n".join(
+            f"## {item['agent_id']}\n{item['message']}" for item in worker_outputs
+        )
+        return (
+            "请整合以下多个 Agent 的并行分析结果，输出一个结构化、去重、可执行的最终答复。\n\n"
+            f"# 用户原始请求\n{original_message}\n\n"
+            f"# 子 Agent 结果\n{worker_sections}"
+        )
+
+    async def _build_parallel_team_history_messages(
+            self,
+            *,
+            previous_messages: list[Any],
+            message: str,
+            final_message: str,
+    ) -> list[Any]:
+        return [
+            *previous_messages,
+            ModelRequest(parts=[UserPromptPart(content=message)]),
+            ModelResponse(parts=[TextPart(content=final_message)]),
+        ]
+
+    async def _save_parallel_team_history(
+            self,
+            *,
+            session_id: str | None,
+            request_context: RequestContext,
+            messages: list[Any],
+            model: str,
+            team_results: list[dict[str, Any]],
+    ) -> bool:
+        if not session_id:
+            return False
+        await self.history_store.save_messages(
+            session_id,
+            messages,
+            request_context=request_context,
+            agent_id="team:auto-parallel",
+            model=model,
+            skills=[],
+            mcp_servers=[],
+            usage={
+                "team_results": [
+                    {
+                        "agent_id": item["agent_id"],
+                        "model": item["model"],
+                        "usage": item["usage"],
+                        "mcp_servers": item["mcp_servers"],
+                        "skills": item["skills"],
+                    }
+                    for item in team_results
+                ],
+            },
+        )
+        return True
 
     def _build_runtime_model(self, run_config: ResolvedRunConfig) -> Any | None:
         """把控制面 provider 配置转换成 PydanticAI 可直接消费的模型对象。"""
@@ -1263,6 +1599,7 @@ class AgentRunner:
             mcp_servers: list[str],
             skills: list[str],
             run_config: ResolvedRunConfig | None = None,
+            team_results: list[dict[str, Any]] | None = None,
     ) -> AgentRunMeta:
         return AgentRunMeta(
             run_kind=run_kind,
@@ -1276,6 +1613,22 @@ class AgentRunner:
             model_key=run_config.model_key if run_config is not None else None,
             provider_key=run_config.model.provider_key if run_config is not None else None,
             config_version=run_config.config_version if run_config is not None else None,
+            agent_route=(
+                {
+                    "requested_agent_id": run_config.agent_route.requested_agent_id,
+                    "selected_agent_id": run_config.agent_route.selected_agent_id,
+                    "source": run_config.agent_route.source,
+                    "reason": run_config.agent_route.reason,
+                    "matched_keywords": list(run_config.agent_route.matched_keywords),
+                    "mode": run_config.agent_route.mode,
+                    "candidate_agent_ids": list(run_config.agent_route.candidate_agent_ids),
+                    "worker_agent_ids": list(run_config.agent_route.worker_agent_ids),
+                    "aggregator_agent_id": run_config.agent_route.aggregator_agent_id,
+                }
+                if run_config is not None and run_config.agent_route is not None
+                else None
+            ),
+            team_results=team_results,
         )
 
     @staticmethod

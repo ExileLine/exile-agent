@@ -29,7 +29,10 @@
 - 已完成服务端 `ApprovalStore` 基线，`/chat` 和 `/chat/stream` 可返回 `approval_id`，`/chat/resume` 可通过 `approval_id + approvals` 续跑，并保留旧协议兼容。
 - 已完成 History Manager 基线，支持 `tenant/user/agent/session` 历史隔离、metadata 保存和最大 message 数裁剪。
 - 已完成第一批内置 Runtime Agent：`general-agent`、`explore-agent`、`planner-agent`、`executor-agent`、`review-agent`、`summary-agent`。
-- 当前自动化测试基线：`52 passed`。
+- 已完成轻量 `AgentRouter`，未显式传 `agent_id` 时可按关键词自动命中内置 Agent，并在响应 meta 返回路由原因。
+- 已完成 Multi-hit AgentRouter + Parallel Team MVP，普通 `/chat` 多意图命中时可并行运行 `explore/planner/review` 并由 `summary-agent` 汇总。
+- 已完成 Parallel Team history 保存，团队协同只保存用户原始输入和最终汇总输出，避免 worker 长输出污染上下文。
+- 当前自动化测试基线：`56 passed`。
 
 当前待补：
 

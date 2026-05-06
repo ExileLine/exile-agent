@@ -31,6 +31,7 @@
 
 - 启动时自动初始化 AI runtime，并挂载到 `FastAPI app.state`
 - 默认注册 `chat-agent` 和一组通用内置 Runtime Agent
+- 支持 `AgentRouter` 自动命中内置 Agent；普通 `/chat` 可在多意图命中时触发并行协同
 - 提供 `/api/v1/agents/chat`、`/chat/stream`、`/chat/resume`、`/agents`、`/agents/skills`
 - 支持基于 `tenant_id / user_id / agent_id / session_id` 隔离的多轮对话历史
 - 支持 history metadata 保存和 `AI_HISTORY_MAX_MESSAGES` 最大消息数裁剪
@@ -719,6 +720,26 @@ curl 'http://127.0.0.1:8000/api/v1/agents/skills'
 2. 在 [`app/ai/agents/__init__.py`](/Users/yangyuexiong/Desktop/exile-agent/app/ai/agents/__init__.py) 的 `register_default_agents(...)` 中注册
 
 如果只是新增业务 Agent，优先使用数据库 Agent 配置并通过 `runtime_agent_id` 复用上面的内置 Agent，不要直接新增 Python builder。
+
+当前 `AgentRouter` 的自动命中规则：
+
+- 请求显式传 `agent_id`：直接使用请求指定 Agent，不再自动路由
+- 命中审查/风险类关键词：`review-agent`
+- 命中规划/拆解类关键词：`planner-agent`
+- 命中总结/摘要类关键词：`summary-agent`
+- 命中探索/调研类关键词：`explore-agent`
+- 命中执行/实现类关键词：`executor-agent`
+- 未命中任何规则：回退 `AI_DEFAULT_AGENT`
+
+普通 `/chat` 如果同时命中多个安全 worker，会进入并行协同 MVP：
+
+- worker 范围：`explore-agent`、`planner-agent`、`review-agent`
+- 聚合 Agent：`summary-agent`
+- `executor-agent` 不会自动进入并行 worker，避免未经确认触发执行类行为
+- `/chat/stream` 和 `/chat/resume` 暂不做并行协同
+- 并行协同会把“用户原始输入 + 最终汇总输出”写入 `team:auto-parallel` 的会话历史，不保存 worker 长输出到 message history
+
+路由命中信息会返回在 `data.meta.agent_route`，用于调试本轮为什么选择某个 Agent。并行协同的子 Agent 输出会返回在 `data.meta.team_results`。
 
 示意：
 

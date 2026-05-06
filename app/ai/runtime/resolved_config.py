@@ -3,6 +3,23 @@ from typing import Literal
 
 
 ConfigSource = Literal["database", "settings_fallback"]
+AgentRouteSource = Literal["explicit", "router", "default"]
+AgentRouteMode = Literal["single", "parallel"]
+
+
+@dataclass(frozen=True, slots=True)
+class ResolvedAgentRoute:
+    """本轮请求的 Agent 选择来源。"""
+
+    requested_agent_id: str | None
+    selected_agent_id: str
+    source: AgentRouteSource
+    reason: str
+    matched_keywords: tuple[str, ...] = ()
+    mode: AgentRouteMode = "single"
+    candidate_agent_ids: tuple[str, ...] = ()
+    worker_agent_ids: tuple[str, ...] = ()
+    aggregator_agent_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -70,6 +87,7 @@ class ResolvedRunConfig:
     skill_ids: tuple[str, ...] = ()
     config_version: str | None = None
     runtime_flags: dict[str, bool] = field(default_factory=dict)
+    agent_route: ResolvedAgentRoute | None = None
 
     @property
     def model_name(self) -> str:

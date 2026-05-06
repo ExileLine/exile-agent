@@ -77,6 +77,8 @@ class AgentRunMeta(BaseModel):
     model_key: str | None = Field(default=None, description="控制面模型 key")
     provider_key: str | None = Field(default=None, description="控制面模型供应商 key")
     config_version: str | None = Field(default=None, description="控制面配置版本标识")
+    agent_route: dict[str, Any] | None = Field(default=None, description="Agent 路由命中信息")
+    team_results: list[dict[str, Any]] | None = Field(default=None, description="多 Agent 协同的子 Agent 结果")
 
 
 class AgentChatResponse(BaseModel):
