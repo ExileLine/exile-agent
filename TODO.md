@@ -28,7 +28,8 @@
 - 已完成 DB 控制面异常 4xx/502 映射，模型/MCP/Skill 配置类错误不再统一返回 500。
 - 已完成服务端 `ApprovalStore` 基线，`/chat` 和 `/chat/stream` 可返回 `approval_id`，`/chat/resume` 可通过 `approval_id + approvals` 续跑，并保留旧协议兼容。
 - 已完成 History Manager 基线，支持 `tenant/user/agent/session` 历史隔离、metadata 保存和最大 message 数裁剪。
-- 当前自动化测试基线：`50 passed`。
+- 已完成第一批内置 Runtime Agent：`general-agent`、`explore-agent`、`planner-agent`、`executor-agent`、`review-agent`、`summary-agent`。
+- 当前自动化测试基线：`52 passed`。
 
 当前待补：
 
@@ -758,7 +759,8 @@ AI_MCP_SERVERS_JSON={}
 
 当前已完成：
 
-- 一个 `chat-agent`
+- 一个兼容默认入口 `chat-agent`
+- 第一批通用内置 Runtime Agent：`general-agent`、`explore-agent`、`planner-agent`、`executor-agent`、`review-agent`、`summary-agent`
 - 一个 `AgentRegistry`
 - 一个 `AgentManager`
 - 一个 `Runner`

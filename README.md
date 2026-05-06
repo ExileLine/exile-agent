@@ -21,6 +21,7 @@
 - 配置控制面：模型供应商、模型、Agent、MCP、Agent-MCP binding、Resolver 和 Runner 主链路接入
 - 服务端 Approval Store：`approval_id` 续跑、过期校验、重复续跑拒绝、旧协议兼容
 - History Manager：tenant/user/agent/session 隔离、metadata 保存、最大 message 数裁剪
+- 内置 Runtime Agent：`general-agent`、`explore-agent`、`planner-agent`、`executor-agent`、`review-agent`、`summary-agent`
 
 本文档的目标是让开发者可以快速理解这套工程能做什么、如何启动、如何调用，以及后续应该从哪里继续扩展。
 
@@ -29,7 +30,7 @@
 当前版本已经具备以下可直接使用的能力：
 
 - 启动时自动初始化 AI runtime，并挂载到 `FastAPI app.state`
-- 默认注册一个可直接使用的 `chat-agent`
+- 默认注册 `chat-agent` 和一组通用内置 Runtime Agent
 - 提供 `/api/v1/agents/chat`、`/chat/stream`、`/chat/resume`、`/agents`、`/agents/skills`
 - 支持基于 `tenant_id / user_id / agent_id / session_id` 隔离的多轮对话历史
 - 支持 history metadata 保存和 `AI_HISTORY_MAX_MESSAGES` 最大消息数裁剪
@@ -702,10 +703,22 @@ curl 'http://127.0.0.1:8000/api/v1/agents/skills'
 
 ### 四、如果你要新增自己的 agent
 
-当前默认只注册了一个 `chat-agent`。如果你要新增一个业务 agent，最小路径是：
+当前默认注册了这些代码内置 Runtime Agent：
+
+- `chat-agent`：兼容默认对话入口
+- `general-agent`：通用任务代理
+- `explore-agent`：探索/调研代理
+- `planner-agent`：规划代理
+- `executor-agent`：执行代理
+- `review-agent`：审查代理
+- `summary-agent`：总结代理
+
+如果你要新增一个新的代码内置 runtime agent，最小路径是：
 
 1. 在 `app/ai/agents/` 下新增一个 `build_xxx_agent(...)`
 2. 在 [`app/ai/agents/__init__.py`](/Users/yangyuexiong/Desktop/exile-agent/app/ai/agents/__init__.py) 的 `register_default_agents(...)` 中注册
+
+如果只是新增业务 Agent，优先使用数据库 Agent 配置并通过 `runtime_agent_id` 复用上面的内置 Agent，不要直接新增 Python builder。
 
 示意：
 

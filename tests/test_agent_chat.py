@@ -113,6 +113,41 @@ def test_list_agents() -> None:
     assert body["data"][0]["agent_id"] == "chat-agent"
 
 
+def test_builtin_mode_agents_are_registered() -> None:
+    with TestClient(app) as client:
+        response = client.get("/api/v1/agents")
+
+    assert response.status_code == 200
+    body = response.json()
+    agent_ids = {item["agent_id"] for item in body["data"]}
+    assert {
+        "chat-agent",
+        "general-agent",
+        "explore-agent",
+        "planner-agent",
+        "executor-agent",
+        "review-agent",
+        "summary-agent",
+    }.issubset(agent_ids)
+
+
+def test_agent_manager_can_instantiate_builtin_mode_agents() -> None:
+    builtin_agent_ids = [
+        "general-agent",
+        "explore-agent",
+        "planner-agent",
+        "executor-agent",
+        "review-agent",
+        "summary-agent",
+    ]
+
+    with TestClient(app) as client:
+        manager = client.app.state.ai_agent_manager
+        for agent_id in builtin_agent_ids:
+            agent = manager.get_agent(agent_id, model=TestModel(custom_output_text=f"{agent_id} ready"))
+            assert agent.name == agent_id
+
+
 def test_agent_chat_endpoint() -> None:
     with TestClient(app) as client:
         expected_model_key = client.app.state.ai_settings.default_model

@@ -547,13 +547,17 @@ app/
 4. MCP 从 DB config 构造和安全自动路由
 5. 配置管理 API 基础能力
 6. DB 控制面异常 4xx/502 化
+7. 服务端 Approval Store 基线
+8. History Manager 基线
+9. 第一批通用内置 Runtime Agent
 
 建议继续按这个顺序推进：
 
-1. 服务端 approval store
-2. history manager
-3. observability / guardrails
-4. 业务 Agent 落地
+1. History token 预算与摘要压缩
+2. Approval Store 查询/撤销与审计持久化
+3. Agent Job 后台任务管理
+4. Agent Teams 编排
+5. observability / guardrails
 
 原因：
 

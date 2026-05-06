@@ -25,6 +25,32 @@ def build_chat_agent(settings: AISettings, model_name: object) -> Agent[AgentDep
 
     它本身并不执行模型调用，真正执行发生在 `AgentRunner.run_chat(...)` 里。
     """
+    return build_builtin_agent(
+        settings=settings,
+        model_name=model_name,
+        agent_id="chat-agent",
+        instructions=(
+            "You are the default assistant for this FastAPI backend project. "
+            "Be concise, factual, and implementation-oriented. "
+            "Prefer answering in Chinese unless the user asks otherwise. "
+            "When runtime metadata would help, use the available builtin tools instead of guessing."
+        ),
+    )
+
+
+def build_builtin_agent(
+    *,
+    settings: AISettings,
+    model_name: object,
+    agent_id: str,
+    instructions: str,
+) -> Agent[AgentDeps, ChatAgentOutput]:
+    """构造代码内置 runtime Agent。
+
+    内置 Agent 共享相同的模型解析、builtin toolsets、approval 和 audit wrapper；
+    差异主要通过 `agent_id` 与 instructions 表达不同工作模式。
+    """
+
     model = _build_model(settings, model_name)
     agent: Agent[AgentDeps, ChatAgentOutput] = Agent[AgentDeps, ChatAgentOutput](
         model=model,
@@ -33,13 +59,8 @@ def build_chat_agent(settings: AISettings, model_name: object) -> Agent[AgentDep
         # 一旦某个工具命中了 approval / deferred 流程，PydanticAI 才能把这次 run
         # 作为“待审批结果”返回，而不是直接抛 UserError。
         output_type=[str, DeferredToolRequests],
-        name="chat-agent",
-        instructions=(
-            "You are the default assistant for this FastAPI backend project. "
-            "Be concise, factual, and implementation-oriented. "
-            "Prefer answering in Chinese unless the user asks otherwise. "
-            "When runtime metadata would help, use the available builtin tools instead of guessing."
-        ),
+        name=agent_id,
+        instructions=instructions,
         retries=settings.max_retries,
         # 这里挂的是一组 builtin toolsets，而不是单个大 toolset。
         # Agent 运行时会把这些 toolset 合并成当前这轮 run 的可用工具集合。
