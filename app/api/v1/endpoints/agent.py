@@ -64,6 +64,15 @@ async def list_skills(request: Request):
     return api_response(data=service.list_skills(), is_pop=False)
 
 
+@router.get("/team-runs/{team_run_id}", summary="查询多 Agent 执行轨迹")
+async def get_team_run_trace(team_run_id: str, request: Request):
+    service = _build_chat_service(request)
+    result = await service.get_team_run_trace(team_run_id)
+    if result is None:
+        raise CustomException(status_code=404, detail=f"未找到 Team Run Trace: {team_run_id}", custom_code=10002)
+    return api_response(data=result)
+
+
 @router.post("/chat", summary="执行 Agent 对话")
 async def chat_with_agent(payload: AgentChatRequest, request: Request):
     service = _build_chat_service(request)

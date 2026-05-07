@@ -28,7 +28,9 @@ async def init_ai_runtime(app: FastAPI, project_config: BaseConfig) -> None:
     from app.ai.runtime.manager import AgentManager
     from app.ai.runtime.registry import AgentRegistry
     from app.ai.runtime.runner import AgentRunner
+    from app.ai.runtime.team_trace import TeamRunTraceStore
     from app.ai.skills import SkillLoader, SkillRegistry, SkillResolver
+    from app.db.session import AsyncSessionLocal
 
     settings = AISettings.from_config(project_config)
     registry = AgentRegistry()
@@ -55,6 +57,10 @@ async def init_ai_runtime(app: FastAPI, project_config: BaseConfig) -> None:
         redis=redis_client.redis_pool,
         ttl_seconds=settings.history_ttl_seconds or 1800,
     )
+    team_trace_store = TeamRunTraceStore(
+        db_session_factory=AsyncSessionLocal,
+        db_enabled=project_config.DB_INIT_ON_STARTUP,
+    )
     runner = AgentRunner(
         settings=settings,
         agent_manager=manager,
@@ -65,6 +71,7 @@ async def init_ai_runtime(app: FastAPI, project_config: BaseConfig) -> None:
         mcp_manager=mcp_manager,
         skill_registry=skill_registry,
         skill_resolver=skill_resolver,
+        team_trace_store=team_trace_store,
         enable_config_resolver=project_config.DB_INIT_ON_STARTUP,
     )
 
@@ -79,6 +86,7 @@ async def init_ai_runtime(app: FastAPI, project_config: BaseConfig) -> None:
     app.state.ai_tool_audit = tool_audit
     app.state.ai_history_store = history_store
     app.state.ai_approval_store = approval_store
+    app.state.ai_team_trace_store = team_trace_store
     app.state.ai_runner = runner
 
 
@@ -104,6 +112,7 @@ async def shutdown_ai_runtime(app: FastAPI) -> None:
         "ai_tool_audit",
         "ai_history_store",
         "ai_approval_store",
+        "ai_team_trace_store",
         "ai_runner",
     ):
         if hasattr(app.state, attr):

@@ -36,6 +36,9 @@ class ChatService:
             return []
         return [skill.model_dump(mode="json") for skill in self.skill_registry.list_skills()]
 
+    async def get_team_run_trace(self, team_run_id: str) -> dict | None:
+        return await self.runner.get_team_run_trace(team_run_id)
+
     async def chat(self, *, request_context: RequestContext, payload: AgentChatRequest) -> AgentChatResponse:
         """把 endpoint 请求转换成一次标准的 runner chat 调用。"""
         return await self.runner.run_chat(

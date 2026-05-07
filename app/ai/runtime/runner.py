@@ -52,6 +52,7 @@ from app.ai.runtime.approvals import ApprovalRecord, ApprovalStore
 from app.ai.runtime.history import SessionHistoryStore
 from app.ai.runtime.manager import AgentManager
 from app.ai.runtime.resolved_config import ResolvedAgentRoute, ResolvedMCPServerConfig, ResolvedModelConfig, ResolvedRunConfig
+from app.ai.runtime.team_trace import TeamRunTracePayload, TeamRunTraceStore
 from app.ai.schemas.chat import (
     AgentApprovalDecision,
     AgentApprovalRequest,
@@ -83,6 +84,7 @@ class AgentRunner:
             mcp_manager: MCPManager | None,
             skill_registry: SkillRegistry | None,
             skill_resolver: SkillResolver | None,
+            team_trace_store: TeamRunTraceStore | None = None,
             enable_config_resolver: bool = False,
     ) -> None:
         self.settings = settings
@@ -91,6 +93,7 @@ class AgentRunner:
         self.tool_audit = tool_audit
         self.history_store = history_store
         self.approval_store = approval_store
+        self.team_trace_store = team_trace_store
         self.agent_router = AgentRouter()
         self.mcp_manager = mcp_manager
         self.skill_registry = skill_registry
@@ -739,6 +742,8 @@ class AgentRunner:
             skill_tags: list[str] | None,
             route_run_config: ResolvedRunConfig,
     ) -> AgentChatResponse:
+        started_at = time.perf_counter()
+        team_run_id = shortuuid.uuid()
         route = route_run_config.agent_route
         if route is None or not route.worker_agent_ids or route.aggregator_agent_id is None:
             raise AIConfigValidationError("Agent 并行协同路由配置不完整")
@@ -769,6 +774,21 @@ class AgentRunner:
         failed_worker_outputs = [item for item in worker_outputs if item.get("status") == "failed"]
         if not completed_worker_outputs:
             failed_agents = ", ".join(str(item.get("agent_id")) for item in failed_worker_outputs)
+            await self._save_team_run_trace(
+                team_run_id=team_run_id,
+                run_kind="chat",
+                request_context=request_context,
+                session_id=session_id,
+                route_run_config=route_run_config,
+                aggregator_agent_id=route.aggregator_agent_id,
+                model=route_run_config.model_name,
+                status="failed",
+                final_message=None,
+                usage=None,
+                worker_outputs=worker_outputs,
+                started_at=started_at,
+                error=f"并行协同所有 worker 均失败: {failed_agents}",
+            )
             raise AIConfigValidationError(f"并行协同所有 worker 均失败: {failed_agents}")
         aggregator_output = await self._run_parallel_aggregator(
             aggregator_agent_id=route.aggregator_agent_id,
@@ -793,7 +813,7 @@ class AgentRunner:
             route_reason=route.reason,
         )
         response = AgentChatResponse(
-            run_id=shortuuid.uuid(),
+            run_id=team_run_id,
             agent_id=route.selected_agent_id,
             model=aggregator_output["model"],
             status="completed",
@@ -813,6 +833,20 @@ class AgentRunner:
                 team_results=worker_outputs,
             ),
         )
+        await self._save_team_run_trace(
+            team_run_id=team_run_id,
+            run_kind="chat",
+            request_context=request_context,
+            session_id=session_id,
+            route_run_config=route_run_config,
+            aggregator_agent_id=route.aggregator_agent_id,
+            model=aggregator_output["model"],
+            status=response.status,
+            final_message=response.message,
+            usage=response.usage,
+            worker_outputs=worker_outputs,
+            started_at=started_at,
+        )
         return response
 
     async def _run_parallel_agent_team_stream(
@@ -827,6 +861,7 @@ class AgentRunner:
             skill_tags: list[str] | None,
             route_run_config: ResolvedRunConfig,
     ) -> AsyncIterator[str]:
+        started_at = time.perf_counter()
         route = route_run_config.agent_route
         stream_run_id = shortuuid.uuid()
         if route is None or not route.worker_agent_ids or route.aggregator_agent_id is None:
@@ -937,6 +972,21 @@ class AgentRunner:
         completed_worker_outputs = [item for item in worker_outputs if item.get("status") == "completed"]
         if not completed_worker_outputs:
             failed_agents = ", ".join(str(item.get("agent_id")) for item in worker_outputs)
+            await self._save_team_run_trace(
+                team_run_id=stream_run_id,
+                run_kind="stream",
+                request_context=request_context,
+                session_id=session_id,
+                route_run_config=route_run_config,
+                aggregator_agent_id=route.aggregator_agent_id,
+                model=route_run_config.model_name,
+                status="failed",
+                final_message=None,
+                usage=None,
+                worker_outputs=worker_outputs,
+                started_at=started_at,
+                error=f"并行协同所有 worker 均失败: {failed_agents}",
+            )
             yield self._sse_event(
                 "error",
                 self._build_stream_error_payload(
@@ -972,6 +1022,21 @@ class AgentRunner:
                 message_history=previous_history_messages,
             )
         except Exception as exc:
+            await self._save_team_run_trace(
+                team_run_id=stream_run_id,
+                run_kind="stream",
+                request_context=request_context,
+                session_id=session_id,
+                route_run_config=route_run_config,
+                aggregator_agent_id=route.aggregator_agent_id,
+                model=model_name or route_run_config.model_name,
+                status="failed",
+                final_message=None,
+                usage=None,
+                worker_outputs=worker_outputs,
+                started_at=started_at,
+                error=str(exc),
+            )
             yield self._sse_event(
                 "error",
                 self._build_stream_error_payload(
@@ -1025,6 +1090,20 @@ class AgentRunner:
                 run_config=route_run_config,
                 team_results=worker_outputs,
             ),
+        )
+        await self._save_team_run_trace(
+            team_run_id=stream_run_id,
+            run_kind="stream",
+            request_context=request_context,
+            session_id=session_id,
+            route_run_config=route_run_config,
+            aggregator_agent_id=route.aggregator_agent_id,
+            model=aggregator_output["model"],
+            status=response.status,
+            final_message=response.message,
+            usage=response.usage,
+            worker_outputs=worker_outputs,
+            started_at=started_at,
         )
         yield self._sse_event("done", response.model_dump(mode="json"))
 
@@ -1340,6 +1419,75 @@ class AgentRunner:
             },
         )
         return True
+
+    async def get_team_run_trace(self, team_run_id: str) -> dict[str, Any] | None:
+        if self.team_trace_store is None:
+            return None
+        return await self.team_trace_store.get(team_run_id)
+
+    async def _save_team_run_trace(
+            self,
+            *,
+            team_run_id: str,
+            run_kind: str,
+            request_context: RequestContext,
+            session_id: str | None,
+            route_run_config: ResolvedRunConfig,
+            aggregator_agent_id: str,
+            model: str,
+            status: str,
+            final_message: str | None,
+            usage: dict[str, Any] | None,
+            worker_outputs: list[dict[str, Any]],
+            started_at: float,
+            error: str | None = None,
+    ) -> None:
+        if self.team_trace_store is None:
+            return
+        route = route_run_config.agent_route
+        await self.team_trace_store.save(
+            TeamRunTracePayload(
+                team_run_id=team_run_id,
+                run_kind=run_kind,
+                agent_id=route.selected_agent_id if route is not None else "team:auto-parallel",
+                request_id=request_context.request_id,
+                session_id=session_id,
+                user_id=request_context.user_id,
+                tenant_id=request_context.tenant_id,
+                status=status,
+                model=model,
+                aggregator_agent_id=aggregator_agent_id,
+                worker_agent_ids=[str(item.get("agent_id")) for item in worker_outputs],
+                route=self._build_agent_route_trace(route),
+                usage=usage,
+                final_message=final_message,
+                duration_ms=round((time.perf_counter() - started_at) * 1000, 2),
+                error=error,
+                metadata={
+                    "config_source": route_run_config.source,
+                    "model_key": route_run_config.model_key,
+                    "provider_key": route_run_config.model.provider_key,
+                    "config_version": route_run_config.config_version,
+                },
+                worker_results=worker_outputs,
+            )
+        )
+
+    @staticmethod
+    def _build_agent_route_trace(route: ResolvedAgentRoute | None) -> dict[str, Any]:
+        if route is None:
+            return {}
+        return {
+            "requested_agent_id": route.requested_agent_id,
+            "selected_agent_id": route.selected_agent_id,
+            "source": route.source,
+            "reason": route.reason,
+            "matched_keywords": list(route.matched_keywords),
+            "mode": route.mode,
+            "candidate_agent_ids": list(route.candidate_agent_ids),
+            "worker_agent_ids": list(route.worker_agent_ids),
+            "aggregator_agent_id": route.aggregator_agent_id,
+        }
 
     def _build_runtime_model(self, run_config: ResolvedRunConfig) -> Any | None:
         """把控制面 provider 配置转换成 PydanticAI 可直接消费的模型对象。"""

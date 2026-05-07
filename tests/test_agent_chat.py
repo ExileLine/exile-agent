@@ -237,6 +237,50 @@ def test_agent_router_runs_parallel_team_when_multiple_safe_agents_match() -> No
     assert all(isinstance(item["duration_ms"], int | float) for item in team_results)
 
 
+def test_parallel_team_chat_persists_team_run_trace() -> None:
+    def review_model(messages: list[ModelRequest | ModelResponse], info: AgentInfo) -> ModelResponse:
+        del messages, info
+        return ModelResponse(parts=[TextPart(content="风险：需要记录 trace")])
+
+    def planner_model(messages: list[ModelRequest | ModelResponse], info: AgentInfo) -> ModelResponse:
+        del messages, info
+        return ModelResponse(parts=[TextPart(content="计划：落库 team run")])
+
+    def summary_model(messages: list[ModelRequest | ModelResponse], info: AgentInfo) -> ModelResponse:
+        del messages, info
+        return ModelResponse(parts=[TextPart(content="trace 汇总完成")])
+
+    with TestClient(app) as client:
+        review_agent = client.app.state.ai_agent_manager.get_agent("review-agent")
+        planner_agent = client.app.state.ai_agent_manager.get_agent("planner-agent")
+        summary_agent = client.app.state.ai_agent_manager.get_agent("summary-agent")
+        with review_agent.override(model=FunctionModel(review_model)):
+            with planner_agent.override(model=FunctionModel(planner_model)):
+                with summary_agent.override(model=FunctionModel(summary_model)):
+                    response = client.post(
+                        "/api/v1/agents/chat",
+                        json={"message": "请规划这个功能，并评估风险"},
+                        headers={"x-user-id": "tester", "x-tenant-id": "tenant-a"},
+                    )
+        body = response.json()
+        trace_response = client.get(f"/api/v1/agents/team-runs/{body['data']['run_id']}")
+
+    assert response.status_code == 200
+    assert trace_response.status_code == 200
+    trace_body = trace_response.json()
+    assert trace_body["code"] == 200
+    trace = trace_body["data"]
+    assert trace["team_run_id"] == body["data"]["run_id"]
+    assert trace["run_kind"] == "chat"
+    assert trace["agent_id"] == "team:auto-parallel"
+    assert trace["status"] == "completed"
+    assert trace["tenant_id"] == "tenant-a"
+    assert trace["final_message"] == "trace 汇总完成"
+    assert trace["route"]["mode"] == "parallel"
+    assert trace["worker_agent_ids"] == ["review-agent", "planner-agent"]
+    assert [item["agent_id"] for item in trace["workers"]] == ["review-agent", "planner-agent"]
+
+
 def test_parallel_team_continues_when_optional_worker_fails() -> None:
     def review_model(messages: list[ModelRequest | ModelResponse], info: AgentInfo) -> ModelResponse:
         del messages, info
@@ -766,6 +810,48 @@ def test_agent_chat_stream_runs_parallel_team_when_multiple_safe_agents_match() 
     assert done_event["meta"]["agent_route"]["mode"] == "parallel"
     assert done_event["meta"]["team_results"] is not None
     assert [item["agent_id"] for item in done_event["meta"]["team_results"]] == ["review-agent", "planner-agent"]
+
+
+def test_parallel_team_stream_persists_team_run_trace() -> None:
+    def review_model(messages: list[ModelRequest | ModelResponse], info: AgentInfo) -> ModelResponse:
+        del messages, info
+        return ModelResponse(parts=[TextPart(content="风险：stream trace")])
+
+    def planner_model(messages: list[ModelRequest | ModelResponse], info: AgentInfo) -> ModelResponse:
+        del messages, info
+        return ModelResponse(parts=[TextPart(content="计划：stream trace")])
+
+    def summary_model(messages: list[ModelRequest | ModelResponse], info: AgentInfo) -> ModelResponse:
+        del messages, info
+        return ModelResponse(parts=[TextPart(content="stream trace 汇总")])
+
+    with TestClient(app) as client:
+        review_agent = client.app.state.ai_agent_manager.get_agent("review-agent")
+        planner_agent = client.app.state.ai_agent_manager.get_agent("planner-agent")
+        summary_agent = client.app.state.ai_agent_manager.get_agent("summary-agent")
+        with review_agent.override(model=FunctionModel(review_model)):
+            with planner_agent.override(model=FunctionModel(planner_model)):
+                with summary_agent.override(model=FunctionModel(summary_model)):
+                    with client.stream(
+                        "POST",
+                        "/api/v1/agents/chat/stream",
+                        json={"message": "请规划这个功能，并评估风险"},
+                        headers={"x-user-id": "tester"},
+                    ) as response:
+                        raw = "".join(response.iter_text())
+        events = _parse_sse_events(raw)
+        done_event = next(payload for event, payload in events if event == "done")
+        trace_response = client.get(f"/api/v1/agents/team-runs/{done_event['run_id']}")
+
+    assert response.status_code == 200
+    assert trace_response.status_code == 200
+    trace = trace_response.json()["data"]
+    assert trace["team_run_id"] == done_event["run_id"]
+    assert trace["run_kind"] == "stream"
+    assert trace["status"] == "completed"
+    assert trace["final_message"] == "stream trace 汇总"
+    assert trace["route"]["mode"] == "parallel"
+    assert [item["agent_id"] for item in trace["workers"]] == ["review-agent", "planner-agent"]
 
 
 def test_chat_stream_emits_tool_call_and_result_events() -> None:
