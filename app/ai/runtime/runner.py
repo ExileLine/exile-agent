@@ -235,8 +235,22 @@ class AgentRunner:
             skill_ids=skill_ids,
             route_message=message,
             allow_agent_routing=True,
-            allow_parallel_routing=False,
+            allow_parallel_routing=True,
         )
+        if self._should_run_parallel_team(run_config):
+            async for event in self._run_parallel_agent_team_stream(
+                    request_context=request_context,
+                    message=message,
+                    session_id=session_id,
+                    model_name=model_name,
+                    mcp_server_ids=mcp_server_ids,
+                    skill_ids=skill_ids,
+                    skill_tags=skill_tags,
+                    route_run_config=run_config,
+            ):
+                yield event
+            return
+
         resolved_agent_id, resolved_model, agent = self._resolve_agent(run_config)
         skill_resolution = self._resolve_skills(
             agent_id=resolved_agent_id,
@@ -800,6 +814,219 @@ class AgentRunner:
             ),
         )
         return response
+
+    async def _run_parallel_agent_team_stream(
+            self,
+            *,
+            request_context: RequestContext,
+            message: str,
+            session_id: str | None,
+            model_name: str | None,
+            mcp_server_ids: list[str] | None,
+            skill_ids: list[str] | None,
+            skill_tags: list[str] | None,
+            route_run_config: ResolvedRunConfig,
+    ) -> AsyncIterator[str]:
+        route = route_run_config.agent_route
+        stream_run_id = shortuuid.uuid()
+        if route is None or not route.worker_agent_ids or route.aggregator_agent_id is None:
+            yield self._sse_event(
+                "error",
+                self._build_stream_error_payload(
+                    error=AIConfigValidationError("Agent 并行协同路由配置不完整"),
+                    request_id=request_context.request_id,
+                    session_id=session_id,
+                    agent_id="team:auto-parallel",
+                    model=route_run_config.model_name,
+                    history_loaded=False,
+                    stream_mode="fallback",
+                    mcp_servers=[],
+                    skills=[],
+                    run_config=route_run_config,
+                ),
+            )
+            return
+
+        previous_history_messages = await self.history_store.load_messages(
+            session_id,
+            request_context=request_context,
+            agent_id="team:auto-parallel",
+        )
+        history_loaded = bool(previous_history_messages)
+        worker_context = self._extract_latest_parallel_team_summary(previous_history_messages)
+
+        yield self._sse_event(
+            "start",
+            {
+                "run_id": stream_run_id,
+                "agent_id": route.selected_agent_id,
+                "model": route_run_config.model_name,
+                "request_id": request_context.request_id,
+                "session_id": session_id,
+                "meta": self._build_run_meta(
+                    run_kind="stream",
+                    stream_mode="fallback",
+                    history_loaded=history_loaded,
+                    history_saved=False,
+                    message_count=len(previous_history_messages),
+                    mcp_servers=[],
+                    skills=[],
+                    run_config=route_run_config,
+                ).model_dump(mode="json"),
+            },
+        )
+
+        worker_tasks: dict[asyncio.Task[dict[str, Any]], str] = {}
+        for worker_agent_id in route.worker_agent_ids:
+            yield self._sse_event(
+                "team_worker_start",
+                {
+                    "run_id": stream_run_id,
+                    "agent_id": worker_agent_id,
+                    "role": self._parallel_agent_role(worker_agent_id),
+                },
+            )
+            task = asyncio.create_task(
+                self._run_parallel_worker(
+                    agent_id=worker_agent_id,
+                    request_context=request_context,
+                    message=message,
+                    session_id=session_id,
+                    model_name=model_name,
+                    mcp_server_ids=mcp_server_ids,
+                    skill_ids=skill_ids,
+                    skill_tags=skill_tags,
+                    team_context=worker_context,
+                )
+            )
+            worker_tasks[task] = worker_agent_id
+
+        worker_outputs: list[dict[str, Any]] = []
+        pending = set(worker_tasks)
+        while pending:
+            done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+            for task in done:
+                worker_agent_id = worker_tasks[task]
+                try:
+                    worker_output = task.result()
+                except Exception as exc:
+                    worker_output = self._build_parallel_worker_result(
+                        agent_id=worker_agent_id,
+                        model=model_name or "",
+                        status="failed",
+                        message=None,
+                        usage=None,
+                        mcp_servers=[],
+                        skills=[],
+                        started_at=time.perf_counter(),
+                        error=str(exc),
+                        error_type=type(exc).__name__,
+                        context_injected=bool(worker_context),
+                    )
+                worker_outputs.append(worker_output)
+                yield self._sse_event(
+                    "team_worker_done" if worker_output.get("status") == "completed" else "team_worker_failed",
+                    {
+                        "run_id": stream_run_id,
+                        **worker_output,
+                    },
+                )
+
+        worker_order = {agent_id: index for index, agent_id in enumerate(route.worker_agent_ids)}
+        worker_outputs.sort(key=lambda item: worker_order.get(str(item.get("agent_id")), len(worker_order)))
+        completed_worker_outputs = [item for item in worker_outputs if item.get("status") == "completed"]
+        if not completed_worker_outputs:
+            failed_agents = ", ".join(str(item.get("agent_id")) for item in worker_outputs)
+            yield self._sse_event(
+                "error",
+                self._build_stream_error_payload(
+                    error=AIConfigValidationError(f"并行协同所有 worker 均失败: {failed_agents}"),
+                    request_id=request_context.request_id,
+                    session_id=session_id,
+                    agent_id=route.selected_agent_id,
+                    model=route_run_config.model_name,
+                    history_loaded=history_loaded,
+                    stream_mode="fallback",
+                    mcp_servers=[],
+                    skills=[],
+                    run_config=route_run_config,
+                ),
+            )
+            return
+
+        yield self._sse_event(
+            "aggregate_start",
+            {
+                "run_id": stream_run_id,
+                "agent_id": route.aggregator_agent_id,
+                "role": self._parallel_agent_role(route.aggregator_agent_id),
+            },
+        )
+        try:
+            aggregator_output = await self._run_parallel_aggregator(
+                aggregator_agent_id=route.aggregator_agent_id,
+                request_context=request_context,
+                message=message,
+                worker_outputs=worker_outputs,
+                model_name=model_name,
+                message_history=previous_history_messages,
+            )
+        except Exception as exc:
+            yield self._sse_event(
+                "error",
+                self._build_stream_error_payload(
+                    error=exc,
+                    request_id=request_context.request_id,
+                    session_id=session_id,
+                    agent_id=route.aggregator_agent_id,
+                    model=model_name or route_run_config.model_name,
+                    history_loaded=history_loaded,
+                    stream_mode="fallback",
+                    mcp_servers=[],
+                    skills=[],
+                    run_config=route_run_config,
+                ),
+            )
+            return
+
+        final_message = aggregator_output["message"]
+        yield self._sse_event("delta", {"run_id": stream_run_id, "text": final_message})
+        history_messages = await self._build_parallel_team_history_messages(
+            previous_messages=previous_history_messages,
+            message=message,
+            final_message=final_message,
+        )
+        history_saved = await self._save_parallel_team_history(
+            session_id=session_id,
+            request_context=request_context,
+            messages=history_messages,
+            model=aggregator_output["model"],
+            team_results=worker_outputs,
+            aggregator_agent_id=route.aggregator_agent_id,
+            route_reason=route.reason,
+        )
+        response = AgentChatResponse(
+            run_id=stream_run_id,
+            agent_id=route.selected_agent_id,
+            model=aggregator_output["model"],
+            status="completed",
+            message=final_message,
+            request_id=request_context.request_id,
+            session_id=session_id,
+            usage=aggregator_output["usage"],
+            meta=self._build_run_meta(
+                run_kind="stream",
+                stream_mode="fallback",
+                history_loaded=history_loaded,
+                history_saved=history_saved,
+                message_count=len(history_messages),
+                mcp_servers=[],
+                skills=[],
+                run_config=route_run_config,
+                team_results=worker_outputs,
+            ),
+        )
+        yield self._sse_event("done", response.model_dump(mode="json"))
 
     async def _run_parallel_worker(
             self,

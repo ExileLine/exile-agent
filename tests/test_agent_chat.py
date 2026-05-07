@@ -705,6 +705,69 @@ def test_agent_chat_stream_endpoint() -> None:
     assert done_event["meta"]["model_key"] == expected_model_key
 
 
+def test_agent_chat_stream_runs_parallel_team_when_multiple_safe_agents_match() -> None:
+    def review_model(messages: list[ModelRequest | ModelResponse], info: AgentInfo) -> ModelResponse:
+        del messages, info
+        return ModelResponse(parts=[TextPart(content="风险：需要补充流式错误事件")])
+
+    def planner_model(messages: list[ModelRequest | ModelResponse], info: AgentInfo) -> ModelResponse:
+        del messages, info
+        return ModelResponse(parts=[TextPart(content="计划：先输出 worker 状态，再聚合")])
+
+    def summary_model(messages: list[ModelRequest | ModelResponse], info: AgentInfo) -> ModelResponse:
+        del info
+        prompt_text = "\n".join(
+            str(getattr(part, "content", ""))
+            for message in messages
+            if isinstance(message, ModelRequest)
+            for part in message.parts
+        )
+        if "风险：需要补充流式错误事件" in prompt_text and "计划：先输出 worker 状态，再聚合" in prompt_text:
+            return ModelResponse(parts=[TextPart(content="流式并行汇总：先暴露过程，再返回最终结论")])
+        return ModelResponse(parts=[TextPart(content="流式并行汇总缺失")])
+
+    with TestClient(app) as client:
+        review_agent = client.app.state.ai_agent_manager.get_agent("review-agent")
+        planner_agent = client.app.state.ai_agent_manager.get_agent("planner-agent")
+        summary_agent = client.app.state.ai_agent_manager.get_agent("summary-agent")
+        with review_agent.override(model=FunctionModel(review_model)):
+            with planner_agent.override(model=FunctionModel(planner_model)):
+                with summary_agent.override(model=FunctionModel(summary_model)):
+                    with client.stream(
+                        "POST",
+                        "/api/v1/agents/chat/stream",
+                        json={"message": "请规划这个功能，并评估风险", "session_id": "parallel-stream"},
+                        headers={"x-user-id": "tester"},
+                    ) as response:
+                        raw = "".join(response.iter_text())
+
+    assert response.status_code == 200
+    events = _parse_sse_events(raw)
+    event_names = [event for event, _ in events]
+    assert event_names[0] == "start"
+    assert event_names.count("team_worker_start") == 2
+    assert event_names.count("team_worker_done") == 2
+    assert "aggregate_start" in event_names
+    assert "delta" in event_names
+
+    start_event = events[0][1]
+    assert start_event["agent_id"] == "team:auto-parallel"
+    assert start_event["meta"]["agent_route"]["mode"] == "parallel"
+
+    worker_done_events = [payload for event, payload in events if event == "team_worker_done"]
+    assert {payload["agent_id"] for payload in worker_done_events} == {"review-agent", "planner-agent"}
+    assert {payload["status"] for payload in worker_done_events} == {"completed"}
+
+    done_event = next(payload for event, payload in events if event == "done")
+    assert done_event["agent_id"] == "team:auto-parallel"
+    assert done_event["message"] == "流式并行汇总：先暴露过程，再返回最终结论"
+    assert done_event["meta"]["run_kind"] == "stream"
+    assert done_event["meta"]["stream_mode"] == "fallback"
+    assert done_event["meta"]["agent_route"]["mode"] == "parallel"
+    assert done_event["meta"]["team_results"] is not None
+    assert [item["agent_id"] for item in done_event["meta"]["team_results"]] == ["review-agent", "planner-agent"]
+
+
 def test_chat_stream_emits_tool_call_and_result_events() -> None:
     def tool_model(messages: list[ModelRequest | ModelResponse], info: AgentInfo) -> ModelResponse:
         del info
@@ -1106,6 +1169,64 @@ def test_chat_approval_resume_flow_with_server_approval_id() -> None:
     duplicate_body = duplicate_response.json()
     assert duplicate_body["code"] == 10005
     assert "审批单状态不可续跑" in duplicate_body["message"]
+
+
+def test_chat_resume_uses_approval_record_agent_without_parallel_rerouting() -> None:
+    def approval_model(messages: list[ModelRequest | ModelResponse], info: AgentInfo) -> ModelResponse:
+        del info
+        for message in messages:
+            if isinstance(message, ModelRequest):
+                for part in message.parts:
+                    if isinstance(part, ToolReturnPart) and part.tool_name == "delete_demo_resource":
+                        return ModelResponse(parts=[TextPart(content="resume stayed on approval agent")])
+
+        return ModelResponse(parts=[ToolCallPart(tool_name="delete_demo_resource", args={})])
+
+    with TestClient(app) as client:
+        registry = client.app.state.ai_agent_registry
+        manager = client.app.state.ai_agent_manager
+        registry.register(
+            AgentManifest(
+                agent_id="approval-no-reroute-agent",
+                name="Approval No Reroute Agent",
+                description="Agent used to ensure resume does not reroute to a parallel team.",
+                default_model="test",
+            ),
+            _build_approval_demo_agent,
+        )
+
+        agent = manager.get_agent("approval-no-reroute-agent")
+        with agent.override(model=FunctionModel(approval_model)):
+            first_response = client.post(
+                "/api/v1/agents/chat",
+                json={
+                    "agent_id": "approval-no-reroute-agent",
+                    "message": "请规划这个删除操作，并评估风险",
+                    "session_id": "approval-no-reroute",
+                },
+                headers={"x-user-id": "tester"},
+            )
+
+            assert first_response.status_code == 200
+            deferred = first_response.json()["data"]["deferred_tool_requests"]
+            resume_response = client.post(
+                "/api/v1/agents/chat/resume",
+                json={
+                    "session_id": "approval-no-reroute",
+                    "approval_id": deferred["approval_id"],
+                    "approvals": [{"tool_call_id": deferred["approvals"][0]["tool_call_id"], "approved": True}],
+                },
+                headers={"x-user-id": "tester"},
+            )
+
+    assert resume_response.status_code == 200
+    resume_body = resume_response.json()
+    assert resume_body["data"]["agent_id"] == "approval-no-reroute-agent"
+    assert resume_body["data"]["message"] == "resume stayed on approval agent"
+    agent_route = resume_body["data"]["meta"]["agent_route"]
+    assert agent_route["selected_agent_id"] == "approval-no-reroute-agent"
+    assert agent_route["mode"] == "single"
+    assert "续跑阶段不重新执行 AgentRouter" in agent_route["reason"]
 
 
 def test_chat_approval_resume_rejects_unknown_tool_call_id() -> None:
