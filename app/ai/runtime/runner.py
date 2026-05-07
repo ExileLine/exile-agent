@@ -1,5 +1,6 @@
 import json
 import asyncio
+import time
 from collections.abc import AsyncIterator
 from dataclasses import replace
 from typing import Any
@@ -728,6 +729,12 @@ class AgentRunner:
         if route is None or not route.worker_agent_ids or route.aggregator_agent_id is None:
             raise AIConfigValidationError("Agent 并行协同路由配置不完整")
 
+        previous_history_messages = await self.history_store.load_messages(
+            session_id,
+            request_context=request_context,
+            agent_id="team:auto-parallel",
+        )
+        worker_context = self._extract_latest_parallel_team_summary(previous_history_messages)
         worker_outputs = await asyncio.gather(
             *[
                 self._run_parallel_worker(
@@ -739,15 +746,16 @@ class AgentRunner:
                     mcp_server_ids=mcp_server_ids,
                     skill_ids=skill_ids,
                     skill_tags=skill_tags,
+                    team_context=worker_context,
                 )
                 for worker_agent_id in route.worker_agent_ids
             ]
         )
-        previous_history_messages = await self.history_store.load_messages(
-            session_id,
-            request_context=request_context,
-            agent_id="team:auto-parallel",
-        )
+        completed_worker_outputs = [item for item in worker_outputs if item.get("status") == "completed"]
+        failed_worker_outputs = [item for item in worker_outputs if item.get("status") == "failed"]
+        if not completed_worker_outputs:
+            failed_agents = ", ".join(str(item.get("agent_id")) for item in failed_worker_outputs)
+            raise AIConfigValidationError(f"并行协同所有 worker 均失败: {failed_agents}")
         aggregator_output = await self._run_parallel_aggregator(
             aggregator_agent_id=route.aggregator_agent_id,
             request_context=request_context,
@@ -767,6 +775,8 @@ class AgentRunner:
             messages=history_messages,
             model=aggregator_output["model"],
             team_results=worker_outputs,
+            aggregator_agent_id=route.aggregator_agent_id,
+            route_reason=route.reason,
         )
         response = AgentChatResponse(
             run_id=shortuuid.uuid(),
@@ -802,68 +812,104 @@ class AgentRunner:
             mcp_server_ids: list[str] | None,
             skill_ids: list[str] | None,
             skill_tags: list[str] | None,
+            team_context: str | None,
     ) -> dict[str, Any]:
-        run_config = await self._resolve_run_config(
-            agent_id=agent_id,
-            model_name=model_name,
-            mcp_server_ids=mcp_server_ids,
-            skill_ids=skill_ids,
-            route_message=message,
-            allow_agent_routing=False,
-        )
-        resolved_agent_id, resolved_model, agent = self._resolve_agent(run_config)
-        skill_resolution = self._resolve_skills(
-            agent_id=resolved_agent_id,
-            message=message,
-            skill_ids=list(run_config.skill_ids),
-            skill_tags=skill_tags,
-        )
-        deps = self._build_deps(request_context, resolved_skill_names=tuple(skill_resolution.skill_names))
-        resolved_mcp_server_ids, run_toolsets = self._resolve_request_toolsets(
-            mcp_server_ids=run_config.mcp_server_keys,
-            mcp_server_configs=run_config.mcp_servers if run_config.source == "database" else (),
-            route_message=message,
-            skill_resolution=skill_resolution,
-            allow_auto_route=run_config.source != "database",
-        )
-        message_history = await self.history_store.load_messages(
-            session_id,
-            request_context=request_context,
-            agent_id=resolved_agent_id,
-        )
-        await self._record_tool_exposure(
-            agent_id=resolved_agent_id,
-            request_id=request_context.request_id,
-            message=message,
-            agent=agent,
-            deps=deps,
-            additional_toolsets=run_toolsets,
-            resolved_mcp_server_ids=resolved_mcp_server_ids,
-        )
+        started_at = time.perf_counter()
+        resolved_agent_id = agent_id
+        resolved_model = model_name or ""
+        skill_names: list[str] = []
+        resolved_mcp_server_ids: list[str] = []
         try:
+            run_config = await self._resolve_run_config(
+                agent_id=agent_id,
+                model_name=model_name,
+                mcp_server_ids=mcp_server_ids,
+                skill_ids=skill_ids,
+                route_message=message,
+                allow_agent_routing=False,
+            )
+            resolved_agent_id, resolved_model, agent = self._resolve_agent(run_config)
+            skill_resolution = self._resolve_skills(
+                agent_id=resolved_agent_id,
+                message=message,
+                skill_ids=list(run_config.skill_ids),
+                skill_tags=skill_tags,
+            )
+            skill_names = skill_resolution.skill_names
+            deps = self._build_deps(request_context, resolved_skill_names=tuple(skill_names))
+            resolved_mcp_server_ids, run_toolsets = self._resolve_request_toolsets(
+                mcp_server_ids=run_config.mcp_server_keys,
+                mcp_server_configs=run_config.mcp_servers if run_config.source == "database" else (),
+                route_message=message,
+                skill_resolution=skill_resolution,
+                allow_auto_route=run_config.source != "database",
+            )
+            message_history = await self.history_store.load_messages(
+                session_id,
+                request_context=request_context,
+                agent_id=resolved_agent_id,
+            )
+            worker_message = self._build_parallel_worker_message(
+                original_message=message,
+                team_context=team_context,
+            )
+            await self._record_tool_exposure(
+                agent_id=resolved_agent_id,
+                request_id=request_context.request_id,
+                message=worker_message,
+                agent=agent,
+                deps=deps,
+                additional_toolsets=run_toolsets,
+                resolved_mcp_server_ids=resolved_mcp_server_ids,
+            )
             result = await agent.run(
-                message,
+                worker_message,
                 deps=deps,
                 message_history=message_history or None,
                 instructions=skill_resolution.instructions or None,
                 toolsets=run_toolsets or None,
             )
-        except AIRuntimeError:
-            raise
         except Exception as exc:
-            raise AIRunExecutionError(f"parallel worker 执行失败: {resolved_agent_id}") from exc
+            return self._build_parallel_worker_result(
+                agent_id=resolved_agent_id,
+                model=resolved_model,
+                status="failed",
+                message=None,
+                usage=None,
+                mcp_servers=resolved_mcp_server_ids,
+                skills=skill_names,
+                started_at=started_at,
+                error=str(exc),
+                error_type=type(exc).__name__,
+                context_injected=bool(team_context),
+            )
 
         output = result.output
         if isinstance(output, DeferredToolRequests):
-            raise AIConfigValidationError(f"并行协同暂不支持 worker 进入审批: {resolved_agent_id}")
-        return {
-            "agent_id": resolved_agent_id,
-            "model": resolved_model,
-            "message": str(output),
-            "usage": self._serialize_usage(result),
-            "mcp_servers": resolved_mcp_server_ids,
-            "skills": skill_resolution.skill_names,
-        }
+            return self._build_parallel_worker_result(
+                agent_id=resolved_agent_id,
+                model=resolved_model,
+                status="failed",
+                message=None,
+                usage=self._serialize_usage(result),
+                mcp_servers=resolved_mcp_server_ids,
+                skills=skill_names,
+                started_at=started_at,
+                error="并行协同暂不支持 worker 进入审批",
+                error_type="DeferredToolRequests",
+                context_injected=bool(team_context),
+            )
+        return self._build_parallel_worker_result(
+            agent_id=resolved_agent_id,
+            model=resolved_model,
+            status="completed",
+            message=str(output),
+            usage=self._serialize_usage(result),
+            mcp_servers=resolved_mcp_server_ids,
+            skills=skill_names,
+            started_at=started_at,
+            context_injected=bool(team_context),
+        )
 
     async def _run_parallel_aggregator(
             self,
@@ -912,14 +958,95 @@ class AgentRunner:
 
     @staticmethod
     def _build_parallel_aggregate_prompt(*, original_message: str, worker_outputs: list[dict[str, Any]]) -> str:
-        worker_sections = "\n\n".join(
-            f"## {item['agent_id']}\n{item['message']}" for item in worker_outputs
+        completed_outputs = [item for item in worker_outputs if item.get("status") == "completed"]
+        failed_outputs = [item for item in worker_outputs if item.get("status") == "failed"]
+        completed_sections = "\n\n".join(
+            f"## {item['agent_id']} ({item.get('role')})\n{item['message']}" for item in completed_outputs
+        )
+        failed_sections = "\n".join(
+            f"- {item['agent_id']}: {item.get('error_type')} - {item.get('error')}" for item in failed_outputs
         )
         return (
-            "请整合以下多个 Agent 的并行分析结果，输出一个结构化、去重、可执行的最终答复。\n\n"
+            "请整合多个 Agent 的并行结果，输出精简、去重、可执行的最终答复。\n"
+            "不要复述 worker 原文；只保留必要结论。默认使用以下结构：\n"
+            "1. 结论\n"
+            "2. 推荐方案\n"
+            "3. 风险 Top 5\n"
+            "4. 下一步行动\n"
+            "如果有失败的 Agent，请在最后补充“协同失败项”。\n\n"
             f"# 用户原始请求\n{original_message}\n\n"
-            f"# 子 Agent 结果\n{worker_sections}"
+            f"# 成功的子 Agent 结果\n{completed_sections or '无'}\n\n"
+            f"# 失败的子 Agent\n{failed_sections or '无'}"
         )
+
+    def _build_parallel_worker_result(
+            self,
+            *,
+            agent_id: str,
+            model: str,
+            status: str,
+            message: str | None,
+            usage: dict[str, Any] | None,
+            mcp_servers: list[str],
+            skills: list[str],
+            started_at: float,
+            error: str | None = None,
+            error_type: str | None = None,
+            context_injected: bool = False,
+    ) -> dict[str, Any]:
+        return {
+            "agent_id": agent_id,
+            "role": self._parallel_agent_role(agent_id),
+            "status": status,
+            "model": model,
+            "message": message,
+            "error": error,
+            "error_type": error_type,
+            "duration_ms": round((time.perf_counter() - started_at) * 1000, 2),
+            "context_injected": context_injected,
+            "usage": usage,
+            "mcp_servers": mcp_servers,
+            "skills": skills,
+        }
+
+    @staticmethod
+    def _parallel_agent_role(agent_id: str) -> str:
+        return {
+            "explore-agent": "explore",
+            "planner-agent": "plan",
+            "review-agent": "review",
+            "summary-agent": "summary",
+        }.get(agent_id, agent_id.removesuffix("-agent"))
+
+    @staticmethod
+    def _build_parallel_worker_message(*, original_message: str, team_context: str | None) -> str:
+        if not team_context:
+            return original_message
+        return (
+            "# 当前用户请求\n"
+            f"{original_message}\n\n"
+            "# 上一轮团队汇总\n"
+            f"{team_context}\n\n"
+            "请基于上一轮团队汇总继续完成你当前角色的分析；不要声称看不到历史。"
+        )
+
+    @staticmethod
+    def _extract_latest_parallel_team_summary(messages: list[Any], max_chars: int = 2000) -> str | None:
+        for message in reversed(messages):
+            if not isinstance(message, ModelResponse):
+                continue
+            text_parts = [
+                part.content
+                for part in message.parts
+                if isinstance(part, TextPart) and isinstance(part.content, str)
+            ]
+            summary = "\n".join(text_parts).strip()
+            if not summary:
+                continue
+            if len(summary) <= max_chars:
+                return summary
+            return summary[-max_chars:]
+        return None
 
     async def _build_parallel_team_history_messages(
             self,
@@ -942,6 +1069,8 @@ class AgentRunner:
             messages: list[Any],
             model: str,
             team_results: list[dict[str, Any]],
+            aggregator_agent_id: str,
+            route_reason: str,
     ) -> bool:
         if not session_id:
             return False
@@ -954,13 +1083,30 @@ class AgentRunner:
             skills=[],
             mcp_servers=[],
             usage={
+                "team": {
+                    "aggregator_agent_id": aggregator_agent_id,
+                    "route_reason": route_reason,
+                    "worker_agent_ids": [item["agent_id"] for item in team_results],
+                    "completed_worker_agent_ids": [
+                        item["agent_id"] for item in team_results if item.get("status") == "completed"
+                    ],
+                    "failed_worker_agent_ids": [
+                        item["agent_id"] for item in team_results if item.get("status") == "failed"
+                    ],
+                },
                 "team_results": [
                     {
                         "agent_id": item["agent_id"],
+                        "role": item["role"],
+                        "status": item["status"],
                         "model": item["model"],
                         "usage": item["usage"],
                         "mcp_servers": item["mcp_servers"],
                         "skills": item["skills"],
+                        "duration_ms": item["duration_ms"],
+                        "context_injected": item["context_injected"],
+                        "error": item["error"],
+                        "error_type": item["error_type"],
                     }
                     for item in team_results
                 ],

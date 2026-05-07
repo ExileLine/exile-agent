@@ -232,15 +232,80 @@ def test_agent_router_runs_parallel_team_when_multiple_safe_agents_match() -> No
     assert agent_route["aggregator_agent_id"] == "summary-agent"
     team_results = body["data"]["meta"]["team_results"]
     assert [item["agent_id"] for item in team_results] == ["review-agent", "planner-agent"]
+    assert [item["status"] for item in team_results] == ["completed", "completed"]
+    assert [item["role"] for item in team_results] == ["review", "plan"]
+    assert all(isinstance(item["duration_ms"], int | float) for item in team_results)
+
+
+def test_parallel_team_continues_when_optional_worker_fails() -> None:
+    def review_model(messages: list[ModelRequest | ModelResponse], info: AgentInfo) -> ModelResponse:
+        del messages, info
+        raise RuntimeError("review exploded")
+
+    def planner_model(messages: list[ModelRequest | ModelResponse], info: AgentInfo) -> ModelResponse:
+        del messages, info
+        return ModelResponse(parts=[TextPart(content="计划：保留成功 worker 结果")])
+
+    def summary_model(messages: list[ModelRequest | ModelResponse], info: AgentInfo) -> ModelResponse:
+        del info
+        prompt_text = "\n".join(
+            str(getattr(part, "content", ""))
+            for message in messages
+            if isinstance(message, ModelRequest)
+            for part in message.parts
+        )
+        if "review-agent: RuntimeError - review exploded" in prompt_text:
+            return ModelResponse(parts=[TextPart(content="降级汇总：review 失败，planner 成功")])
+        return ModelResponse(parts=[TextPart(content="降级汇总缺失")])
+
+    with TestClient(app) as client:
+        review_agent = client.app.state.ai_agent_manager.get_agent("review-agent")
+        planner_agent = client.app.state.ai_agent_manager.get_agent("planner-agent")
+        summary_agent = client.app.state.ai_agent_manager.get_agent("summary-agent")
+        with review_agent.override(model=FunctionModel(review_model)):
+            with planner_agent.override(model=FunctionModel(planner_model)):
+                with summary_agent.override(model=FunctionModel(summary_model)):
+                    response = client.post(
+                        "/api/v1/agents/chat",
+                        json={"message": "请规划这个功能，并评估风险"},
+                        headers={"x-user-id": "tester"},
+                    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["data"]["message"] == "降级汇总：review 失败，planner 成功"
+    team_results = body["data"]["meta"]["team_results"]
+    assert team_results[0]["agent_id"] == "review-agent"
+    assert team_results[0]["status"] == "failed"
+    assert team_results[0]["error"] == "review exploded"
+    assert team_results[0]["error_type"] == "RuntimeError"
+    assert team_results[1]["agent_id"] == "planner-agent"
+    assert team_results[1]["status"] == "completed"
 
 
 def test_parallel_team_chat_saves_summary_history() -> None:
     def review_model(messages: list[ModelRequest | ModelResponse], info: AgentInfo) -> ModelResponse:
-        del messages, info
+        del info
+        prompt_text = "\n".join(
+            str(getattr(part, "content", ""))
+            for message in messages
+            if isinstance(message, ModelRequest)
+            for part in message.parts
+        )
+        if "上一轮团队汇总结果" in prompt_text:
+            return ModelResponse(parts=[TextPart(content="风险：已读取上一轮团队汇总")])
         return ModelResponse(parts=[TextPart(content="风险：需要控制并发")])
 
     def planner_model(messages: list[ModelRequest | ModelResponse], info: AgentInfo) -> ModelResponse:
-        del messages, info
+        del info
+        prompt_text = "\n".join(
+            str(getattr(part, "content", ""))
+            for message in messages
+            if isinstance(message, ModelRequest)
+            for part in message.parts
+        )
+        if "上一轮团队汇总结果" in prompt_text:
+            return ModelResponse(parts=[TextPart(content="计划：已读取上一轮团队汇总")])
         return ModelResponse(parts=[TextPart(content="计划：先做任务表")])
 
     def summary_model(messages: list[ModelRequest | ModelResponse], info: AgentInfo) -> ModelResponse:
@@ -308,6 +373,7 @@ def test_parallel_team_chat_saves_summary_history() -> None:
     assert first_body["data"]["meta"]["history_saved"] is True
     assert first_body["data"]["meta"]["message_count"] == 2
     assert first_body["data"]["message"] == "上一轮团队汇总结果"
+    assert all(item["context_injected"] is False for item in first_body["data"]["meta"]["team_results"])
 
     assert second_response.status_code == 200
     second_body = second_response.json()
@@ -315,10 +381,19 @@ def test_parallel_team_chat_saves_summary_history() -> None:
     assert second_body["data"]["meta"]["history_saved"] is True
     assert second_body["data"]["meta"]["message_count"] == 4
     assert second_body["data"]["message"] == "第二轮汇总：已读取团队历史"
+    assert all(item["context_injected"] is True for item in second_body["data"]["meta"]["team_results"])
+    assert [item["message"] for item in second_body["data"]["meta"]["team_results"]] == [
+        "风险：已读取上一轮团队汇总",
+        "计划：已读取上一轮团队汇总",
+    ]
 
     assert record is not None
     assert record.metadata.agent_id == "team:auto-parallel"
     assert record.metadata.message_count == 4
+    assert record.metadata.usage is not None
+    assert record.metadata.usage["team"]["aggregator_agent_id"] == "summary-agent"
+    assert record.metadata.usage["team"]["worker_agent_ids"] == ["review-agent", "planner-agent"]
+    assert record.metadata.usage["team"]["failed_worker_agent_ids"] == []
     assert len(record.messages) == 4
 
 

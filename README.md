@@ -738,8 +738,11 @@ curl 'http://127.0.0.1:8000/api/v1/agents/skills'
 - `executor-agent` 不会自动进入并行 worker，避免未经确认触发执行类行为
 - `/chat/stream` 和 `/chat/resume` 暂不做并行协同
 - 并行协同会把“用户原始输入 + 最终汇总输出”写入 `team:auto-parallel` 的会话历史，不保存 worker 长输出到 message history
+- 后续同一 `session_id` 的团队请求会把最近一轮团队汇总注入 worker prompt，避免 worker 声称看不到上下文
+- 聚合 prompt 会默认压缩为结论、推荐方案、风险 Top 5、下一步行动，避免整段复述 worker 原文
+- 单个可选 worker 失败不会拖垮整体；失败信息会进入 `team_results` 并交给 `summary-agent` 汇总说明
 
-路由命中信息会返回在 `data.meta.agent_route`，用于调试本轮为什么选择某个 Agent。并行协同的子 Agent 输出会返回在 `data.meta.team_results`。
+路由命中信息会返回在 `data.meta.agent_route`，用于调试本轮为什么选择某个 Agent。并行协同的子 Agent 输出会返回在 `data.meta.team_results`，其中 `context_injected` 表示该 worker 是否注入了上一轮团队汇总。
 
 示意：
 

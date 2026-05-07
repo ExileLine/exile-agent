@@ -553,6 +553,8 @@ app/
 10. 轻量 AgentRouter 自动命中
 11. Multi-hit AgentRouter + Parallel Team MVP
 12. Parallel Team history 保存
+13. Parallel Team 稳定化：精简聚合、失败降级、team_results 元信息
+14. Parallel Worker Context Injection
 
 建议继续按这个顺序推进：
 

@@ -32,7 +32,9 @@
 - 已完成轻量 `AgentRouter`，未显式传 `agent_id` 时可按关键词自动命中内置 Agent，并在响应 meta 返回路由原因。
 - 已完成 Multi-hit AgentRouter + Parallel Team MVP，普通 `/chat` 多意图命中时可并行运行 `explore/planner/review` 并由 `summary-agent` 汇总。
 - 已完成 Parallel Team history 保存，团队协同只保存用户原始输入和最终汇总输出，避免 worker 长输出污染上下文。
-- 当前自动化测试基线：`56 passed`。
+- 已完成 Parallel Team 稳定化，支持精简聚合 prompt、worker 失败降级、team_results 状态/耗时/错误和 history 团队摘要 metadata。
+- 已完成 Parallel Worker Context Injection，worker 会注入最近一轮团队汇总并在 `team_results.context_injected` 标记。
+- 当前自动化测试基线：`57 passed`。
 
 当前待补：
 
