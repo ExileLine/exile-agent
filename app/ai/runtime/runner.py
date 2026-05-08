@@ -506,6 +506,15 @@ class AgentRunner:
         if not resolved_message_history_json:
             raise AIConfigValidationError("resume 需要 approval_id 或 message_history_json")
         self._validate_approval_decisions(approvals=approvals, approval_record=approval_record)
+        if approval_record is not None and approval_record.metadata.get("kind") == "team_worker_approval":
+            return await self._resume_parallel_team_worker(
+                request_context=request_context,
+                approval_record=approval_record,
+                approvals=approvals,
+                session_id=session_id,
+                model_name=model_name,
+            )
+
         message_history = ModelMessagesTypeAdapter.validate_json(resolved_message_history_json)
         latest_user_message = self._extract_latest_user_message(message_history)
         resume_agent_id = agent_id or (approval_record.agent_id if approval_record is not None else None)
@@ -771,7 +780,29 @@ class AgentRunner:
             ]
         )
         completed_worker_outputs = [item for item in worker_outputs if item.get("status") == "completed"]
+        approval_worker_outputs = [item for item in worker_outputs if item.get("status") == "approval_required"]
         failed_worker_outputs = [item for item in worker_outputs if item.get("status") == "failed"]
+        if approval_worker_outputs:
+            approval_response = await self._build_parallel_team_approval_response(
+                team_run_id=team_run_id,
+                request_context=request_context,
+                session_id=session_id,
+                route_run_config=route_run_config,
+                route=route,
+                message=message,
+                worker_outputs=worker_outputs,
+                approval_worker_output=approval_worker_outputs[0],
+                history_loaded=bool(previous_history_messages),
+                started_at=started_at,
+                model=route_run_config.model_name,
+                run_kind="chat",
+                mcp_server_ids=mcp_server_ids,
+                skill_ids=skill_ids,
+                skill_tags=skill_tags,
+                model_name=model_name,
+            )
+            return approval_response
+
         if not completed_worker_outputs:
             failed_agents = ", ".join(str(item.get("agent_id")) for item in failed_worker_outputs)
             await self._save_team_run_trace(
@@ -970,6 +1001,30 @@ class AgentRunner:
         worker_order = {agent_id: index for index, agent_id in enumerate(route.worker_agent_ids)}
         worker_outputs.sort(key=lambda item: worker_order.get(str(item.get("agent_id")), len(worker_order)))
         completed_worker_outputs = [item for item in worker_outputs if item.get("status") == "completed"]
+        approval_worker_outputs = [item for item in worker_outputs if item.get("status") == "approval_required"]
+        if approval_worker_outputs:
+            approval_response = await self._build_parallel_team_approval_response(
+                team_run_id=stream_run_id,
+                request_context=request_context,
+                session_id=session_id,
+                route_run_config=route_run_config,
+                route=route,
+                message=message,
+                worker_outputs=worker_outputs,
+                approval_worker_output=approval_worker_outputs[0],
+                history_loaded=history_loaded,
+                started_at=started_at,
+                model=route_run_config.model_name,
+                run_kind="stream",
+                mcp_server_ids=mcp_server_ids,
+                skill_ids=skill_ids,
+                skill_tags=skill_tags,
+                model_name=model_name,
+            )
+            yield self._sse_event("approval_pending", approval_response.model_dump(mode="json"))
+            yield self._sse_event("approval_required", approval_response.model_dump(mode="json"))
+            return
+
         if not completed_worker_outputs:
             failed_agents = ", ".join(str(item.get("agent_id")) for item in worker_outputs)
             await self._save_team_run_trace(
@@ -1107,6 +1162,287 @@ class AgentRunner:
         )
         yield self._sse_event("done", response.model_dump(mode="json"))
 
+    async def _build_parallel_team_approval_response(
+            self,
+            *,
+            team_run_id: str,
+            request_context: RequestContext,
+            session_id: str | None,
+            route_run_config: ResolvedRunConfig,
+            route: ResolvedAgentRoute,
+            message: str,
+            worker_outputs: list[dict[str, Any]],
+            approval_worker_output: dict[str, Any],
+            history_loaded: bool,
+            started_at: float,
+            model: str,
+            run_kind: str,
+            mcp_server_ids: list[str] | None,
+            skill_ids: list[str] | None,
+            skill_tags: list[str] | None,
+            model_name: str | None,
+    ) -> AgentChatResponse:
+        deferred_payload = AgentDeferredToolRequestsPayload.model_validate(
+            approval_worker_output.get("deferred_tool_requests") or {}
+        )
+        response = AgentChatResponse(
+            run_id=team_run_id,
+            agent_id=route.selected_agent_id,
+            model=model,
+            status="approval_required",
+            message=None,
+            deferred_tool_requests=deferred_payload,
+            request_id=request_context.request_id,
+            session_id=session_id,
+            usage=None,
+            meta=self._build_run_meta(
+                run_kind=run_kind,
+                stream_mode="fallback" if run_kind == "stream" else None,
+                history_loaded=history_loaded,
+                history_saved=False,
+                message_count=0,
+                mcp_servers=[],
+                skills=[],
+                run_config=route_run_config,
+                team_results=worker_outputs,
+            ),
+        )
+        await self._attach_team_worker_approval_record(
+            response=response,
+            request_context=request_context,
+            worker_output=approval_worker_output,
+            route=route,
+            original_message=message,
+            worker_outputs=worker_outputs,
+            mcp_server_ids=mcp_server_ids,
+            skill_ids=skill_ids,
+            skill_tags=skill_tags,
+            model_name=model_name,
+        )
+        await self._save_team_run_trace(
+            team_run_id=team_run_id,
+            run_kind=run_kind,
+            request_context=request_context,
+            session_id=session_id,
+            route_run_config=route_run_config,
+            aggregator_agent_id=route.aggregator_agent_id or "",
+            model=model,
+            status=response.status,
+            final_message=None,
+            usage=None,
+            worker_outputs=worker_outputs,
+            started_at=started_at,
+            error="等待 Team Worker 审批",
+        )
+        return response
+
+    async def _resume_parallel_team_worker(
+            self,
+            *,
+            request_context: RequestContext,
+            approval_record: ApprovalRecord,
+            approvals: list[AgentApprovalDecision],
+            session_id: str | None,
+            model_name: str | None,
+    ) -> AgentChatResponse:
+        started_at = time.perf_counter()
+        metadata = approval_record.metadata
+        team_run_id = str(metadata.get("team_run_id") or approval_record.run_id)
+        worker_agent_id = str(metadata.get("worker_agent_id") or approval_record.agent_id)
+        aggregator_agent_id = str(metadata.get("aggregator_agent_id") or "summary-agent")
+        original_message = str(metadata.get("original_message") or self._extract_latest_user_message(
+            ModelMessagesTypeAdapter.validate_json(approval_record.message_history_json)
+        ) or "")
+        worker_outputs = list(metadata.get("worker_outputs") or [])
+        route = dict(metadata.get("route") or {})
+        resumed_session_id = session_id or approval_record.session_id
+        requested_model_name = model_name or metadata.get("model_name")
+
+        run_config = await self._resolve_run_config(
+            agent_id=worker_agent_id,
+            model_name=requested_model_name if isinstance(requested_model_name, str) else None,
+            mcp_server_ids=list(metadata.get("mcp_server_ids") or []),
+            skill_ids=list(metadata.get("skill_ids") or []),
+            route_message=original_message,
+            allow_agent_routing=False,
+        )
+        resolved_agent_id, resolved_model, agent = self._resolve_agent(run_config)
+        skill_resolution = self._resolve_skills(
+            agent_id=resolved_agent_id,
+            message=original_message,
+            skill_ids=list(run_config.skill_ids),
+            skill_tags=list(metadata.get("skill_tags") or []),
+        )
+        deps = self._build_deps(request_context, resolved_skill_names=tuple(skill_resolution.skill_names))
+        resolved_mcp_server_ids, run_toolsets = self._resolve_request_toolsets(
+            mcp_server_ids=run_config.mcp_server_keys,
+            mcp_server_configs=run_config.mcp_servers if run_config.source == "database" else (),
+            route_message=original_message,
+            skill_resolution=skill_resolution,
+            allow_auto_route=run_config.source != "database",
+        )
+        deferred_tool_results = self._build_deferred_tool_results(approvals)
+        message_history = ModelMessagesTypeAdapter.validate_json(approval_record.message_history_json)
+
+        try:
+            result = await agent.run(
+                deps=deps,
+                message_history=message_history,
+                deferred_tool_results=deferred_tool_results,
+                instructions=skill_resolution.instructions or None,
+                toolsets=run_toolsets or None,
+            )
+        except AIRuntimeError:
+            raise
+        except Exception as exc:
+            raise AIRunExecutionError("team worker resume run 执行失败") from exc
+
+        output = result.output
+        if isinstance(output, DeferredToolRequests):
+            deferred_payload = self._serialize_deferred_tool_requests(result, output)
+            resumed_worker_output = self._build_parallel_worker_result(
+                agent_id=resolved_agent_id,
+                model=resolved_model,
+                status="approval_required",
+                message=None,
+                usage=self._serialize_usage(result),
+                mcp_servers=resolved_mcp_server_ids,
+                skills=skill_resolution.skill_names,
+                started_at=started_at,
+                deferred_tool_requests=deferred_payload.model_dump(mode="json"),
+                context_injected=bool(_find_worker_output(worker_outputs, resolved_agent_id).get("context_injected")),
+            )
+            updated_worker_outputs = _replace_worker_output(worker_outputs, resumed_worker_output)
+            response = AgentChatResponse(
+                run_id=team_run_id,
+                agent_id=str(route.get("selected_agent_id") or "team:auto-parallel"),
+                model=resolved_model,
+                status="approval_required",
+                message=None,
+                deferred_tool_requests=deferred_payload,
+                request_id=request_context.request_id,
+                session_id=resumed_session_id,
+                usage=self._serialize_usage(result),
+                meta=self._build_team_resume_meta(
+                    route=route,
+                    run_kind="resume",
+                    history_loaded=True,
+                    history_saved=False,
+                    team_results=updated_worker_outputs,
+                    model_key=run_config.model_key,
+                    provider_key=run_config.model.provider_key,
+                    config_source=run_config.source,
+                    config_version=run_config.config_version,
+                ),
+            )
+            await self._attach_team_worker_approval_record(
+                response=response,
+                request_context=request_context,
+                worker_output=resumed_worker_output,
+                route_dict=route,
+                original_message=original_message,
+                worker_outputs=updated_worker_outputs,
+                mcp_server_ids=list(metadata.get("mcp_server_ids") or []),
+                skill_ids=list(metadata.get("skill_ids") or []),
+                skill_tags=list(metadata.get("skill_tags") or []),
+                model_name=requested_model_name if isinstance(requested_model_name, str) else None,
+            )
+            await self.approval_store.mark_completed(approval_record.approval_id)
+            await self._save_team_run_trace_from_route(
+                team_run_id=team_run_id,
+                run_kind="resume",
+                request_context=request_context,
+                session_id=resumed_session_id,
+                route=route,
+                aggregator_agent_id=aggregator_agent_id,
+                model=resolved_model,
+                status=response.status,
+                final_message=None,
+                usage=response.usage,
+                worker_outputs=updated_worker_outputs,
+                started_at=started_at,
+                error="等待 Team Worker 审批",
+            )
+            return response
+
+        resumed_worker_output = self._build_parallel_worker_result(
+            agent_id=resolved_agent_id,
+            model=resolved_model,
+            status="completed",
+            message=str(output),
+            usage=self._serialize_usage(result),
+            mcp_servers=resolved_mcp_server_ids,
+            skills=skill_resolution.skill_names,
+            started_at=started_at,
+            context_injected=bool(_find_worker_output(worker_outputs, resolved_agent_id).get("context_injected")),
+        )
+        updated_worker_outputs = _replace_worker_output(worker_outputs, resumed_worker_output)
+        previous_history_messages = await self.history_store.load_messages(
+            resumed_session_id,
+            request_context=request_context,
+            agent_id="team:auto-parallel",
+        )
+        aggregator_output = await self._run_parallel_aggregator(
+            aggregator_agent_id=aggregator_agent_id,
+            request_context=request_context,
+            message=original_message,
+            worker_outputs=updated_worker_outputs,
+            model_name=model_name,
+            message_history=previous_history_messages,
+        )
+        history_messages = await self._build_parallel_team_history_messages(
+            previous_messages=previous_history_messages,
+            message=original_message,
+            final_message=aggregator_output["message"],
+        )
+        history_saved = await self._save_parallel_team_history(
+            session_id=resumed_session_id,
+            request_context=request_context,
+            messages=history_messages,
+            model=aggregator_output["model"],
+            team_results=updated_worker_outputs,
+            aggregator_agent_id=aggregator_agent_id,
+            route_reason=str(route.get("reason") or "Team worker 审批续跑后重新聚合"),
+        )
+        await self.approval_store.mark_completed(approval_record.approval_id)
+        response = AgentChatResponse(
+            run_id=team_run_id,
+            agent_id=str(route.get("selected_agent_id") or "team:auto-parallel"),
+            model=aggregator_output["model"],
+            status="completed",
+            message=aggregator_output["message"],
+            request_id=request_context.request_id,
+            session_id=resumed_session_id,
+            usage=aggregator_output["usage"],
+            meta=self._build_team_resume_meta(
+                route=route,
+                run_kind="resume",
+                history_loaded=True,
+                history_saved=history_saved,
+                message_count=len(history_messages),
+                team_results=updated_worker_outputs,
+                model_key=run_config.model_key,
+                provider_key=run_config.model.provider_key,
+                config_source=run_config.source,
+                config_version=run_config.config_version,
+            ),
+        )
+        await self._save_team_run_trace_from_route(
+            team_run_id=team_run_id,
+            run_kind="resume",
+            request_context=request_context,
+            session_id=resumed_session_id,
+            route=route,
+            aggregator_agent_id=aggregator_agent_id,
+            model=aggregator_output["model"],
+            status=response.status,
+            final_message=response.message,
+            usage=response.usage,
+            worker_outputs=updated_worker_outputs,
+            started_at=started_at,
+        )
+        return response
+
     async def _run_parallel_worker(
             self,
             *,
@@ -1192,17 +1528,17 @@ class AgentRunner:
 
         output = result.output
         if isinstance(output, DeferredToolRequests):
+            deferred_payload = self._serialize_deferred_tool_requests(result, output)
             return self._build_parallel_worker_result(
                 agent_id=resolved_agent_id,
                 model=resolved_model,
-                status="failed",
+                status="approval_required",
                 message=None,
                 usage=self._serialize_usage(result),
                 mcp_servers=resolved_mcp_server_ids,
                 skills=skill_names,
                 started_at=started_at,
-                error="并行协同暂不支持 worker 进入审批",
-                error_type="DeferredToolRequests",
+                deferred_tool_requests=deferred_payload.model_dump(mode="json"),
                 context_injected=bool(team_context),
             )
         return self._build_parallel_worker_result(
@@ -1298,6 +1634,7 @@ class AgentRunner:
             started_at: float,
             error: str | None = None,
             error_type: str | None = None,
+            deferred_tool_requests: dict[str, Any] | None = None,
             context_injected: bool = False,
     ) -> dict[str, Any]:
         return {
@@ -1308,6 +1645,7 @@ class AgentRunner:
             "message": message,
             "error": error,
             "error_type": error_type,
+            "deferred_tool_requests": deferred_tool_requests,
             "duration_ms": round((time.perf_counter() - started_at) * 1000, 2),
             "context_injected": context_injected,
             "usage": usage,
@@ -1471,6 +1809,78 @@ class AgentRunner:
                 },
                 worker_results=worker_outputs,
             )
+        )
+
+    async def _save_team_run_trace_from_route(
+            self,
+            *,
+            team_run_id: str,
+            run_kind: str,
+            request_context: RequestContext,
+            session_id: str | None,
+            route: dict[str, Any],
+            aggregator_agent_id: str,
+            model: str,
+            status: str,
+            final_message: str | None,
+            usage: dict[str, Any] | None,
+            worker_outputs: list[dict[str, Any]],
+            started_at: float,
+            error: str | None = None,
+    ) -> None:
+        if self.team_trace_store is None:
+            return
+        await self.team_trace_store.save(
+            TeamRunTracePayload(
+                team_run_id=team_run_id,
+                run_kind=run_kind,
+                agent_id=str(route.get("selected_agent_id") or "team:auto-parallel"),
+                request_id=request_context.request_id,
+                session_id=session_id,
+                user_id=request_context.user_id,
+                tenant_id=request_context.tenant_id,
+                status=status,
+                model=model,
+                aggregator_agent_id=aggregator_agent_id,
+                worker_agent_ids=[str(item.get("agent_id")) for item in worker_outputs],
+                route=route,
+                usage=usage,
+                final_message=final_message,
+                duration_ms=round((time.perf_counter() - started_at) * 1000, 2),
+                error=error,
+                metadata={"resume": True},
+                worker_results=worker_outputs,
+            )
+        )
+
+    @staticmethod
+    def _build_team_resume_meta(
+            *,
+            route: dict[str, Any],
+            run_kind: str,
+            history_loaded: bool,
+            history_saved: bool,
+            team_results: list[dict[str, Any]],
+            model_key: str | None,
+            provider_key: str | None,
+            config_source: str | None,
+            config_version: str | None,
+            message_count: int = 0,
+    ) -> AgentRunMeta:
+        return AgentRunMeta(
+            run_kind=run_kind,
+            stream_mode=None,
+            history_loaded=history_loaded,
+            history_saved=history_saved,
+            message_count=message_count,
+            mcp_servers=[],
+            skills=[],
+            config_source=config_source,
+            model_key=model_key,
+            provider_key=provider_key,
+            config_version=config_version,
+            agent_route=route,
+            team_results=team_results,
         )
 
     @staticmethod
@@ -1890,6 +2300,55 @@ class AgentRunner:
         payload.expires_at = record.expires_at
         payload.status = record.status
 
+    async def _attach_team_worker_approval_record(
+            self,
+            *,
+            response: AgentChatResponse,
+            request_context: RequestContext,
+            worker_output: dict[str, Any],
+            original_message: str,
+            worker_outputs: list[dict[str, Any]],
+            mcp_server_ids: list[str] | None,
+            skill_ids: list[str] | None,
+            skill_tags: list[str] | None,
+            model_name: str | None,
+            route: ResolvedAgentRoute | None = None,
+            route_dict: dict[str, Any] | None = None,
+    ) -> None:
+        payload = response.deferred_tool_requests
+        if response.status != "approval_required" or payload is None:
+            return
+        route_payload = route_dict if route_dict is not None else self._build_agent_route_trace(route)
+        worker_agent_id = str(worker_output.get("agent_id") or "")
+        record = await self.approval_store.create(
+            run_id=response.run_id,
+            agent_id=worker_agent_id,
+            request_id=request_context.request_id,
+            session_id=response.session_id or request_context.session_id,
+            user_id=request_context.user_id,
+            message_history_json=payload.message_history_json,
+            approval_tool_call_ids=[item.tool_call_id for item in payload.approvals],
+            call_tool_call_ids=[item.tool_call_id for item in payload.calls],
+            metadata={
+                "kind": "team_worker_approval",
+                "team_run_id": response.run_id,
+                "team_agent_id": response.agent_id,
+                "worker_agent_id": worker_agent_id,
+                "aggregator_agent_id": route_payload.get("aggregator_agent_id"),
+                "original_message": original_message,
+                "route": route_payload,
+                "worker_outputs": worker_outputs,
+                "mcp_server_ids": list(mcp_server_ids or []),
+                "skill_ids": list(skill_ids or []),
+                "skill_tags": list(skill_tags or []),
+                "model_name": model_name,
+                "model": response.model,
+            },
+        )
+        payload.approval_id = record.approval_id
+        payload.expires_at = record.expires_at
+        payload.status = record.status
+
     async def _load_approval_record_for_resume(
         self,
         *,
@@ -1900,12 +2359,22 @@ class AgentRunner:
     ) -> ApprovalRecord | None:
         if not approval_id:
             return None
-        return await self.approval_store.get_pending(
+        record = await self.approval_store.get_pending(
             approval_id,
-            agent_id=agent_id,
+            agent_id=None,
             session_id=session_id,
             user_id=user_id,
         )
+        if agent_id is None:
+            return record
+        if record.metadata.get("kind") == "team_worker_approval":
+            allowed_agent_ids = {record.agent_id, record.metadata.get("team_agent_id")}
+            if agent_id not in allowed_agent_ids:
+                raise AIConfigValidationError("审批单 Agent 不匹配")
+            return record
+        if agent_id != record.agent_id:
+            raise AIConfigValidationError("审批单 Agent 不匹配")
+        return record
 
     @staticmethod
     def _validate_approval_decisions(
@@ -2208,3 +2677,25 @@ def _dedupe_server_ids(server_ids: list[str]) -> list[str]:
         seen.add(normalized)
         deduped.append(normalized)
     return deduped
+
+
+def _find_worker_output(worker_outputs: list[dict[str, Any]], agent_id: str) -> dict[str, Any]:
+    for item in worker_outputs:
+        if item.get("agent_id") == agent_id:
+            return item
+    return {}
+
+
+def _replace_worker_output(worker_outputs: list[dict[str, Any]], replacement: dict[str, Any]) -> list[dict[str, Any]]:
+    replaced = False
+    updated: list[dict[str, Any]] = []
+    replacement_agent_id = replacement.get("agent_id")
+    for item in worker_outputs:
+        if item.get("agent_id") == replacement_agent_id:
+            updated.append(replacement)
+            replaced = True
+        else:
+            updated.append(item)
+    if not replaced:
+        updated.append(replacement)
+    return updated

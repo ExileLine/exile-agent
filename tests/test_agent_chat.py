@@ -20,6 +20,7 @@ from app.ai.config_store.encryption import encrypt_secret
 from app.ai.deps import AgentDeps, RequestContext
 from app.ai.exceptions import AIConfigValidationError, MCPConfigurationError, MCPRuntimeError, MCPServerNotFoundError
 from app.ai.agents import register_default_agents
+from app.ai.runtime.agent_router import AgentRouteRule
 from app.ai.runtime.resolved_config import ResolvedModelConfig, ResolvedProviderConfig, ResolvedRunConfig
 from app.main import app
 from app.ai.schemas.agent import AgentManifest
@@ -279,6 +280,128 @@ def test_parallel_team_chat_persists_team_run_trace() -> None:
     assert trace["route"]["mode"] == "parallel"
     assert trace["worker_agent_ids"] == ["review-agent", "planner-agent"]
     assert [item["agent_id"] for item in trace["workers"]] == ["review-agent", "planner-agent"]
+
+
+def test_parallel_team_worker_approval_can_resume_and_reaggregate(monkeypatch) -> None:
+    def approval_worker_model(messages: list[ModelRequest | ModelResponse], info: AgentInfo) -> ModelResponse:
+        del info
+        for message in messages:
+            if isinstance(message, ModelRequest):
+                for part in message.parts:
+                    if isinstance(part, ToolReturnPart) and part.tool_name == "delete_demo_resource":
+                        return ModelResponse(parts=[TextPart(content="审批 worker 已执行: deleted")])
+
+        return ModelResponse(parts=[ToolCallPart(tool_name="delete_demo_resource", args={})])
+
+    def planner_model(messages: list[ModelRequest | ModelResponse], info: AgentInfo) -> ModelResponse:
+        del messages, info
+        return ModelResponse(parts=[TextPart(content="计划 worker 已完成")])
+
+    def summary_model(messages: list[ModelRequest | ModelResponse], info: AgentInfo) -> ModelResponse:
+        del info
+        prompt_text = "\n".join(
+            str(getattr(part, "content", ""))
+            for message in messages
+            if isinstance(message, ModelRequest)
+            for part in message.parts
+        )
+        if "审批 worker 已执行: deleted" in prompt_text and "计划 worker 已完成" in prompt_text:
+            return ModelResponse(parts=[TextPart(content="Team 审批续跑后汇总完成")])
+        return ModelResponse(parts=[TextPart(content="Team 审批续跑汇总缺失")])
+
+    with TestClient(app) as client:
+        registry = client.app.state.ai_agent_registry
+        manager = client.app.state.ai_agent_manager
+        runner = client.app.state.ai_runner
+        registry.register(
+            AgentManifest(
+                agent_id="approval-worker-agent",
+                name="Approval Worker Agent",
+                description="Agent used to test team-aware approval resume.",
+                default_model="test",
+            ),
+            _build_approval_demo_agent,
+        )
+        monkeypatch.setattr(
+            runner.agent_router,
+            "rules",
+            (
+                AgentRouteRule(
+                    agent_id="approval-worker-agent",
+                    reason="命中审批 worker 测试意图",
+                    keywords=("审批测试",),
+                ),
+                AgentRouteRule(
+                    agent_id="planner-agent",
+                    reason="命中规划意图",
+                    keywords=("规划",),
+                ),
+            ),
+        )
+        monkeypatch.setattr(
+            runner.agent_router,
+            "parallel_worker_agent_ids",
+            {"approval-worker-agent", "planner-agent"},
+        )
+
+        approval_agent = manager.get_agent("approval-worker-agent")
+        planner_agent = manager.get_agent("planner-agent")
+        summary_agent = manager.get_agent("summary-agent")
+        with approval_agent.override(model=FunctionModel(approval_worker_model)):
+            with planner_agent.override(model=FunctionModel(planner_model)):
+                with summary_agent.override(model=FunctionModel(summary_model)):
+                    first_response = client.post(
+                        "/api/v1/agents/chat",
+                        json={
+                            "message": "请审批测试并规划这个功能",
+                            "session_id": "team-approval-resume",
+                        },
+                        headers={"x-user-id": "tester"},
+                    )
+                    first_body = first_response.json()
+                    deferred = first_body["data"]["deferred_tool_requests"]
+                    resume_response = client.post(
+                        "/api/v1/agents/chat/resume",
+                        json={
+                            "agent_id": first_body["data"]["agent_id"],
+                            "session_id": "team-approval-resume",
+                            "approval_id": deferred["approval_id"],
+                            "approvals": [
+                                {
+                                    "tool_call_id": deferred["approvals"][0]["tool_call_id"],
+                                    "approved": True,
+                                }
+                            ],
+                        },
+                        headers={"x-user-id": "tester"},
+                    )
+                    trace_response = client.get(f"/api/v1/agents/team-runs/{first_body['data']['run_id']}")
+
+    assert first_response.status_code == 200
+    assert first_body["data"]["agent_id"] == "team:auto-parallel"
+    assert first_body["data"]["status"] == "approval_required"
+    assert first_body["data"]["deferred_tool_requests"]["approval_id"]
+    assert first_body["data"]["meta"]["team_results"][0]["status"] == "approval_required"
+
+    assert resume_response.status_code == 200
+    resume_body = resume_response.json()
+    assert resume_body["data"]["run_id"] == first_body["data"]["run_id"]
+    assert resume_body["data"]["agent_id"] == "team:auto-parallel"
+    assert resume_body["data"]["status"] == "completed"
+    assert resume_body["data"]["message"] == "Team 审批续跑后汇总完成"
+    assert resume_body["data"]["meta"]["run_kind"] == "resume"
+    assert [item["status"] for item in resume_body["data"]["meta"]["team_results"]] == [
+        "completed",
+        "completed",
+    ]
+
+    assert trace_response.status_code == 200
+    trace = trace_response.json()["data"]
+    assert trace["team_run_id"] == first_body["data"]["run_id"]
+    assert trace["run_kind"] == "resume"
+    assert trace["status"] == "completed"
+    assert trace["final_message"] == "Team 审批续跑后汇总完成"
+    assert [item["status"] for item in trace["workers"]] == ["completed", "completed"]
 
 
 def test_parallel_team_continues_when_optional_worker_fails() -> None:

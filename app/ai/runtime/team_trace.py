@@ -112,26 +112,36 @@ class TeamRunTraceStore:
 
         try:
             async with self.db_session_factory() as session:
-                run = AITeamRunTrace(
-                    team_run_id=payload.team_run_id,
-                    run_kind=payload.run_kind,
-                    agent_id=payload.agent_id,
-                    request_id=payload.request_id,
-                    session_id=payload.session_id,
-                    user_id=payload.user_id,
-                    tenant_id=payload.tenant_id,
-                    status_text=payload.status,
-                    model=payload.model,
-                    aggregator_agent_id=payload.aggregator_agent_id,
-                    worker_agent_ids_json=payload.worker_agent_ids,
-                    route_json=payload.route,
-                    usage_json=payload.usage,
-                    final_message=payload.final_message,
-                    duration_ms=payload.duration_ms,
-                    error=payload.error,
-                    metadata_json=payload.metadata or {},
-                )
-                session.add(run)
+                run = await _get_run(session, payload.team_run_id)
+                values = {
+                    "run_kind": payload.run_kind,
+                    "agent_id": payload.agent_id,
+                    "request_id": payload.request_id,
+                    "session_id": payload.session_id,
+                    "user_id": payload.user_id,
+                    "tenant_id": payload.tenant_id,
+                    "status_text": payload.status,
+                    "model": payload.model,
+                    "aggregator_agent_id": payload.aggregator_agent_id,
+                    "worker_agent_ids_json": payload.worker_agent_ids,
+                    "route_json": payload.route,
+                    "usage_json": payload.usage,
+                    "final_message": payload.final_message,
+                    "duration_ms": payload.duration_ms,
+                    "error": payload.error,
+                    "metadata_json": payload.metadata or {},
+                }
+                if run is None:
+                    run = AITeamRunTrace(team_run_id=payload.team_run_id, **values)
+                    session.add(run)
+                else:
+                    for key, value in values.items():
+                        setattr(run, key, value)
+                    run.touch()
+                    for worker in await _list_workers(session, payload.team_run_id):
+                        worker.is_deleted = 1
+                        worker.touch()
+
                 for worker in payload.worker_results or []:
                     session.add(_worker_result_to_model(payload.team_run_id, worker))
                 await session.commit()
@@ -213,7 +223,9 @@ def _worker_result_to_model(team_run_id: str, worker: dict[str, Any]) -> AITeamW
         usage_json=worker.get("usage"),
         mcp_servers_json=list(worker.get("mcp_servers") or []),
         skills_json=list(worker.get("skills") or []),
-        metadata_json={},
+        metadata_json={
+            "deferred_tool_requests": worker.get("deferred_tool_requests"),
+        },
     )
 
 
@@ -250,6 +262,7 @@ def _models_to_dict(run: AITeamRunTrace, workers: list[AITeamWorkerRunTrace]) ->
                 "usage": item.usage_json,
                 "mcp_servers": item.mcp_servers_json or [],
                 "skills": item.skills_json or [],
+                "deferred_tool_requests": (item.metadata_json or {}).get("deferred_tool_requests"),
             }
             for item in workers
         ],
