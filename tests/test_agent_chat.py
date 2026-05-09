@@ -590,6 +590,8 @@ def test_get_session_histories_returns_chat_and_parallel_team_scopes() -> None:
     )
     with TestClient(app) as client:
         history_store = client.app.state.ai_history_store
+        original_db_enabled = history_store.db_enabled
+        history_store.db_enabled = False
         for agent_id in ("chat-agent", "team:auto-parallel"):
             asyncio.run(
                 history_store.delete_messages(
@@ -635,17 +637,19 @@ def test_get_session_histories_returns_chat_and_parallel_team_scopes() -> None:
                         agent_id=agent_id,
                     )
                 )
+            history_store.db_enabled = original_db_enabled
 
     assert chat_response.status_code == 200
     assert team_response.status_code == 200
     assert histories_response.status_code == 200
-    histories = histories_response.json()["data"]["histories"]
-    assert [item["agent_id"] for item in histories] == ["chat-agent", "team:auto-parallel"]
-    assert [item["exists"] for item in histories] == [True, True]
-    assert histories[0]["metadata"]["message_count"] == 2
-    assert histories[1]["metadata"]["message_count"] == 2
-    assert histories[0]["messages"][1]["parts"][0]["content"] == "普通对话答复"
-    assert histories[1]["messages"][1]["parts"][0]["content"] == "团队汇总答复"
+    history_data = histories_response.json()["data"]
+    assert history_data["session_id"] == session_id
+    assert history_data["turn_count"] == 2
+    assert history_data["message_count"] == 4
+    assert history_data["agent_ids"] == ["chat-agent", "team:auto-parallel"]
+    assert [item["agent_id"] for item in history_data["records"]] == ["chat-agent", "team:auto-parallel"]
+    assert history_data["records"][0]["assistant_message"] == "普通对话答复"
+    assert history_data["records"][1]["assistant_message"] == "团队汇总答复"
 
     assert merged_response.status_code == 200
     merged_messages = merged_response.json()["data"]["messages"]
@@ -663,6 +667,8 @@ def test_get_session_histories_merge_sorts_messages_chronologically() -> None:
     base_time = datetime(2026, 1, 1, tzinfo=UTC)
     with TestClient(app) as client:
         history_store = client.app.state.ai_history_store
+        original_db_enabled = history_store.db_enabled
+        history_store.db_enabled = False
         for agent_id in ("chat-agent", "team:auto-parallel"):
             asyncio.run(
                 history_store.delete_messages(
@@ -728,6 +734,7 @@ def test_get_session_histories_merge_sorts_messages_chronologically() -> None:
                         agent_id=agent_id,
                     )
                 )
+            history_store.db_enabled = original_db_enabled
 
     assert merged_response.status_code == 200
     merged_messages = merged_response.json()["data"]["messages"]
@@ -746,6 +753,270 @@ def test_get_session_histories_merge_sorts_messages_chronologically() -> None:
         "更晚的普通问题",
         "更晚的普通回答",
     ]
+
+
+def test_list_user_session_histories_returns_paginated_conversation_records() -> None:
+    user_id = "tester-history-list"
+    request_context = RequestContext(
+        request_id="user-history-list-cleanup",
+        user_id=user_id,
+    )
+    base_time = datetime(2026, 1, 1, tzinfo=UTC)
+    session_ids = ["user-history-old", "user-history-new"]
+    with TestClient(app) as client:
+        history_store = client.app.state.ai_history_store
+        original_db_enabled = history_store.db_enabled
+        history_store.db_enabled = False
+        for session_id in session_ids:
+            for agent_id in ("chat-agent", "team:auto-parallel"):
+                asyncio.run(
+                    history_store.delete_messages(
+                        session_id,
+                        request_context=request_context,
+                        agent_id=agent_id,
+                    )
+                )
+
+        try:
+            asyncio.run(
+                history_store.save_messages(
+                    "user-history-old",
+                    [
+                        ModelRequest(
+                            parts=[
+                                UserPromptPart(
+                                    content="旧会话问题",
+                                    timestamp=base_time,
+                                )
+                            ]
+                        ),
+                        ModelResponse(
+                            parts=[TextPart(content="旧会话回答")],
+                            timestamp=base_time + timedelta(minutes=1),
+                        ),
+                    ],
+                    request_context=request_context,
+                    agent_id="chat-agent",
+                )
+            )
+            asyncio.run(
+                history_store.save_messages(
+                    "user-history-new",
+                    [
+                        ModelRequest(
+                            parts=[
+                                UserPromptPart(
+                                    content="新会话问题",
+                                    timestamp=base_time + timedelta(minutes=2),
+                                )
+                            ]
+                        ),
+                        ModelResponse(
+                            parts=[TextPart(content="新会话回答")],
+                            timestamp=base_time + timedelta(minutes=3),
+                        ),
+                    ],
+                    request_context=request_context,
+                    agent_id="team:auto-parallel",
+                )
+            )
+            response_page_1 = client.get(
+                f"/api/v1/agents/users/{user_id}/sessions/histories?page=1&size=1"
+            )
+            response_page_2 = client.get(
+                f"/api/v1/agents/users/{user_id}/sessions/histories?page=2&size=1"
+            )
+        finally:
+            for session_id in session_ids:
+                for agent_id in ("chat-agent", "team:auto-parallel"):
+                    asyncio.run(
+                        history_store.delete_messages(
+                            session_id,
+                            request_context=request_context,
+                            agent_id=agent_id,
+                        )
+                    )
+            history_store.db_enabled = original_db_enabled
+
+    assert response_page_1.status_code == 200
+    page_1_data = response_page_1.json()["data"]
+    assert page_1_data["now_page"] == 1
+    assert page_1_data["total"] == 2
+    assert [item["session_id"] for item in page_1_data["records"]] == ["user-history-new"]
+    assert page_1_data["records"][0]["title"] == "新会话问题"
+    assert page_1_data["records"][0]["latest_message"]["content"] == "新会话回答"
+    assert page_1_data["records"][0]["latest_agent_id"] == "team:auto-parallel"
+
+    assert response_page_2.status_code == 200
+    page_2_data = response_page_2.json()["data"]
+    assert page_2_data["now_page"] == 2
+    assert page_2_data["total"] == 2
+    assert [item["session_id"] for item in page_2_data["records"]] == ["user-history-old"]
+
+
+def test_user_session_list_groups_turns_and_detail_returns_each_turn() -> None:
+    user_id = "tester-history-turns"
+    session_id = "yyx-123-opo"
+    request_context = RequestContext(
+        request_id="user-history-turns-cleanup",
+        user_id=user_id,
+        session_id=session_id,
+    )
+    base_time = datetime(2026, 1, 1, tzinfo=UTC)
+    turns = [
+        ("请帮我规划这个多 Agent 后台任务功能，并评估风险和不足", "第一轮回答"),
+        ("基于刚才的结论，继续细化第一阶段的开发步骤，并评估风险", "第二轮回答"),
+        ("你是谁？", "第三轮回答"),
+    ]
+    with TestClient(app) as client:
+        history_store = client.app.state.ai_history_store
+        original_db_enabled = history_store.db_enabled
+        history_store.db_enabled = False
+        asyncio.run(
+            history_store.delete_messages(
+                session_id,
+                request_context=request_context,
+                agent_id="chat-agent",
+            )
+        )
+
+        messages = []
+        try:
+            for index, (user_message, assistant_message) in enumerate(turns):
+                messages.extend(
+                    [
+                        ModelRequest(
+                            parts=[
+                                UserPromptPart(
+                                    content=user_message,
+                                    timestamp=base_time + timedelta(minutes=index * 2),
+                                )
+                            ]
+                        ),
+                        ModelResponse(
+                            parts=[TextPart(content=assistant_message)],
+                            timestamp=base_time + timedelta(minutes=index * 2 + 1),
+                        ),
+                    ]
+                )
+                asyncio.run(
+                    history_store.save_messages(
+                        session_id,
+                        list(messages),
+                        request_context=request_context,
+                        agent_id="chat-agent",
+                    )
+                )
+
+            response = client.get(
+                f"/api/v1/agents/users/{user_id}/sessions/histories?page=1&size=10&agent_ids=chat-agent"
+            )
+            detail_response = client.get(
+                f"/api/v1/agents/sessions/{session_id}/histories?agent_ids=chat-agent",
+                headers={"x-user-id": user_id},
+            )
+        finally:
+            asyncio.run(
+                history_store.delete_messages(
+                    session_id,
+                    request_context=request_context,
+                    agent_id="chat-agent",
+                )
+            )
+            history_store.db_enabled = original_db_enabled
+
+    assert response.status_code == 200
+    data = response.json()["data"]
+    assert data["total"] == 1
+    assert data["records"][0]["session_id"] == session_id
+    assert data["records"][0]["turn_count"] == 3
+    assert data["records"][0]["message_count"] == 6
+
+    assert detail_response.status_code == 200
+    detail_data = detail_response.json()["data"]
+    assert detail_data["session_id"] == session_id
+    assert detail_data["turn_count"] == 3
+    assert detail_data["message_count"] == 6
+    assert [item["user_message"] for item in detail_data["records"]] == [
+        "请帮我规划这个多 Agent 后台任务功能，并评估风险和不足",
+        "基于刚才的结论，继续细化第一阶段的开发步骤，并评估风险",
+        "你是谁？",
+    ]
+    assert [item["assistant_message"] for item in detail_data["records"]] == [
+        "第一轮回答",
+        "第二轮回答",
+        "第三轮回答",
+    ]
+    assert [item["parts"][0]["content"] for item in detail_data["messages"]] == [
+        "请帮我规划这个多 Agent 后台任务功能，并评估风险和不足",
+        "第一轮回答",
+        "基于刚才的结论，继续细化第一阶段的开发步骤，并评估风险",
+        "第二轮回答",
+        "你是谁？",
+        "第三轮回答",
+    ]
+
+
+def test_list_user_session_histories_without_agent_ids_returns_all_records() -> None:
+    user_id = "tester-history-all-agents"
+    request_context = RequestContext(
+        request_id="user-history-all-agents-cleanup",
+        user_id=user_id,
+    )
+    with TestClient(app) as client:
+        history_store = client.app.state.ai_history_store
+        original_db_enabled = history_store.db_enabled
+        history_store.db_enabled = False
+        for session_id, agent_id in (
+            ("user-history-all-chat", "chat-agent"),
+            ("user-history-all-custom", "custom-agent"),
+        ):
+            asyncio.run(
+                history_store.delete_messages(
+                    session_id,
+                    request_context=request_context,
+                    agent_id=agent_id,
+                )
+            )
+
+        try:
+            for session_id, agent_id, message in (
+                ("user-history-all-chat", "chat-agent", "普通 Agent 问题"),
+                ("user-history-all-custom", "custom-agent", "自定义 Agent 问题"),
+            ):
+                asyncio.run(
+                    history_store.save_messages(
+                        session_id,
+                        [
+                            ModelRequest(parts=[UserPromptPart(content=message)]),
+                            ModelResponse(parts=[TextPart(content=f"{message}回答")]),
+                        ],
+                        request_context=request_context,
+                        agent_id=agent_id,
+                    )
+                )
+
+            response = client.get(
+                f"/api/v1/agents/users/{user_id}/sessions/histories?page=1&size=20"
+            )
+        finally:
+            for session_id, agent_id in (
+                ("user-history-all-chat", "chat-agent"),
+                ("user-history-all-custom", "custom-agent"),
+            ):
+                asyncio.run(
+                    history_store.delete_messages(
+                        session_id,
+                        request_context=request_context,
+                        agent_id=agent_id,
+                    )
+                )
+            history_store.db_enabled = original_db_enabled
+
+    assert response.status_code == 200
+    data = response.json()["data"]
+    assert data["total"] == 2
+    assert {item["agent_ids"][0] for item in data["records"]} == {"chat-agent", "custom-agent"}
 
 
 def test_agent_chat_injects_cross_agent_session_context_without_polluting_scope() -> None:

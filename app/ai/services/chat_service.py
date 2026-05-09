@@ -1,8 +1,4 @@
 from collections.abc import AsyncIterator
-import json
-from dataclasses import asdict
-
-from pydantic_ai import ModelMessagesTypeAdapter
 
 from app.ai.deps import RequestContext
 from app.ai.runtime.manager import AgentManager
@@ -51,23 +47,38 @@ class ChatService:
         agent_ids: list[str] | None = None,
         merge: bool = False,
     ) -> dict:
-        resolved_agent_ids = _normalize_history_agent_ids(agent_ids)
-        histories = []
-        for agent_id in resolved_agent_ids:
-            record = await self.runner.history_store.load_record(
-                session_id,
-                request_context=request_context,
-                agent_id=agent_id,
-            )
-            histories.append(_history_record_to_payload(agent_id=agent_id, record=record))
+        del merge
+        resolved_agent_ids = _normalize_history_agent_ids(agent_ids) if agent_ids else None
+        return await self.runner.history_store.load_session_history(
+            session_id=session_id,
+            user_id=request_context.user_id,
+            tenant_id=request_context.tenant_id,
+            agent_ids=resolved_agent_ids,
+        )
 
-        payload = {
-            "session_id": session_id,
-            "histories": histories,
+    async def get_user_session_histories(
+        self,
+        *,
+        request_context: RequestContext,
+        user_id: str,
+        page: int,
+        size: int,
+        agent_ids: list[str] | None = None,
+    ) -> dict:
+        resolved_agent_ids = _normalize_history_agent_ids(agent_ids) if agent_ids else None
+        records, total = await self.runner.history_store.paginate_user_sessions(
+            user_id=user_id,
+            tenant_id=request_context.tenant_id,
+            agent_ids=resolved_agent_ids,
+            page=page,
+            size=size,
+        )
+
+        return {
+            "records": records,
+            "now_page": page,
+            "total": total,
         }
-        if merge:
-            payload["messages"] = _merge_history_messages(histories)
-        return payload
 
     async def chat(self, *, request_context: RequestContext, payload: AgentChatRequest) -> AgentChatResponse:
         """把 endpoint 请求转换成一次标准的 runner chat 调用。"""
@@ -125,100 +136,3 @@ def _normalize_history_agent_ids(agent_ids: list[str] | None) -> list[str]:
         seen.add(item)
         normalized.append(item)
     return normalized
-
-
-def _history_record_to_payload(*, agent_id: str, record) -> dict:
-    if record is None:
-        return {
-            "agent_id": agent_id,
-            "exists": False,
-            "metadata": None,
-            "messages": [],
-        }
-    metadata = asdict(record.metadata)
-    for key in ("created_at", "updated_at"):
-        value = metadata.get(key)
-        if value is not None and hasattr(value, "isoformat"):
-            metadata[key] = value.isoformat()
-    return {
-        "agent_id": agent_id,
-        "exists": True,
-        "metadata": metadata,
-        "messages": _sort_history_messages(
-            json.loads(ModelMessagesTypeAdapter.dump_json(record.messages).decode()),
-            metadata=metadata,
-            history_index=0,
-        ),
-    }
-
-
-def _merge_history_messages(histories: list[dict]) -> list[dict]:
-    messages: list[tuple[tuple[str, int, int], dict]] = []
-    for history_index, history in enumerate(histories):
-        agent_id = history["agent_id"]
-        metadata = history.get("metadata") or {}
-        scoped_messages = _sort_history_messages(history["messages"], metadata=metadata, history_index=history_index)
-        for message_index, message in enumerate(scoped_messages):
-            item = dict(message)
-            item["agent_id"] = agent_id
-            messages.append(
-                (
-                    _history_message_sort_key(
-                        item,
-                        metadata=metadata,
-                        history_index=history_index,
-                        message_index=message_index,
-                    ),
-                    item,
-                )
-            )
-    return [message for _, message in sorted(messages, key=lambda item: item[0])]
-
-
-def _sort_history_messages(messages: list[dict], *, metadata: dict, history_index: int) -> list[dict]:
-    return [
-        message
-        for _, message in sorted(
-            (
-                (
-                    _history_message_sort_key(
-                        message,
-                        metadata=metadata,
-                        history_index=history_index,
-                        message_index=message_index,
-                    ),
-                    message,
-                )
-                for message_index, message in enumerate(messages)
-            ),
-            key=lambda item: item[0],
-        )
-    ]
-
-
-def _history_message_sort_key(
-    message: dict,
-    *,
-    metadata: dict | None = None,
-    history_index: int = 0,
-    message_index: int = 0,
-) -> tuple[str, int, int]:
-    metadata = metadata or {}
-    timestamp = _history_message_timestamp(message)
-    if timestamp:
-        return (timestamp, history_index, message_index)
-    fallback_timestamp = metadata.get("created_at") or metadata.get("updated_at") or ""
-    return (fallback_timestamp, history_index, message_index)
-
-
-def _history_message_timestamp(message: dict) -> str | None:
-    timestamp = message.get("timestamp")
-    if isinstance(timestamp, str):
-        return timestamp
-    parts = message.get("parts")
-    if isinstance(parts, list):
-        for part in parts:
-            part_timestamp = part.get("timestamp") if isinstance(part, dict) else None
-            if isinstance(part_timestamp, str):
-                return part_timestamp
-    return None

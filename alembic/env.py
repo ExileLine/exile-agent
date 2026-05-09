@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import async_engine_from_config
 
 import app.models  # noqa: F401
 import app.ai.config_store.models  # noqa: F401
+import app.ai.runtime.session_history_record  # noqa: F401
 import app.ai.runtime.team_trace  # noqa: F401
 from app.core.config import get_config
 from app.models.base import Base

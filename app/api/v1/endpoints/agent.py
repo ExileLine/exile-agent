@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Query, Request
 from fastapi.responses import StreamingResponse
 
 from app.ai.deps import RequestContext
@@ -71,6 +71,32 @@ async def get_team_run_trace(team_run_id: str, request: Request):
     if result is None:
         raise CustomException(status_code=404, detail=f"未找到 Team Run Trace: {team_run_id}", custom_code=10002)
     return api_response(data=result)
+
+
+@router.get("/users/{user_id}/sessions/histories", summary="按用户分页查询历史会话列表")
+async def list_user_session_histories(
+    user_id: str,
+    request: Request,
+    page: int = Query(default=1, ge=1, description="页码"),
+    size: int = Query(default=20, ge=1, le=200, description="每页数量"),
+    agent_ids: str | None = None,
+):
+    service = _build_chat_service(request)
+    request_context = RequestContext(
+        request_id=getattr(request.state, "request_id", None) or request.headers.get("x-request-id", ""),
+        user_id=user_id,
+        tenant_id=request.headers.get("x-tenant-id"),
+    )
+    parsed_agent_ids = [item.strip() for item in agent_ids.split(",")] if agent_ids else None
+    return api_response(
+        data=await service.get_user_session_histories(
+            request_context=request_context,
+            user_id=user_id,
+            page=page,
+            size=size,
+            agent_ids=parsed_agent_ids,
+        )
+    )
 
 
 @router.get("/sessions/{session_id}/histories", summary="查询 Agent 会话历史")

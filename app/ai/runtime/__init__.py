@@ -51,6 +51,8 @@ async def init_ai_runtime(app: FastAPI, project_config: BaseConfig) -> None:
     history_store = SessionHistoryStore(
         redis=redis_client.redis_pool,
         ttl_seconds=settings.history_ttl_seconds,
+        db_session_factory=AsyncSessionLocal,
+        db_enabled=True,
         max_messages=settings.history_max_messages,
     )
     approval_store = ApprovalStore(
