@@ -154,8 +154,8 @@ class AgentRunner:
             skill_resolution=skill_resolution,
             allow_auto_route=run_config.source != "database",
         )
-        message_history = await self.history_store.load_messages(
-            session_id,
+        message_history = await self._load_session_context_messages(
+            session_id=session_id,
             request_context=request_context,
             agent_id=resolved_agent_id,
         )
@@ -172,13 +172,29 @@ class AgentRunner:
         )
 
         try:
-            result = await agent.run(
-                message,
-                deps=deps,
-                message_history=message_history or None,
-                instructions=skill_resolution.instructions or None,
-                toolsets=run_toolsets or None,
-            )
+            try:
+                result = await agent.run(
+                    message,
+                    deps=deps,
+                    message_history=message_history or None,
+                    instructions=skill_resolution.instructions or None,
+                    toolsets=run_toolsets or None,
+                )
+            except Exception as exc:
+                if not self._should_retry_without_history(exc, message_history):
+                    raise
+                await self.history_store.delete_messages(
+                    session_id,
+                    request_context=request_context,
+                    agent_id=resolved_agent_id,
+                )
+                result = await agent.run(
+                    message,
+                    deps=deps,
+                    message_history=None,
+                    instructions=skill_resolution.instructions or None,
+                    toolsets=run_toolsets or None,
+                )
             history_saved = await self._save_history(
                 session_id=session_id,
                 result=result,
@@ -269,8 +285,8 @@ class AgentRunner:
             skill_resolution=skill_resolution,
             allow_auto_route=run_config.source != "database",
         )
-        message_history = await self.history_store.load_messages(
-            session_id,
+        message_history = await self._load_session_context_messages(
+            session_id=session_id,
             request_context=request_context,
             agent_id=resolved_agent_id,
         )
@@ -762,7 +778,12 @@ class AgentRunner:
             request_context=request_context,
             agent_id="team:auto-parallel",
         )
-        worker_context = self._extract_latest_parallel_team_summary(previous_history_messages)
+        session_context_messages = await self._load_session_context_messages(
+            session_id=session_id,
+            request_context=request_context,
+            agent_id="team:auto-parallel",
+        )
+        worker_context = self._extract_latest_parallel_team_summary(session_context_messages)
         worker_outputs = await asyncio.gather(
             *[
                 self._run_parallel_worker(
@@ -792,7 +813,7 @@ class AgentRunner:
                 message=message,
                 worker_outputs=worker_outputs,
                 approval_worker_output=approval_worker_outputs[0],
-                history_loaded=bool(previous_history_messages),
+                history_loaded=bool(session_context_messages),
                 started_at=started_at,
                 model=route_run_config.model_name,
                 run_kind="chat",
@@ -827,7 +848,7 @@ class AgentRunner:
             message=message,
             worker_outputs=worker_outputs,
             model_name=model_name,
-            message_history=previous_history_messages,
+            message_history=session_context_messages,
         )
         history_messages = await self._build_parallel_team_history_messages(
             previous_messages=previous_history_messages,
@@ -855,7 +876,7 @@ class AgentRunner:
             meta=self._build_run_meta(
                 run_kind="chat",
                 stream_mode=None,
-                history_loaded=bool(previous_history_messages),
+                history_loaded=bool(session_context_messages),
                 history_saved=history_saved,
                 message_count=len(history_messages),
                 mcp_servers=[],
@@ -918,8 +939,13 @@ class AgentRunner:
             request_context=request_context,
             agent_id="team:auto-parallel",
         )
-        history_loaded = bool(previous_history_messages)
-        worker_context = self._extract_latest_parallel_team_summary(previous_history_messages)
+        session_context_messages = await self._load_session_context_messages(
+            session_id=session_id,
+            request_context=request_context,
+            agent_id="team:auto-parallel",
+        )
+        history_loaded = bool(session_context_messages)
+        worker_context = self._extract_latest_parallel_team_summary(session_context_messages)
 
         yield self._sse_event(
             "start",
@@ -1074,7 +1100,7 @@ class AgentRunner:
                 message=message,
                 worker_outputs=worker_outputs,
                 model_name=model_name,
-                message_history=previous_history_messages,
+                message_history=session_context_messages,
             )
         except Exception as exc:
             await self._save_team_run_trace(
@@ -2127,20 +2153,38 @@ class AgentRunner:
     ) -> AsyncIterator[str]:
         """当模型不支持真正的 streamed request 时，退化成单次 run 再包装成 SSE。"""
 
+        fallback_request_context = RequestContext(
+            request_id=request_id,
+            user_id=user_id,
+            tenant_id=tenant_id,
+            session_id=session_id,
+        )
+        effective_message_history = message_history
         try:
-            result = await agent.run(
-                message,
-                deps=deps,
-                message_history=message_history or None,
-                instructions=instructions or None,
-                toolsets=run_toolsets or None,
-            )
-            fallback_request_context = RequestContext(
-                request_id=request_id,
-                user_id=user_id,
-                tenant_id=tenant_id,
-                session_id=session_id,
-            )
+            try:
+                result = await agent.run(
+                    message,
+                    deps=deps,
+                    message_history=effective_message_history or None,
+                    instructions=instructions or None,
+                    toolsets=run_toolsets or None,
+                )
+            except Exception as exc:
+                if not self._should_retry_without_history(exc, effective_message_history):
+                    raise
+                await self.history_store.delete_messages(
+                    session_id,
+                    request_context=fallback_request_context,
+                    agent_id=agent_id,
+                )
+                effective_message_history = []
+                result = await agent.run(
+                    message,
+                    deps=deps,
+                    message_history=None,
+                    instructions=instructions or None,
+                    toolsets=run_toolsets or None,
+                )
             history_saved = await self._save_history(
                 session_id=session_id,
                 result=result,
@@ -2198,13 +2242,13 @@ class AgentRunner:
                     stream_mode="fallback",
                     history_loaded=history_loaded,
                     history_saved=False,
-                    message_count=len(message_history),
+                    message_count=len(effective_message_history),
                     mcp_servers=mcp_servers,
                     skills=skills,
                     run_config=run_config,
                 ).model_dump(mode="json"),
-            },
-        )
+                },
+            )
         if response.status == "approval_required":
             payload = response.model_dump(mode="json")
             # fallback 路径虽然拿不到细粒度 tool 事件，
@@ -2230,9 +2274,14 @@ class AgentRunner:
 
         if not session_id:
             return False
+        previous_messages = await self.history_store.load_messages(
+            session_id,
+            request_context=request_context,
+            agent_id=agent_id,
+        )
         await self.history_store.save_messages(
             session_id,
-            result.all_messages(),
+            [*previous_messages, *result.new_messages()],
             request_context=request_context,
             agent_id=agent_id,
             model=model,
@@ -2241,6 +2290,73 @@ class AgentRunner:
             usage=self._serialize_usage(result),
         )
         return True
+
+    async def _load_session_context_messages(
+            self,
+            *,
+            session_id: str | None,
+            request_context: RequestContext,
+            agent_id: str,
+    ) -> list[Any]:
+        """加载当前会话可用上下文，跨普通 chat 和多 Agent 团队 scope 合并。
+
+        历史仍按 agent scope 分开保存；这里只在运行时合并给模型看，避免
+        `chat-agent` 和 `team:auto-parallel` 的 Redis key 互相复制污染。
+        """
+
+        if not session_id:
+            return []
+        scoped_agent_ids = self._session_context_agent_ids(agent_id)
+        message_sets = [
+            await self.history_store.load_messages(
+                session_id,
+                request_context=request_context,
+                agent_id=scoped_agent_id,
+            )
+            for scoped_agent_id in scoped_agent_ids
+        ]
+        return self._merge_model_message_sets(message_sets)
+
+    @staticmethod
+    def _session_context_agent_ids(agent_id: str) -> list[str]:
+        defaults = ["chat-agent", "team:auto-parallel"]
+        scoped_agent_ids: list[str] = []
+        for scoped_agent_id in [*defaults, agent_id]:
+            if scoped_agent_id and scoped_agent_id not in scoped_agent_ids:
+                scoped_agent_ids.append(scoped_agent_id)
+        return scoped_agent_ids
+
+    @staticmethod
+    def _merge_model_message_sets(message_sets: list[list[Any]]) -> list[Any]:
+        items: list[tuple[str, int, Any]] = []
+        seen: set[str] = set()
+        sequence = 0
+        for messages in message_sets:
+            for message in messages:
+                signature = ModelMessagesTypeAdapter.dump_json([message]).decode()
+                if signature in seen:
+                    continue
+                seen.add(signature)
+                items.append((AgentRunner._message_sort_timestamp(message), sequence, message))
+                sequence += 1
+        return [message for _, _, message in sorted(items, key=lambda item: (item[0], item[1]))]
+
+    @staticmethod
+    def _message_sort_timestamp(message: Any) -> str:
+        timestamp = getattr(message, "timestamp", None)
+        if timestamp is not None and hasattr(timestamp, "isoformat"):
+            return timestamp.isoformat()
+        if isinstance(timestamp, str):
+            return timestamp
+        parts = getattr(message, "parts", None)
+        if isinstance(parts, list):
+            for part in parts:
+                part_timestamp = getattr(part, "timestamp", None)
+                if part_timestamp is not None and hasattr(part_timestamp, "isoformat"):
+                    return part_timestamp.isoformat()
+                if isinstance(part_timestamp, str):
+                    return part_timestamp
+        return ""
 
     def _serialize_deferred_tool_requests(
             self,
@@ -2545,6 +2661,20 @@ class AgentRunner:
                 if isinstance(content, str) and content.strip():
                     return content
         return None
+
+    @staticmethod
+    def _should_retry_without_history(error: Exception, message_history: list[Any]) -> bool:
+        if not message_history:
+            return False
+        error_text = str(error).lower()
+        invalid_tool_history_markers = (
+            "messages with role 'tool'",
+            "must be a response to a preceding message with 'tool_calls'",
+            "tool_calls",
+        )
+        return all(marker in error_text for marker in invalid_tool_history_markers[:2]) or (
+            "tool" in error_text and "tool_calls" in error_text
+        )
 
     @staticmethod
     def _normalize_value(value: Any) -> Any:

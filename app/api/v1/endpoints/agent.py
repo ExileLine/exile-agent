@@ -73,6 +73,31 @@ async def get_team_run_trace(team_run_id: str, request: Request):
     return api_response(data=result)
 
 
+@router.get("/sessions/{session_id}/histories", summary="查询 Agent 会话历史")
+async def get_session_histories(
+    session_id: str,
+    request: Request,
+    agent_ids: str | None = None,
+    merge: bool = False,
+):
+    service = _build_chat_service(request)
+    request_context = RequestContext(
+        request_id=getattr(request.state, "request_id", None) or request.headers.get("x-request-id", ""),
+        user_id=request.headers.get("x-user-id"),
+        tenant_id=request.headers.get("x-tenant-id"),
+        session_id=session_id,
+    )
+    parsed_agent_ids = [item.strip() for item in agent_ids.split(",")] if agent_ids else None
+    return api_response(
+        data=await service.get_session_histories(
+            request_context=request_context,
+            session_id=session_id,
+            agent_ids=parsed_agent_ids,
+            merge=merge,
+        )
+    )
+
+
 @router.post("/chat", summary="执行 Agent 对话")
 async def chat_with_agent(payload: AgentChatRequest, request: Request):
     service = _build_chat_service(request)

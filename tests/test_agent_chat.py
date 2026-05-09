@@ -1,5 +1,6 @@
 import asyncio
 import json
+from datetime import UTC, datetime, timedelta
 import httpx
 from fastapi.testclient import TestClient
 import pytest
@@ -7,7 +8,7 @@ from pydantic_ai import Agent
 from pydantic_ai import RunContext
 from pydantic_ai import models
 from pydantic_ai.exceptions import ApprovalRequired
-from pydantic_ai.messages import ModelRequest, ModelResponse, TextPart, ToolCallPart, ToolReturnPart
+from pydantic_ai.messages import ModelRequest, ModelResponse, TextPart, ToolCallPart, ToolReturnPart, UserPromptPart
 from pydantic_ai.models.function import AgentInfo, DeltaToolCall, FunctionModel
 from pydantic_ai.models.openai import OpenAIChatModel
 from pydantic_ai.models.test import TestModel
@@ -562,6 +563,285 @@ def test_parallel_team_chat_saves_summary_history() -> None:
     assert record.metadata.usage["team"]["worker_agent_ids"] == ["review-agent", "planner-agent"]
     assert record.metadata.usage["team"]["failed_worker_agent_ids"] == []
     assert len(record.messages) == 4
+
+
+def test_get_session_histories_returns_chat_and_parallel_team_scopes() -> None:
+    def chat_model(messages: list[ModelRequest | ModelResponse], info: AgentInfo) -> ModelResponse:
+        del messages, info
+        return ModelResponse(parts=[TextPart(content="普通对话答复")])
+
+    def review_model(messages: list[ModelRequest | ModelResponse], info: AgentInfo) -> ModelResponse:
+        del messages, info
+        return ModelResponse(parts=[TextPart(content="风险：需要记录团队历史")])
+
+    def planner_model(messages: list[ModelRequest | ModelResponse], info: AgentInfo) -> ModelResponse:
+        del messages, info
+        return ModelResponse(parts=[TextPart(content="计划：返回团队历史")])
+
+    def summary_model(messages: list[ModelRequest | ModelResponse], info: AgentInfo) -> ModelResponse:
+        del messages, info
+        return ModelResponse(parts=[TextPart(content="团队汇总答复")])
+
+    session_id = "session-history-api"
+    request_context = RequestContext(
+        request_id="session-history-api-cleanup",
+        user_id="tester",
+        session_id=session_id,
+    )
+    with TestClient(app) as client:
+        history_store = client.app.state.ai_history_store
+        for agent_id in ("chat-agent", "team:auto-parallel"):
+            asyncio.run(
+                history_store.delete_messages(
+                    session_id,
+                    request_context=request_context,
+                    agent_id=agent_id,
+                )
+            )
+
+        chat_agent = client.app.state.ai_agent_manager.get_agent("chat-agent")
+        review_agent = client.app.state.ai_agent_manager.get_agent("review-agent")
+        planner_agent = client.app.state.ai_agent_manager.get_agent("planner-agent")
+        summary_agent = client.app.state.ai_agent_manager.get_agent("summary-agent")
+        try:
+            with chat_agent.override(model=FunctionModel(chat_model)):
+                chat_response = client.post(
+                    "/api/v1/agents/chat",
+                    json={"message": "你是谁?", "session_id": session_id},
+                    headers={"x-user-id": "tester"},
+                )
+            with review_agent.override(model=FunctionModel(review_model)):
+                with planner_agent.override(model=FunctionModel(planner_model)):
+                    with summary_agent.override(model=FunctionModel(summary_model)):
+                        team_response = client.post(
+                            "/api/v1/agents/chat",
+                            json={"message": "请规划这个功能，并评估风险", "session_id": session_id},
+                            headers={"x-user-id": "tester"},
+                        )
+            histories_response = client.get(
+                f"/api/v1/agents/sessions/{session_id}/histories",
+                headers={"x-user-id": "tester"},
+            )
+            merged_response = client.get(
+                f"/api/v1/agents/sessions/{session_id}/histories?merge=true",
+                headers={"x-user-id": "tester"},
+            )
+        finally:
+            for agent_id in ("chat-agent", "team:auto-parallel"):
+                asyncio.run(
+                    history_store.delete_messages(
+                        session_id,
+                        request_context=request_context,
+                        agent_id=agent_id,
+                    )
+                )
+
+    assert chat_response.status_code == 200
+    assert team_response.status_code == 200
+    assert histories_response.status_code == 200
+    histories = histories_response.json()["data"]["histories"]
+    assert [item["agent_id"] for item in histories] == ["chat-agent", "team:auto-parallel"]
+    assert [item["exists"] for item in histories] == [True, True]
+    assert histories[0]["metadata"]["message_count"] == 2
+    assert histories[1]["metadata"]["message_count"] == 2
+    assert histories[0]["messages"][1]["parts"][0]["content"] == "普通对话答复"
+    assert histories[1]["messages"][1]["parts"][0]["content"] == "团队汇总答复"
+
+    assert merged_response.status_code == 200
+    merged_messages = merged_response.json()["data"]["messages"]
+    assert {item["agent_id"] for item in merged_messages} == {"chat-agent", "team:auto-parallel"}
+    assert len(merged_messages) == 4
+
+
+def test_get_session_histories_merge_sorts_messages_chronologically() -> None:
+    session_id = "session-history-sort-api"
+    request_context = RequestContext(
+        request_id="session-history-sort-api-cleanup",
+        user_id="tester",
+        session_id=session_id,
+    )
+    base_time = datetime(2026, 1, 1, tzinfo=UTC)
+    with TestClient(app) as client:
+        history_store = client.app.state.ai_history_store
+        for agent_id in ("chat-agent", "team:auto-parallel"):
+            asyncio.run(
+                history_store.delete_messages(
+                    session_id,
+                    request_context=request_context,
+                    agent_id=agent_id,
+                )
+            )
+
+        try:
+            asyncio.run(
+                history_store.save_messages(
+                    session_id,
+                    [
+                        ModelRequest(
+                            parts=[
+                                UserPromptPart(
+                                    content="更晚的普通问题",
+                                    timestamp=base_time + timedelta(minutes=2),
+                                )
+                            ]
+                        ),
+                        ModelResponse(
+                            parts=[TextPart(content="更晚的普通回答")],
+                            timestamp=base_time + timedelta(minutes=3),
+                        ),
+                    ],
+                    request_context=request_context,
+                    agent_id="chat-agent",
+                )
+            )
+            asyncio.run(
+                history_store.save_messages(
+                    session_id,
+                    [
+                        ModelRequest(
+                            parts=[
+                                UserPromptPart(
+                                    content="更早的团队问题",
+                                    timestamp=base_time,
+                                )
+                            ]
+                        ),
+                        ModelResponse(
+                            parts=[TextPart(content="更早的团队回答")],
+                            timestamp=base_time + timedelta(minutes=1),
+                        ),
+                    ],
+                    request_context=request_context,
+                    agent_id="team:auto-parallel",
+                )
+            )
+            merged_response = client.get(
+                f"/api/v1/agents/sessions/{session_id}/histories?merge=true",
+                headers={"x-user-id": "tester"},
+            )
+        finally:
+            for agent_id in ("chat-agent", "team:auto-parallel"):
+                asyncio.run(
+                    history_store.delete_messages(
+                        session_id,
+                        request_context=request_context,
+                        agent_id=agent_id,
+                    )
+                )
+
+    assert merged_response.status_code == 200
+    merged_messages = merged_response.json()["data"]["messages"]
+    assert [item["agent_id"] for item in merged_messages] == [
+        "team:auto-parallel",
+        "team:auto-parallel",
+        "chat-agent",
+        "chat-agent",
+    ]
+    assert [
+        item["parts"][0]["content"]
+        for item in merged_messages
+    ] == [
+        "更早的团队问题",
+        "更早的团队回答",
+        "更晚的普通问题",
+        "更晚的普通回答",
+    ]
+
+
+def test_agent_chat_injects_cross_agent_session_context_without_polluting_scope() -> None:
+    captured_chat_texts: list[str] = []
+
+    def chat_model(messages: list[ModelRequest | ModelResponse], info: AgentInfo) -> ModelResponse:
+        del info
+        captured_chat_texts.extend(
+            part.content
+            for message in messages
+            if isinstance(message, ModelResponse)
+            for part in message.parts
+            if isinstance(part, TextPart)
+        )
+        return ModelResponse(parts=[TextPart(content="普通对话答复")])
+
+    def review_model(messages: list[ModelRequest | ModelResponse], info: AgentInfo) -> ModelResponse:
+        del messages, info
+        return ModelResponse(parts=[TextPart(content="风险：需要记录团队历史")])
+
+    def planner_model(messages: list[ModelRequest | ModelResponse], info: AgentInfo) -> ModelResponse:
+        del messages, info
+        return ModelResponse(parts=[TextPart(content="计划：返回团队历史")])
+
+    def summary_model(messages: list[ModelRequest | ModelResponse], info: AgentInfo) -> ModelResponse:
+        del messages, info
+        return ModelResponse(parts=[TextPart(content="团队汇总答复")])
+
+    session_id = "cross-agent-session-context-chat"
+    request_context = RequestContext(
+        request_id="cross-agent-session-context-chat-cleanup",
+        user_id="tester",
+        session_id=session_id,
+    )
+    with TestClient(app) as client:
+        history_store = client.app.state.ai_history_store
+        for agent_id in ("chat-agent", "team:auto-parallel"):
+            asyncio.run(
+                history_store.delete_messages(
+                    session_id,
+                    request_context=request_context,
+                    agent_id=agent_id,
+                )
+            )
+
+        chat_agent = client.app.state.ai_agent_manager.get_agent("chat-agent")
+        review_agent = client.app.state.ai_agent_manager.get_agent("review-agent")
+        planner_agent = client.app.state.ai_agent_manager.get_agent("planner-agent")
+        summary_agent = client.app.state.ai_agent_manager.get_agent("summary-agent")
+        try:
+            with review_agent.override(model=FunctionModel(review_model)):
+                with planner_agent.override(model=FunctionModel(planner_model)):
+                    with summary_agent.override(model=FunctionModel(summary_model)):
+                        team_response = client.post(
+                            "/api/v1/agents/chat",
+                            json={"message": "请规划这个功能，并评估风险", "session_id": session_id},
+                            headers={"x-user-id": "tester"},
+                        )
+            with chat_agent.override(model=FunctionModel(chat_model)):
+                chat_response = client.post(
+                    "/api/v1/agents/chat",
+                    json={"message": "你是谁?", "session_id": session_id},
+                    headers={"x-user-id": "tester"},
+                )
+            chat_record = asyncio.run(
+                history_store.load_record(
+                    session_id,
+                    request_context=request_context,
+                    agent_id="chat-agent",
+                )
+            )
+            team_record = asyncio.run(
+                history_store.load_record(
+                    session_id,
+                    request_context=request_context,
+                    agent_id="team:auto-parallel",
+                )
+            )
+        finally:
+            for agent_id in ("chat-agent", "team:auto-parallel"):
+                asyncio.run(
+                    history_store.delete_messages(
+                        session_id,
+                        request_context=request_context,
+                        agent_id=agent_id,
+                    )
+                )
+
+    assert team_response.status_code == 200
+    assert chat_response.status_code == 200
+    assert "团队汇总答复" in captured_chat_texts
+    assert chat_response.json()["data"]["meta"]["history_loaded"] is True
+    assert chat_record is not None
+    assert team_record is not None
+    assert chat_record.metadata.message_count == 2
+    assert team_record.metadata.message_count == 2
 
 
 def test_agent_chat_endpoint() -> None:
@@ -1532,6 +1812,172 @@ def test_chat_stream_approval_flow() -> None:
     assert approval_event["deferred_tool_requests"]["approval_id"]
     assert approval_event["deferred_tool_requests"]["status"] == "pending"
     assert approval_event["meta"]["run_kind"] == "stream"
+
+
+def test_chat_stream_repairs_invalid_tool_history() -> None:
+    def history_sensitive_model(messages: list[ModelRequest | ModelResponse], info: AgentInfo) -> ModelResponse:
+        del info
+        for message in messages:
+            if isinstance(message, ModelRequest):
+                for part in message.parts:
+                    if isinstance(part, ToolReturnPart):
+                        raise RuntimeError(
+                            "Messages with role 'tool' must be a response to a preceding message with 'tool_calls'"
+                        )
+        return ModelResponse(parts=[TextPart(content="history repaired")])
+
+    session_id = "sess-invalid-tool-history"
+    request_context = RequestContext(
+        request_id="invalid-tool-history-cleanup",
+        user_id="tester",
+        session_id=session_id,
+    )
+    with TestClient(app) as client:
+        history_store = client.app.state.ai_history_store
+        asyncio.run(
+            history_store.save_messages(
+                session_id,
+                [
+                    ModelRequest(
+                        parts=[
+                            ToolReturnPart(
+                                tool_name="get_request_context",
+                                content={"user_id": "tester"},
+                                tool_call_id="orphan-tool-call",
+                            )
+                        ]
+                    )
+                ],
+                request_context=request_context,
+                agent_id="chat-agent",
+            )
+        )
+        agent = client.app.state.ai_agent_manager.get_agent("chat-agent")
+        try:
+            with agent.override(model=FunctionModel(history_sensitive_model)):
+                with client.stream(
+                    "POST",
+                    "/api/v1/agents/chat/stream",
+                    json={"message": "你是谁?", "session_id": session_id},
+                    headers={"x-user-id": "tester"},
+                ) as response:
+                    raw = "".join(response.iter_text())
+            record = asyncio.run(
+                history_store.load_record(
+                    session_id,
+                    request_context=request_context,
+                    agent_id="chat-agent",
+                )
+            )
+        finally:
+            asyncio.run(
+                history_store.delete_messages(
+                    session_id,
+                    request_context=request_context,
+                    agent_id="chat-agent",
+                )
+            )
+
+    assert response.status_code == 200
+    events = _parse_sse_events(raw)
+    done_event = next(payload for event, payload in events if event == "done")
+    assert done_event["message"] == "history repaired"
+    assert done_event["meta"]["stream_mode"] == "fallback"
+    assert done_event["meta"]["history_loaded"] is True
+    assert record is not None
+    assert record.metadata.message_count >= 1
+
+
+def test_agent_chat_stream_injects_cross_agent_session_context() -> None:
+    captured_stream_texts: list[str] = []
+
+    def chat_model(messages: list[ModelRequest | ModelResponse], info: AgentInfo) -> ModelResponse:
+        del info
+        captured_stream_texts.extend(
+            part.content
+            for message in messages
+            if isinstance(message, ModelResponse)
+            for part in message.parts
+            if isinstance(part, TextPart)
+        )
+        return ModelResponse(parts=[TextPart(content="stream 普通对话答复")])
+
+    def review_model(messages: list[ModelRequest | ModelResponse], info: AgentInfo) -> ModelResponse:
+        del messages, info
+        return ModelResponse(parts=[TextPart(content="stream 风险：需要记录团队历史")])
+
+    def planner_model(messages: list[ModelRequest | ModelResponse], info: AgentInfo) -> ModelResponse:
+        del messages, info
+        return ModelResponse(parts=[TextPart(content="stream 计划：返回团队历史")])
+
+    def summary_model(messages: list[ModelRequest | ModelResponse], info: AgentInfo) -> ModelResponse:
+        del messages, info
+        return ModelResponse(parts=[TextPart(content="stream 团队汇总答复")])
+
+    session_id = "cross-agent-session-context-stream"
+    request_context = RequestContext(
+        request_id="cross-agent-session-context-stream-cleanup",
+        user_id="tester",
+        session_id=session_id,
+    )
+    with TestClient(app) as client:
+        history_store = client.app.state.ai_history_store
+        for agent_id in ("chat-agent", "team:auto-parallel"):
+            asyncio.run(
+                history_store.delete_messages(
+                    session_id,
+                    request_context=request_context,
+                    agent_id=agent_id,
+                )
+            )
+
+        chat_agent = client.app.state.ai_agent_manager.get_agent("chat-agent")
+        review_agent = client.app.state.ai_agent_manager.get_agent("review-agent")
+        planner_agent = client.app.state.ai_agent_manager.get_agent("planner-agent")
+        summary_agent = client.app.state.ai_agent_manager.get_agent("summary-agent")
+        try:
+            with review_agent.override(model=FunctionModel(review_model)):
+                with planner_agent.override(model=FunctionModel(planner_model)):
+                    with summary_agent.override(model=FunctionModel(summary_model)):
+                        team_response = client.post(
+                            "/api/v1/agents/chat",
+                            json={"message": "请规划这个功能，并评估风险", "session_id": session_id},
+                            headers={"x-user-id": "tester"},
+                        )
+            with chat_agent.override(model=FunctionModel(chat_model)):
+                with client.stream(
+                    "POST",
+                    "/api/v1/agents/chat/stream",
+                    json={"message": "你是谁?", "session_id": session_id},
+                    headers={"x-user-id": "tester"},
+                ) as response:
+                    raw = "".join(response.iter_text())
+            chat_record = asyncio.run(
+                history_store.load_record(
+                    session_id,
+                    request_context=request_context,
+                    agent_id="chat-agent",
+                )
+            )
+        finally:
+            for agent_id in ("chat-agent", "team:auto-parallel"):
+                asyncio.run(
+                    history_store.delete_messages(
+                        session_id,
+                        request_context=request_context,
+                        agent_id=agent_id,
+                    )
+                )
+
+    assert team_response.status_code == 200
+    assert response.status_code == 200
+    events = _parse_sse_events(raw)
+    done_event = next(payload for event, payload in events if event == "done")
+    assert done_event["message"] == "stream 普通对话答复"
+    assert done_event["meta"]["history_loaded"] is True
+    assert "stream 团队汇总答复" in captured_stream_texts
+    assert chat_record is not None
+    assert chat_record.metadata.message_count == 2
 
 
 def test_chat_stream_error_payload_contains_run_meta() -> None:
