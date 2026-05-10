@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 from pathlib import Path
+import re
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 SkillLoadStrategy = Literal["summary_only", "full_on_match"]
+SKILL_NAME_PATTERN = re.compile(r"^[a-z0-9-]{1,64}$")
+XML_TAG_PATTERN = re.compile(r"<[^>]+>")
+RESERVED_SKILL_NAME_WORDS = ("anthropic", "claude")
 
 
 def _dedupe_preserve_order(values: list[str]) -> list[str]:
@@ -35,6 +39,7 @@ class SkillManifest(BaseModel):
     title: str = Field(description="展示标题")
     description: str = Field(description="skill 摘要说明")
     tags: list[str] = Field(default_factory=list, description="能力标签")
+    allowed_tools: list[str] = Field(default_factory=list, description="Anthropic SKILL.md allowed-tools 元数据")
     enabled: bool = Field(default=True, description="是否启用该 skill")
     priority: int = Field(default=0, description="排序优先级，越大越优先")
     load_strategy: SkillLoadStrategy = Field(default="summary_only", description="正文加载策略")
@@ -49,12 +54,53 @@ class SkillManifest(BaseModel):
     @model_validator(mode="after")
     def _normalize_fields(self) -> "SkillManifest":
         self.tags = _dedupe_preserve_order(self.tags)
+        self.allowed_tools = _dedupe_preserve_order(self.allowed_tools)
         self.allowed_agents = _dedupe_preserve_order(self.allowed_agents)
         self.required_toolsets = _dedupe_preserve_order(self.required_toolsets)
         self.required_mcp_servers = _dedupe_preserve_order(self.required_mcp_servers)
         self.instruction_files = _dedupe_preserve_order(self.instruction_files or ["SKILL.md"])
         self.route_keywords = _dedupe_preserve_order(self.route_keywords)
         return self
+
+    @field_validator(
+        "tags",
+        "allowed_tools",
+        "allowed_agents",
+        "required_toolsets",
+        "required_mcp_servers",
+        "instruction_files",
+        "route_keywords",
+        mode="before",
+    )
+    @classmethod
+    def _coerce_string_list(cls, value: object) -> object:
+        if isinstance(value, str):
+            return [item.strip() for item in value.split(",") if item.strip()]
+        return value
+
+    @field_validator("name")
+    @classmethod
+    def _validate_name(cls, value: str) -> str:
+        normalized = value.strip()
+        if not SKILL_NAME_PATTERN.fullmatch(normalized):
+            raise ValueError("skill name 必须小于等于 64 字符，且只能包含小写字母、数字和短横线")
+        if any(word in normalized for word in RESERVED_SKILL_NAME_WORDS):
+            raise ValueError('skill name 不能包含保留词 "anthropic" 或 "claude"')
+        if XML_TAG_PATTERN.search(normalized):
+            raise ValueError("skill name 不能包含 XML 标签")
+        return normalized
+
+    @field_validator("description")
+    @classmethod
+    def _validate_description(cls, value: str) -> str:
+        normalized = " ".join(value.strip().split())
+        if not normalized:
+            raise ValueError("skill description 不能为空")
+        if len(normalized) > 1024:
+            raise ValueError("skill description 不能超过 1024 字符")
+        if XML_TAG_PATTERN.search(normalized):
+            raise ValueError("skill description 不能包含 XML 标签")
+        return normalized
 
     def allows_agent(self, agent_id: str) -> bool:
         """判断当前 skill 是否允许给指定 agent 使用。"""

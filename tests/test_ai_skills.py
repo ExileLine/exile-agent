@@ -51,7 +51,20 @@ def _write_skill(
         encoding="utf-8",
     )
     skill_dir.joinpath("SKILL.md").write_text(
-        "# Custom Ops Skill\n\n请优先依据工具事实判断运行时状态，不要主观猜测。",
+        "\n".join(
+            [
+                "---",
+                f"name: {name}",
+                "description: Provides runtime status checks when users ask about health or service state.",
+                "allowed-tools:",
+                "  - get_runtime_config_summary",
+                "---",
+                "",
+                "# Custom Ops Skill",
+                "",
+                "请优先依据工具事实判断运行时状态，不要主观猜测。",
+            ]
+        ),
         encoding="utf-8",
     )
 
@@ -68,6 +81,8 @@ def test_skill_loader_and_resolver(tmp_path: Path) -> None:
     manifests = loader.load_manifests()
     assert len(manifests) == 1
     assert manifests[0].name == "custom-ops-skill"
+    assert manifests[0].allowed_tools == ["get_runtime_config_summary"]
+    assert "runtime status checks" in manifests[0].description
 
     registry = SkillRegistry(manifests)
     resolver = SkillResolver(registry=registry, loader=loader)
@@ -82,6 +97,66 @@ def test_skill_loader_and_resolver(tmp_path: Path) -> None:
     assert resolution.required_mcp_server_ids == ("demo",)
     assert any(item.startswith("[Skill Summary | custom-ops-skill]") for item in resolution.instructions)
     assert any("不要主观猜测" in item for item in resolution.instructions)
+    assert all("allowed-tools" not in item for item in resolution.instructions)
+
+
+def test_skill_loader_supports_skill_md_without_legacy_yaml(tmp_path: Path) -> None:
+    skill_dir = tmp_path / "report-writer"
+    skill_dir.mkdir(parents=True)
+    skill_dir.joinpath("SKILL.md").write_text(
+        "\n".join(
+            [
+                "---",
+                "name: report-writer",
+                "description: Helps write concise operational reports when users ask for status summaries.",
+                "allowed-tools: Read",
+                "---",
+                "",
+                "# Report Writer",
+                "",
+                "Use short sections and evidence-backed conclusions.",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    loader = SkillLoader(skills_dir=tmp_path)
+    manifests = loader.load_manifests()
+
+    assert len(manifests) == 1
+    assert manifests[0].name == "report-writer"
+    assert manifests[0].title == "Report Writer"
+    assert manifests[0].allowed_tools == ["Read"]
+    assert loader.load_instruction_text(manifests[0]).startswith("# Report Writer")
+
+
+def test_skill_loader_keeps_legacy_yaml_compatibility(tmp_path: Path) -> None:
+    skill_dir = tmp_path / "legacy-skill"
+    skill_dir.mkdir(parents=True)
+    skill_dir.joinpath("skill.yaml").write_text(
+        "\n".join(
+            [
+                "name: legacy-skill",
+                "title: Legacy Skill",
+                "description: Handles legacy skill definitions that still use skill.yaml metadata.",
+                "load_strategy: full_on_match",
+                "route_keywords:",
+                "  - legacy",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    skill_dir.joinpath("SKILL.md").write_text(
+        "# Legacy Skill\n\nThis body has no YAML frontmatter.",
+        encoding="utf-8",
+    )
+
+    loader = SkillLoader(skills_dir=tmp_path)
+    manifests = loader.load_manifests()
+
+    assert len(manifests) == 1
+    assert manifests[0].name == "legacy-skill"
+    assert loader.load_instruction_text(manifests[0]).startswith("# Legacy Skill")
 
 
 def test_list_skills_endpoint() -> None:

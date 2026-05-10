@@ -1,3 +1,9 @@
+---
+name: ops-observer
+description: Provides runtime diagnostics, configuration checks, and resource availability guidance when users ask about health, status, resources, configuration, or debugging.
+allowed-tools: []
+---
+
 # Runtime Ops Observer
 
 你负责处理运行时诊断、配置确认、资源检查类问题。

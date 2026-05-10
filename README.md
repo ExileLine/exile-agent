@@ -637,24 +637,42 @@ skills 采用文件系统 catalog 方式加载。默认目录由 `AI_SKILLS_DIR`
 新增一个 skill 的步骤：
 
 1. 在 `AI_SKILLS_DIR` 下新建一个目录，例如 `app/ai/skills/catalog/order-assistant/`
-2. 新增 `skill.yaml`
-3. 新增 `SKILL.md`
+2. 新增 `SKILL.md`，并在文件顶部写 YAML frontmatter
+3. 如需声明项目扩展字段，再新增可选的 `skill.yaml`
 
 目录示例：
 
 ```text
 app/ai/skills/catalog/
   order-assistant/
-    skill.yaml
     SKILL.md
+    skill.yaml  # 可选：项目扩展字段
 ```
 
-`skill.yaml` 最小示例：
+`SKILL.md` 最小示例：
+
+```md
+---
+name: order-assistant
+description: Helps answer order lookup, order explanation, and delivery status questions when users ask about orders, shipping, refunds, or payments.
+allowed-tools: []
+---
+
+# Order Assistant
+
+你负责处理订单相关问题。
+
+执行要求：
+
+- 优先使用订单域工具获取事实
+- 清楚区分订单状态、支付状态和发货状态
+- 如果工具没有返回足够信息，直接说明边界
+```
+
+`skill.yaml` 是项目扩展配置，适合放路由、依赖和运行时治理字段：
 
 ```yaml
-name: order-assistant
 title: Order Assistant
-description: 处理订单查询、订单解释和订单状态确认。
 tags:
   - order
   - commerce
@@ -673,20 +691,6 @@ route_keywords:
   - 发货
   - 退款
 summary: 当问题与订单、发货、退款有关时，优先使用订单域工具返回事实，不要主观猜测。
-```
-
-`SKILL.md` 最小示例：
-
-```md
-# Order Assistant
-
-你负责处理订单相关问题。
-
-执行要求：
-
-- 优先使用订单域工具获取事实
-- 清楚区分订单状态、支付状态和发货状态
-- 如果工具没有返回足够信息，直接说明边界
 ```
 
 完成后重启服务，再调用：
@@ -1389,25 +1393,29 @@ curl -X POST 'http://127.0.0.1:8000/api/v1/agents/chat' \
 
 ### 3.6 Skills 基础设施的当前设计
 
-当前 skills 采用“本地目录 + manifest + 渐进式注入”的方式。
+当前 skills 采用“本地目录 + `SKILL.md` frontmatter + 渐进式注入”的方式。
 
 #### 目录结构
 
 每个 skill 目录至少包含：
 
-- `skill.yaml`
 - `SKILL.md`
 
 其中：
 
-- `skill.yaml` 描述 skill 的元数据、依赖与路由策略
-- `SKILL.md` 描述面向模型的完整执行说明
+- `SKILL.md` frontmatter 描述 Anthropic-style 基础元数据：`name`、`description`、可选 `allowed-tools`
+- `SKILL.md` 正文描述面向模型的完整执行说明
+- `skill.yaml` 可选，描述项目扩展元数据、依赖与路由策略
 
-当前 `skill.yaml` 主要支持这些字段：
+当前 `SKILL.md` frontmatter 遵循这些约束：
 
 - `name`
-- `title`
 - `description`
+- `allowed-tools`
+
+当前 `skill.yaml` 扩展配置主要支持这些字段：
+
+- `title`
 - `tags`
 - `enabled`
 - `priority`
