@@ -7,6 +7,7 @@ import yaml
 
 from app.ai.exceptions import SkillConfigurationError
 from app.ai.skills.models import SkillManifest
+from app.ai.toolsets.skill_scripts import SKILL_SCRIPT_TOOLSET_ID
 from app.core.config import BASE_DIR
 
 
@@ -72,13 +73,14 @@ class SkillLoader:
         if legacy_manifest_path.exists():
             payload.update(_load_yaml_mapping(legacy_manifest_path, "Skill manifest"))
 
+        has_legacy_manifest = legacy_manifest_path.exists()
         if skill_md_path.exists():
             frontmatter, _body = _split_markdown_frontmatter(skill_md_path.read_text(encoding="utf-8"))
             if frontmatter:
                 payload.update(_normalize_frontmatter(frontmatter, skill_md_path))
-            elif not legacy_manifest_path.exists():
+            elif not has_legacy_manifest:
                 raise SkillConfigurationError(f"SKILL.md frontmatter 缺少 `name` 和 `description`: {skill_md_path}")
-        elif not legacy_manifest_path.exists():
+        elif not has_legacy_manifest:
             raise SkillConfigurationError(f"Skill 目录缺少 SKILL.md: {skill_dir}")
 
         if "name" not in payload or not payload["name"]:
@@ -86,6 +88,13 @@ class SkillLoader:
 
         payload.setdefault("title", _title_from_name(str(payload["name"])))
         payload.setdefault("instruction_files", ["SKILL.md"])
+        if skill_md_path.exists() and not has_legacy_manifest:
+            payload.setdefault("load_strategy", "full_on_match")
+        if (skill_dir / "scripts").is_dir():
+            required_toolsets = payload.get("required_toolsets") or []
+            if isinstance(required_toolsets, str):
+                required_toolsets = [required_toolsets]
+            payload["required_toolsets"] = _dedupe_strings([*required_toolsets, SKILL_SCRIPT_TOOLSET_ID])
         payload["root_dir"] = str(skill_dir.resolve())
 
         try:
@@ -139,3 +148,14 @@ def _normalize_frontmatter(frontmatter: dict[str, Any], path: Path) -> dict[str,
 
 def _title_from_name(name: str) -> str:
     return " ".join(part.capitalize() for part in name.split("-") if part) or name
+
+
+def _dedupe_strings(values: list[str]) -> list[str]:
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        if value in seen:
+            continue
+        seen.add(value)
+        deduped.append(value)
+    return deduped

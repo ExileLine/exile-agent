@@ -3,10 +3,12 @@ import asyncio
 import time
 from collections.abc import AsyncIterator
 from dataclasses import replace
+from pathlib import Path
 from typing import Any
 
 import httpx
 import shortuuid
+from loguru import logger
 from pydantic_ai import ModelMessagesTypeAdapter, RunContext
 from pydantic_ai.messages import (
     FunctionToolCallEvent,
@@ -18,6 +20,7 @@ from pydantic_ai.messages import (
     ModelResponse,
     TextPart,
     TextPartDelta,
+    ToolReturnPart,
     UserPromptPart,
 )
 from pydantic_ai.run import AgentRunResultEvent
@@ -56,6 +59,7 @@ from app.ai.runtime.team_trace import TeamRunTracePayload, TeamRunTraceStore
 from app.ai.schemas.chat import (
     AgentApprovalDecision,
     AgentApprovalRequest,
+    AgentArtifact,
     AgentChatResponse,
     AgentDeferredToolRequestsPayload,
     AgentRunMeta,
@@ -207,6 +211,13 @@ class AgentRunner:
         except AIRuntimeError:
             raise
         except Exception as exc:
+            logger.exception(
+                "chat run 执行失败: request_id={} session_id={} agent_id={} skills={}",
+                request_context.request_id,
+                session_id,
+                resolved_agent_id,
+                skill_resolution.skill_names,
+            )
             raise AIRunExecutionError("chat run 执行失败") from exc
         response = self._build_chat_response(
             result=result,
@@ -2108,6 +2119,7 @@ class AgentRunner:
             request_id=request_id,
             session_id=session_id,
             usage=self._serialize_usage(result),
+            artifacts=self._extract_artifacts(result),
             meta=self._build_run_meta(
                 run_kind=run_kind,
                 stream_mode=None,
@@ -2129,6 +2141,109 @@ class AgentRunner:
 
         response.message = output
         return response
+
+    def _extract_artifacts(self, result: Any) -> list[AgentArtifact]:
+        artifacts: list[AgentArtifact] = []
+        seen_paths: set[str] = set()
+
+        for message in result.all_messages():
+            parts = getattr(message, "parts", None)
+            if not isinstance(parts, list):
+                continue
+            for part in parts:
+                if not isinstance(part, ToolReturnPart) or part.tool_name != "run_skill_script":
+                    continue
+                content = self._normalize_value(part.content)
+                for artifact in self._extract_skill_script_artifacts(content):
+                    if artifact.path in seen_paths:
+                        continue
+                    seen_paths.add(artifact.path)
+                    artifacts.append(artifact)
+
+        return artifacts
+
+    def _extract_skill_script_artifacts(self, content: Any) -> list[AgentArtifact]:
+        if not isinstance(content, dict):
+            return []
+
+        workdir = self._artifact_workdir(content)
+        candidates = self._artifact_candidate_paths(content, workdir)
+        if workdir is not None:
+            candidates.extend(sorted(workdir.glob("*.docx")))
+
+        artifacts: list[AgentArtifact] = []
+        seen_paths: set[str] = set()
+        for candidate in candidates:
+            resolved = candidate.resolve()
+            if not resolved.exists() or not resolved.is_file():
+                continue
+            if resolved.suffix.lower() != ".docx":
+                continue
+            path = str(resolved)
+            if path in seen_paths:
+                continue
+            seen_paths.add(path)
+            artifacts.append(
+                AgentArtifact(
+                    artifact_id=self._build_artifact_id(resolved),
+                    name=resolved.name,
+                    path=path,
+                    kind=resolved.suffix.lower().lstrip("."),
+                    download_url=f"/api/v1/agents/artifacts/{self._build_artifact_id(resolved)}/download",
+                    source_tool="run_skill_script",
+                    metadata={
+                        "script_path": content.get("script_path"),
+                        "workdir": str(workdir) if workdir is not None else None,
+                    },
+                )
+            )
+        return artifacts
+
+    @staticmethod
+    def _build_artifact_id(path: Path) -> str:
+        parts = path.resolve().parts
+        try:
+            root_index = parts.index("exile-agent-skill-runs")
+        except ValueError:
+            return path.name
+        return "/".join(parts[root_index + 1 :])
+
+    @staticmethod
+    def _artifact_workdir(content: dict[str, Any]) -> Path | None:
+        raw_workdir = content.get("workdir")
+        if not isinstance(raw_workdir, str) or not raw_workdir.strip():
+            return None
+        path = Path(raw_workdir).expanduser()
+        if not path.is_absolute():
+            return None
+        return path.resolve()
+
+    def _artifact_candidate_paths(self, content: dict[str, Any], workdir: Path | None) -> list[Path]:
+        candidates: list[Path] = []
+        stdout_payload = self._parse_tool_stdout_json(content.get("stdout"))
+        for payload in [content, stdout_payload]:
+            if not isinstance(payload, dict):
+                continue
+            for key in ("output", "path", "file_path"):
+                raw_path = payload.get(key)
+                if not isinstance(raw_path, str) or not raw_path.strip():
+                    continue
+                path = Path(raw_path)
+                candidates.append(path if path.is_absolute() else (workdir / path if workdir else path))
+        return candidates
+
+    @staticmethod
+    def _parse_tool_stdout_json(stdout: Any) -> dict[str, Any] | None:
+        if not isinstance(stdout, str) or not stdout.strip():
+            return None
+        for line in reversed([item.strip() for item in stdout.splitlines() if item.strip()]):
+            try:
+                payload = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(payload, dict):
+                return payload
+        return None
 
     async def _run_chat_stream_fallback(
             self,
@@ -2288,6 +2403,7 @@ class AgentRunner:
             mcp_servers=mcp_servers,
             skills=skills,
             usage=self._serialize_usage(result),
+            artifacts=[artifact.model_dump(mode="json") for artifact in self._extract_artifacts(result)],
         )
         return True
 

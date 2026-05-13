@@ -1,5 +1,8 @@
+import tempfile
+from pathlib import Path
+
 from fastapi import APIRouter, Query, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import FileResponse, StreamingResponse
 
 from app.ai.deps import RequestContext
 from app.ai.exceptions import (
@@ -71,6 +74,21 @@ async def get_team_run_trace(team_run_id: str, request: Request):
     if result is None:
         raise CustomException(status_code=404, detail=f"未找到 Team Run Trace: {team_run_id}", custom_code=10002)
     return api_response(data=result)
+
+
+@router.get("/artifacts/{request_id}/{filename}/download", summary="下载 Agent 生成产物")
+async def download_agent_artifact(request_id: str, filename: str):
+    artifacts_root = Path(tempfile.gettempdir()).resolve() / "exile-agent-skill-runs"
+    artifact_path = (artifacts_root / request_id / filename).resolve()
+    if artifacts_root not in artifact_path.parents:
+        raise CustomException(status_code=400, detail="非法产物路径", custom_code=10005)
+    if not artifact_path.exists() or not artifact_path.is_file():
+        raise CustomException(status_code=404, detail="产物不存在或已过期", custom_code=10002)
+    return FileResponse(
+        path=str(artifact_path),
+        filename=artifact_path.name,
+        media_type="application/octet-stream",
+    )
 
 
 @router.get("/users/{user_id}/sessions/histories", summary="按用户分页查询历史会话列表")

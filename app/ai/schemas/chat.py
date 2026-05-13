@@ -81,6 +81,18 @@ class AgentRunMeta(BaseModel):
     team_results: list[dict[str, Any]] | None = Field(default=None, description="多 Agent 协同的子 Agent 结果")
 
 
+class AgentArtifact(BaseModel):
+    """一次 Agent run 生成的文件产物。"""
+
+    artifact_id: str = Field(description="产物下载标识")
+    name: str = Field(description="文件名")
+    path: str = Field(description="服务端本地绝对路径")
+    kind: str = Field(description="产物类型，例如 docx")
+    download_url: str = Field(description="前端下载 URL")
+    source_tool: str | None = Field(default=None, description="生成该产物的工具名")
+    metadata: dict[str, Any] = Field(default_factory=dict, description="产物附加信息")
+
+
 class AgentChatResponse(BaseModel):
     """一次 chat run 的标准化响应结构。"""
 
@@ -96,4 +108,5 @@ class AgentChatResponse(BaseModel):
     request_id: str = Field(description="请求 ID")
     session_id: str | None = Field(default=None, description="会话 ID")
     usage: dict[str, Any] | None = Field(default=None, description="模型用量信息")
+    artifacts: list[AgentArtifact] = Field(default_factory=list, description="本轮生成的文件产物")
     meta: AgentRunMeta = Field(description="运行时元信息")

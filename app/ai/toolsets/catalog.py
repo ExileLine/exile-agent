@@ -14,6 +14,7 @@ from app.ai.toolsets.builtin import (
     get_builtin_runtime_toolset,
     get_builtin_time_toolset,
 )
+from app.ai.toolsets.skill_scripts import SKILL_SCRIPT_TOOLSET_ID, get_skill_script_toolset
 
 # 当前 `chat-agent` 默认已经静态挂载了全部 builtin toolsets。
 # Skills 如果声明依赖这些 id，不需要再重复动态装配，避免同名工具重复注册。
@@ -29,6 +30,7 @@ TOOLSET_BUILDERS: dict[str, Callable[[], AbstractToolset[AgentDeps]]] = {
     BUILTIN_TIME_TOOLSET_ID: get_builtin_time_toolset,
     BUILTIN_REQUEST_TOOLSET_ID: get_builtin_request_toolset,
     BUILTIN_RUNTIME_TOOLSET_ID: get_builtin_runtime_toolset,
+    SKILL_SCRIPT_TOOLSET_ID: get_skill_script_toolset,
 }
 
 

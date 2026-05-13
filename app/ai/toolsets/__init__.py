@@ -25,11 +25,13 @@ from app.ai.toolsets.metadata import (
     build_tool_metadata,
     build_toolset_metadata,
 )
+from app.ai.toolsets.skill_scripts import SKILL_SCRIPT_TOOLSET_ID, get_skill_script_toolset
 
 __all__ = [
     "READONLY_TOOL_PREFIXES",
     "MetadataApprovalToolset",
     "STATIC_DEFAULT_TOOLSET_IDS",
+    "SKILL_SCRIPT_TOOLSET_ID",
     "TOOL_NAME_PATTERN",
     "ToolAuditWrapperToolset",
     "ToolRisk",
@@ -43,6 +45,7 @@ __all__ = [
     "get_builtin_runtime_toolset",
     "get_builtin_time_toolset",
     "get_builtin_toolsets",
+    "get_skill_script_toolset",
     "validate_toolset_conventions",
     "wrap_toolset_with_audit",
     "wrap_toolset_with_metadata_approval",

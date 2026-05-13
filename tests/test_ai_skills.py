@@ -2,11 +2,17 @@ from pathlib import Path
 
 from fastapi.testclient import TestClient
 from pydantic_ai import models
+from pydantic_ai import RunContext
 from pydantic_ai.messages import ModelRequest, ModelResponse, TextPart
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 
+from app.ai.config import AISettings
+from app.ai.deps import AgentDeps, RequestContext
 from app.ai.skills import SkillLoader, SkillRegistry, SkillResolver
 from app.ai.toolsets.builtin import BUILTIN_RUNTIME_TOOLSET_ID
+from app.ai.toolsets.catalog import build_registered_toolsets
+from app.ai.toolsets.skill_scripts import SKILL_SCRIPT_TOOLSET_ID, get_skill_script_toolset
+from app.ai.services.tool_audit import ToolAuditService
 from app.main import app
 
 models.ALLOW_MODEL_REQUESTS = False
@@ -127,6 +133,7 @@ def test_skill_loader_supports_skill_md_without_legacy_yaml(tmp_path: Path) -> N
     assert manifests[0].name == "report-writer"
     assert manifests[0].title == "Report Writer"
     assert manifests[0].allowed_tools == ["Read"]
+    assert manifests[0].load_strategy == "full_on_match"
     assert loader.load_instruction_text(manifests[0]).startswith("# Report Writer")
 
 
@@ -157,6 +164,184 @@ def test_skill_loader_keeps_legacy_yaml_compatibility(tmp_path: Path) -> None:
     assert len(manifests) == 1
     assert manifests[0].name == "legacy-skill"
     assert loader.load_instruction_text(manifests[0]).startswith("# Legacy Skill")
+
+
+def test_docx_skill_matches_description_triggers_and_loads_body() -> None:
+    loader = SkillLoader(skills_dir="app/ai/skills/catalog")
+    registry = SkillRegistry(loader.load_manifests())
+    resolver = SkillResolver(registry=registry, loader=loader)
+
+    resolution = resolver.resolve(
+        agent_id="chat-agent",
+        message="Please create a Word document report with headings.",
+    )
+
+    assert resolution.skill_names == ["docx"]
+    assert resolution.skills[0].include_full_instructions is True
+    assert SKILL_SCRIPT_TOOLSET_ID in resolution.required_toolset_ids
+    assert any("DOCX Skill" in item for item in resolution.instructions)
+
+
+def test_docx_skill_matches_normal_business_document_requests() -> None:
+    loader = SkillLoader(skills_dir="app/ai/skills/catalog")
+    registry = SkillRegistry(loader.load_manifests())
+    resolver = SkillResolver(registry=registry, loader=loader)
+
+    resolution = resolver.resolve(
+        agent_id="chat-agent",
+        message="帮我生成一份季度报告，包含业务摘要、里程碑和下季度计划。",
+    )
+
+    assert resolution.skill_names == ["docx"]
+    assert any("Runtime Rules" in item for item in resolution.instructions)
+
+
+class _NoopHTTPClient:
+    async def aclose(self) -> None:
+        return None
+
+
+def _build_run_context(registry: SkillRegistry, skill_name: str) -> RunContext[AgentDeps]:
+    return RunContext(
+        deps=AgentDeps(
+            request=RequestContext(request_id="skill-script-test"),
+            settings=AISettings(),
+            db_session_factory=None,
+            redis=None,
+            http_client=_NoopHTTPClient(),  # type: ignore[arg-type]
+            tool_audit=ToolAuditService(),
+            mcp_manager=None,
+            skill_registry=registry,
+            resolved_skill_names=(skill_name,),
+        ),
+        model=None,  # type: ignore[arg-type]
+        usage=None,  # type: ignore[arg-type]
+        prompt=None,
+    )
+
+
+def test_skill_script_toolset_lists_reads_and_runs_skill_scripts(tmp_path: Path) -> None:
+    skill_dir = tmp_path / "script-skill"
+    scripts_dir = skill_dir / "scripts"
+    scripts_dir.mkdir(parents=True)
+    skill_dir.joinpath("SKILL.md").write_text(
+        "\n".join(
+            [
+                "---",
+                "name: script-skill",
+                "description: Runs safe helper scripts when users ask for script skill checks.",
+                "---",
+                "",
+                "# Script Skill",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    scripts_dir.joinpath("echo_args.py").write_text(
+        "import json, sys\nprint(json.dumps(sys.argv[1:], ensure_ascii=False))\n",
+        encoding="utf-8",
+    )
+    scripts_dir.joinpath("nested").mkdir()
+    scripts_dir.joinpath("nested", "helper.py").write_text(
+        "VALUE = 'office-helper-ok'\n",
+        encoding="utf-8",
+    )
+    scripts_dir.joinpath("nested", "validate_docx.py").write_text(
+        "import json, sys\nfrom helper import VALUE\n"
+        "print(json.dumps({'argv': sys.argv[1:], 'value': VALUE}, ensure_ascii=False))\n",
+        encoding="utf-8",
+    )
+
+    loader = SkillLoader(skills_dir=tmp_path)
+    manifests = loader.load_manifests()
+    assert manifests[0].required_toolsets == [SKILL_SCRIPT_TOOLSET_ID]
+
+    registry = SkillRegistry(manifests)
+    toolset = get_skill_script_toolset()
+    ctx = _build_run_context(registry, "script-skill")
+
+    files_result = toolset.tools["list_skill_files"].function(ctx, "script-skill", "scripts", 1)
+    assert "scripts/echo_args.py" in files_result["files"]
+
+    text_result = toolset.tools["get_skill_file_text"].function(ctx, "script-skill", "SKILL.md", 2000)
+    assert "# Script Skill" in text_result["content"]
+
+    run_result = toolset.tools["run_skill_script"].function(
+        ctx,
+        "script-skill",
+        "scripts/echo_args.py",
+        '["hello", "world"]',
+        5.0,
+    )
+    import asyncio
+
+    output = asyncio.run(run_result)
+    assert output["return_code"] == 0
+    assert '["hello", "world"]' in output["stdout"]
+
+    nested_result = toolset.tools["run_skill_script"].function(
+        ctx,
+        "script-skill",
+        "nested/validate_docx.py",
+        '["doc.docx"]',
+        5.0,
+    )
+    nested_output = asyncio.run(nested_result)
+    assert nested_output["return_code"] == 0
+    assert '"argv": ["doc.docx"]' in nested_output["stdout"]
+    assert '"value": "office-helper-ok"' in nested_output["stdout"]
+
+    command_like_result = toolset.tools["run_skill_script"].function(
+        ctx,
+        "script-skill",
+        "python scripts/echo_args.py",
+        '["hello"]',
+        5.0,
+    )
+    command_like_output = asyncio.run(command_like_result)
+    assert command_like_output["return_code"] == 0
+    assert '["hello"]' in command_like_output["stdout"]
+
+    inline_arguments_result = toolset.tools["run_skill_script"].function(
+        ctx,
+        "script-skill",
+        "scripts/echo_args.py inline.docx",
+        '["from-json"]',
+        5.0,
+    )
+    inline_arguments_output = asyncio.run(inline_arguments_result)
+    assert inline_arguments_output["return_code"] == 0
+    assert '["inline.docx", "from-json"]' in inline_arguments_output["stdout"]
+
+    escaped_list_result = toolset.tools["list_skill_files"].function(ctx, "script-skill", "../", 1)
+    assert escaped_list_result["ok"] is False
+    assert "path escapes skill directory" in escaped_list_result["error"]
+
+    escaped_read_result = toolset.tools["get_skill_file_text"].function(
+        ctx,
+        "script-skill",
+        "../create_report.js",
+        2000,
+    )
+    assert escaped_read_result["ok"] is False
+    assert "path escapes skill directory" in escaped_read_result["error"]
+
+    invalid_script_result = toolset.tools["run_skill_script"].function(
+        ctx,
+        "script-skill",
+        "../create_report.js",
+        "[]",
+        5.0,
+    )
+    invalid_script_output = asyncio.run(invalid_script_result)
+    assert invalid_script_output["ok"] is False
+    assert invalid_script_output["return_code"] is None
+    assert "path escapes skill directory" in invalid_script_output["stderr"]
+
+
+def test_registered_toolsets_can_build_skill_script_toolset() -> None:
+    toolsets = build_registered_toolsets([SKILL_SCRIPT_TOOLSET_ID])
+    assert [toolset.id for toolset in toolsets] == [SKILL_SCRIPT_TOOLSET_ID]
 
 
 def test_list_skills_endpoint() -> None:

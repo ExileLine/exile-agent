@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import re
 
 from app.ai.skills.loader import SkillLoader
 from app.ai.skills.models import SkillManifest
@@ -144,10 +145,22 @@ def _build_match_keywords(skill: SkillManifest) -> list[str]:
         [
             *[_normalize_text(keyword) for keyword in skill.route_keywords],
             *[_normalize_text(tag) for tag in skill.tags],
+            *_description_match_keywords(skill.description),
             _normalize_text(skill.name),
             _normalize_text(skill.title),
         ]
     )
+
+
+def _description_match_keywords(description: str) -> list[str]:
+    """Extract explicit trigger phrases from Anthropic-style skill descriptions."""
+
+    quoted_phrases = [
+        match.group(1) or match.group(2)
+        for match in re.finditer(r"'([^']+)'|\"([^\"]+)\"", description)
+    ]
+    file_extensions = re.findall(r"\.[a-z0-9]{2,8}\b", description.casefold())
+    return [_normalize_text(item) for item in [*quoted_phrases, *file_extensions]]
 
 
 def _dedupe(values: list[str]) -> list[str]:

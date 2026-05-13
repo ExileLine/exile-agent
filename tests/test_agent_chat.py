@@ -1,6 +1,7 @@
 import asyncio
 import json
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 import httpx
 from fastapi.testclient import TestClient
 import pytest
@@ -1786,6 +1787,120 @@ def test_runner_records_tool_execution_events() -> None:
     assert execution_record.tool_args == {}
     assert execution_record.tool_metadata["toolset"]["id"] == "builtin-request-toolset"
     assert execution_record.result["user_id"] == "tester"
+
+
+def test_chat_response_includes_docx_artifacts_from_skill_script() -> None:
+    def docx_model(messages: list[ModelRequest | ModelResponse], info: AgentInfo) -> ModelResponse:
+        del info
+        tool_returns = [
+            part
+            for message in messages
+            if isinstance(message, ModelRequest)
+            for part in message.parts
+            if isinstance(part, ToolReturnPart) and part.tool_name == "run_skill_script"
+        ]
+        if len(tool_returns) == 0:
+            return ModelResponse(
+                parts=[
+                    ToolCallPart(
+                        tool_name="run_skill_script",
+                        args={
+                            "skill_name": "docx",
+                            "script_path": "scripts/create_docx.py",
+                            "arguments_json": json.dumps(
+                                [
+                                    "--output",
+                                    "quarterly_report.docx",
+                                    "--title",
+                                    "季度报告",
+                                    "--section",
+                                    "业务摘要::本季度业务保持稳定推进。",
+                                ],
+                                ensure_ascii=False,
+                            ),
+                        },
+                    )
+                ]
+            )
+        if len(tool_returns) == 1:
+            return ModelResponse(
+                parts=[
+                    ToolCallPart(
+                        tool_name="run_skill_script",
+                        args={
+                            "skill_name": "docx",
+                            "script_path": "scripts/validate_docx.py",
+                            "arguments_json": json.dumps(["quarterly_report.docx"]),
+                        },
+                    )
+                ]
+            )
+        return ModelResponse(parts=[TextPart(content="季度报告已生成并验证通过。")])
+
+    session_id = "docx-artifact-test"
+    request_context = RequestContext(request_id="docx-artifact-cleanup", user_id="tester", session_id=session_id)
+
+    with TestClient(app) as client:
+        history_store = client.app.state.ai_history_store
+        original_db_enabled = history_store.db_enabled
+        history_store.db_enabled = False
+        agent = client.app.state.ai_agent_manager.get_agent("chat-agent")
+        try:
+            asyncio.run(
+                history_store.delete_messages(
+                    session_id,
+                    request_context=request_context,
+                    agent_id="chat-agent",
+                )
+            )
+            with agent.override(model=FunctionModel(docx_model)):
+                response = client.post(
+                    "/api/v1/agents/chat",
+                    json={
+                        "agent_id": "chat-agent",
+                        "message": "帮我生成一份季度报告，包含业务摘要、里程碑和下季度计划。",
+                        "session_id": session_id,
+                    },
+                    headers={"x-user-id": "tester"},
+                )
+                history_response = client.get(
+                    f"/api/v1/agents/sessions/{session_id}/histories",
+                    headers={"x-user-id": "tester"},
+                )
+        finally:
+            asyncio.run(
+                history_store.delete_messages(
+                    session_id,
+                    request_context=request_context,
+                    agent_id="chat-agent",
+                )
+            )
+            history_store.db_enabled = original_db_enabled
+
+    assert response.status_code == 200
+    assert history_response.status_code == 200
+    body = response.json()
+    artifacts = body["data"]["artifacts"]
+    assert len(artifacts) == 1
+    assert artifacts[0]["name"] == "quarterly_report.docx"
+    assert artifacts[0]["kind"] == "docx"
+    assert artifacts[0]["source_tool"] == "run_skill_script"
+    assert artifacts[0]["artifact_id"].endswith("/quarterly_report.docx")
+    assert artifacts[0]["download_url"].endswith("/download")
+    assert Path(artifacts[0]["path"]).exists()
+    assert body["data"]["meta"]["skills"] == ["docx"]
+    history_data = history_response.json()["data"]
+    assert history_data["artifact_count"] == 1
+    assert history_data["artifacts"][0]["artifact_id"] == artifacts[0]["artifact_id"]
+    assert history_data["records"][-1]["artifacts"][0]["download_url"] == artifacts[0]["download_url"]
+    assistant_messages = [item for item in history_data["messages"] if item.get("kind") == "response"]
+    assert assistant_messages[-1]["artifacts"][0]["artifact_id"] == artifacts[0]["artifact_id"]
+
+    with TestClient(app) as client:
+        download_response = client.get(artifacts[0]["download_url"])
+
+    assert download_response.status_code == 200
+    assert download_response.content.startswith(b"PK")
 
 
 def test_chat_approval_resume_flow() -> None:

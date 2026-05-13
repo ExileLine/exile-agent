@@ -40,6 +40,7 @@ class HistoryMetadata:
     skills: list[str] = field(default_factory=list)
     mcp_servers: list[str] = field(default_factory=list)
     usage: dict[str, Any] | None = None
+    artifacts: list[dict[str, Any]] = field(default_factory=list)
     message_count: int = 0
     created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
     updated_at: datetime = field(default_factory=lambda: datetime.now(UTC))
@@ -68,6 +69,7 @@ class SessionConversationRecord:
     created_at: datetime
     updated_at: datetime
     messages: list[dict[str, Any]]
+    artifacts: list[dict[str, Any]]
     metadata: dict[str, Any]
 
 
@@ -142,6 +144,7 @@ class SessionHistoryStore:
         skills: Sequence[str] = (),
         mcp_servers: Sequence[str] = (),
         usage: dict[str, Any] | None = None,
+        artifacts: Sequence[dict[str, Any]] = (),
     ) -> None:
         """覆盖写入某个会话的完整 message history。"""
 
@@ -165,6 +168,7 @@ class SessionHistoryStore:
             skills=list(skills),
             mcp_servers=list(mcp_servers),
             usage=usage,
+            artifacts=[dict(item) for item in artifacts],
             message_count=len(trimmed_messages),
             created_at=existing.metadata.created_at if existing is not None else now,
             updated_at=now,
@@ -362,6 +366,7 @@ class SessionHistoryStore:
             skills=list(metadata_payload.get("skills") or []),
             mcp_servers=list(metadata_payload.get("mcp_servers") or []),
             usage=metadata_payload.get("usage"),
+            artifacts=list(metadata_payload.get("artifacts") or []),
             message_count=int(metadata_payload.get("message_count") or len(messages)),
             created_at=metadata_payload.get("created_at") or datetime.now(UTC),
             updated_at=metadata_payload.get("updated_at") or datetime.now(UTC),
@@ -665,10 +670,12 @@ class SessionHistoryStore:
             created_at=metadata.updated_at,
             updated_at=metadata.updated_at,
             messages=serialized_messages,
+            artifacts=list(metadata.artifacts),
             metadata={
                 "skills": metadata.skills,
                 "mcp_servers": metadata.mcp_servers,
                 "usage": metadata.usage,
+                "artifacts": metadata.artifacts,
             },
         )
 
@@ -766,6 +773,7 @@ class SessionHistoryStore:
         )
         agent_ids = sorted({record["agent_id"] for record in records if record.get("agent_id")})
         messages = SessionHistoryStore._flatten_record_messages(records)
+        artifacts = SessionHistoryStore._flatten_record_artifacts(records)
         return {
             "session_id": latest.get("session_id"),
             "user_id": latest.get("user_id"),
@@ -775,6 +783,8 @@ class SessionHistoryStore:
             "latest_message": latest.get("latest_message"),
             "turn_count": len(records),
             "message_count": len(messages),
+            "artifact_count": len(artifacts),
+            "artifacts": artifacts,
             "agent_ids": agent_ids,
             "created_at": first.get("created_at"),
             "updated_at": latest.get("updated_at"),
@@ -796,6 +806,7 @@ class SessionHistoryStore:
             ),
         )
         messages = SessionHistoryStore._flatten_record_messages(records)
+        artifacts = SessionHistoryStore._flatten_record_artifacts(records)
         agent_ids = sorted({record["agent_id"] for record in records if record.get("agent_id")})
         first = records[0] if records else {}
         latest = records[-1] if records else {}
@@ -807,6 +818,8 @@ class SessionHistoryStore:
             "agent_ids": agent_ids,
             "turn_count": len(records),
             "message_count": len(messages),
+            "artifact_count": len(artifacts),
+            "artifacts": artifacts,
             "records": records,
             "messages": messages,
             "created_at": first.get("created_at"),
@@ -819,10 +832,13 @@ class SessionHistoryStore:
         seen: set[str] = set()
         for record in records:
             agent_id = record.get("agent_id")
+            artifacts = list(record.get("artifacts") or [])
             for message in record.get("messages") or []:
                 item = dict(message)
                 if agent_id is not None:
                     item["agent_id"] = agent_id
+                if artifacts and item.get("kind") == "response":
+                    item["artifacts"] = artifacts
                 signature = json.dumps(item, ensure_ascii=False, sort_keys=True)
                 if signature in seen:
                     continue
@@ -844,6 +860,21 @@ class SessionHistoryStore:
                 key=lambda item: item[0],
             )
         ]
+
+    @staticmethod
+    def _flatten_record_artifacts(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        artifacts: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for record in records:
+            for artifact in record.get("artifacts") or []:
+                if not isinstance(artifact, dict):
+                    continue
+                signature = str(artifact.get("artifact_id") or artifact.get("download_url") or artifact.get("path"))
+                if not signature or signature in seen:
+                    continue
+                seen.add(signature)
+                artifacts.append(dict(artifact))
+        return artifacts
 
     @staticmethod
     def _payload_message_timestamp(message: dict[str, Any]) -> str:
@@ -878,6 +909,7 @@ class SessionHistoryStore:
             },
             "message_count": row.message_count,
             "messages": list(row.messages_json or []),
+            "artifacts": list((row.metadata_json or {}).get("artifacts") or []),
             "metadata": dict(row.metadata_json or {}),
             "created_at": row.create_time.isoformat() if row.create_time else None,
             "updated_at": row.update_time.isoformat() if row.update_time else None,
@@ -903,6 +935,7 @@ class SessionHistoryStore:
             },
             "message_count": record.message_count,
             "messages": list(record.messages),
+            "artifacts": list(record.artifacts),
             "metadata": dict(record.metadata),
             "created_at": record.created_at.isoformat(),
             "updated_at": record.updated_at.isoformat(),
